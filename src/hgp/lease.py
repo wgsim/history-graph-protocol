@@ -64,12 +64,8 @@ class LeaseManager:
         )
 
     def validate(self, lease_id: str, extend: bool = True) -> dict[str, Any]:
-        """Validate lease is still valid and chain_hash hasn't changed.
-
-        Uses BEGIN IMMEDIATE to atomically check + extend TTL, preventing
-        a race where two concurrent validates could both see valid and extend.
-        """
-        # Read-only pre-check (no lock) for fast rejection
+        """Validate lease is still valid and chain_hash hasn't changed."""
+        # Fast read-only pre-check to avoid acquiring the write lock for obvious rejects
         row = self._db.execute(
             "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
         ).fetchone()
@@ -83,11 +79,22 @@ class LeaseManager:
         if row["status"] != "ACTIVE" or now > expires_at:
             return {"valid": False, "reason": "LEASE_EXPIRED"}
 
-        # Recompute chain_hash and conditionally extend under write lock
+        # Acquire write lock, then re-validate to close TOCTOU gap
         self._db.begin_immediate()
         try:
-            current_hash = compute_chain_hash(self._db, row["subgraph_root_op_id"])
-            if current_hash != row["chain_hash"]:
+            # Re-fetch inside the lock: another thread may have released/expired the lease
+            locked_row = self._db.execute(
+                "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+            now = datetime.now(timezone.utc)
+            locked_expires_at = datetime.fromisoformat(locked_row["expires_at"])
+
+            if locked_row["status"] != "ACTIVE" or now > locked_expires_at:
+                self._db.rollback()
+                return {"valid": False, "reason": "LEASE_EXPIRED"}
+
+            current_hash = compute_chain_hash(self._db, locked_row["subgraph_root_op_id"])
+            if current_hash != locked_row["chain_hash"]:
                 self._db.rollback()
                 return {
                     "valid": False,
@@ -95,14 +102,18 @@ class LeaseManager:
                     "current_chain_hash": current_hash,
                 }
 
-            issued_at = datetime.fromisoformat(row["issued_at"])
-            original_ttl = int((expires_at - issued_at).total_seconds())
-            new_expires = now + timedelta(seconds=original_ttl)
             if extend:
+                issued_at = datetime.fromisoformat(locked_row["issued_at"])
+                original_ttl = int((locked_expires_at - issued_at).total_seconds())
+                new_expires = now + timedelta(seconds=original_ttl)
                 self._db.execute(
                     "UPDATE leases SET expires_at = ? WHERE lease_id = ?",
                     (new_expires.isoformat(), lease_id),
                 )
+                returned_expires = new_expires
+            else:
+                returned_expires = locked_expires_at
+
             self._db.commit()
         except Exception:
             self._db.rollback()
@@ -111,7 +122,7 @@ class LeaseManager:
         return {
             "valid": True,
             "chain_hash": current_hash,
-            "expires_at": new_expires.isoformat(),
+            "expires_at": returned_expires.isoformat(),
         }
 
     def release(self, lease_id: str) -> None:
