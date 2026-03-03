@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from hgp.errors import PayloadTooLargeError
+from hgp.errors import BlobWriteError, PayloadTooLargeError
 
 MAX_PAYLOAD_BYTES = 10 * 1024 * 1024  # 10 MB V1 limit
 
@@ -52,12 +52,12 @@ class CAS:
         # Step 3: Atomic rename
         try:
             os.rename(str(staging_path), str(final_path))
-        except OSError:
+        except OSError as e:
             if final_path.exists():
                 # Concurrent writer produced the same hash — idempotent success
                 staging_path.unlink(missing_ok=True)
                 return object_key
-            raise
+            raise BlobWriteError(f"Failed to rename staging file to {final_path}") from e
 
         # Step 4: fsync source and destination directories
         for dir_path in [self._staging_dir, final_dir]:
@@ -87,7 +87,7 @@ class CAS:
             for blob_file in subdir.iterdir():
                 if blob_file.is_file():
                     hex_hash = subdir.name + blob_file.name
-                    mtime = datetime.fromtimestamp(blob_file.stat().st_mtime)
+                    mtime = datetime.fromtimestamp(blob_file.stat().st_mtime, tz=timezone.utc)
                     yield f"sha256:{hex_hash}", mtime
 
     def _hash_to_path(self, object_hash: str) -> Path:
