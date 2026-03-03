@@ -13,9 +13,8 @@ from mcp.server.fastmcp import FastMCP
 from hgp.cas import CAS
 from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
 from hgp.db import Database
-from hgp.errors import ChainStaleError, LeaseExpiredError, ParentNotFoundError
+from hgp.errors import ChainStaleError, ParentNotFoundError
 from hgp.lease import LeaseManager
-from hgp.models import ReconcileReport
 from hgp.reconciler import Reconciler
 
 # ── Server initialization ───────────────────────────────────
@@ -65,7 +64,7 @@ def hgp_create_operation(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a new operation in the causal history DAG."""
-    db, cas, lease_mgr, _ = _get_components()
+    db, cas, _, _ = _get_components()
 
     # Validate parents exist
     for pid in (parent_op_ids or []):
@@ -95,7 +94,9 @@ def hgp_create_operation(
             current = compute_chain_hash(db, root_op_id)
             if current != chain_hash:
                 db.rollback()
-                raise ChainStaleError(f"CHAIN_STALE (under lock)")
+                raise ChainStaleError(
+                    f"CHAIN_STALE (under lock): expected {chain_hash}, got {current}"
+                )
 
         seq = db.next_commit_seq()
         db.insert_operation(

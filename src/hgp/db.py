@@ -190,7 +190,7 @@ class Database:
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
         assert self._conn
-        clauses = []
+        clauses: list[str] = []
         params: list[Any] = []
         if status:
             clauses.append("status = ?")
