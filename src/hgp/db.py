@@ -147,7 +147,7 @@ class Database:
             """,
             (op_id, op_type, commit_seq, agent_id, object_hash, chain_hash, metadata),
         )
-        if object_hash:
+        if object_hash is not None:
             self._conn.execute(
                 "INSERT OR IGNORE INTO objects (hash, size, mime_type) VALUES (?, 0, ?)",
                 (object_hash, mime_type),
