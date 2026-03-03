@@ -111,7 +111,7 @@ class Database:
             self._conn.close()
             self._conn = None
 
-    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
+    def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Cursor:
         assert self._conn, "Database not initialized"
         return self._conn.execute(sql, params)
 
@@ -169,7 +169,10 @@ class Database:
 
     def commit(self) -> None:
         assert self._conn
-        self._conn.execute("COMMIT")
+        try:
+            self._conn.execute("COMMIT")
+        except sqlite3.OperationalError:
+            pass  # No active transaction in autocommit mode — already committed
 
     def rollback(self) -> None:
         assert self._conn
