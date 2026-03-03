@@ -139,6 +139,12 @@ class Database:
         mime_type: str | None = None,
     ) -> None:
         assert self._conn
+        # Insert into objects FIRST to satisfy the FK constraint on operations.object_hash
+        if object_hash is not None:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO objects (hash, size, mime_type) VALUES (?, 0, ?)",
+                (object_hash, mime_type),
+            )
         self._conn.execute(
             """
             INSERT INTO operations
@@ -147,11 +153,6 @@ class Database:
             """,
             (op_id, op_type, commit_seq, agent_id, object_hash, chain_hash, metadata),
         )
-        if object_hash is not None:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO objects (hash, size, mime_type) VALUES (?, 0, ?)",
-                (object_hash, mime_type),
-            )
 
     def get_operation(self, op_id: str) -> dict[str, Any] | None:
         assert self._conn

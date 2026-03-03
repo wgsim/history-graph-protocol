@@ -1,0 +1,255 @@
+"""HGP MCP Server — FastMCP entry point."""
+
+from __future__ import annotations
+
+import base64
+import json
+import uuid
+from pathlib import Path
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+from hgp.cas import CAS
+from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
+from hgp.db import Database
+from hgp.errors import ChainStaleError, LeaseExpiredError, ParentNotFoundError
+from hgp.lease import LeaseManager
+from hgp.models import ReconcileReport
+from hgp.reconciler import Reconciler
+
+# ── Server initialization ───────────────────────────────────
+
+HGP_DIR = Path.home() / ".hgp"
+HGP_CONTENT_DIR = HGP_DIR / ".hgp_content"
+HGP_DB_PATH = HGP_DIR / "hgp.db"
+
+mcp = FastMCP("hgp")
+
+_db: Database | None = None
+_cas: CAS | None = None
+_lease_mgr: LeaseManager | None = None
+_reconciler: Reconciler | None = None
+
+
+def _get_components() -> tuple[Database, CAS, LeaseManager, Reconciler]:
+    global _db, _cas, _lease_mgr, _reconciler
+    if _db is None:
+        HGP_DIR.mkdir(parents=True, exist_ok=True)
+        HGP_CONTENT_DIR.mkdir(exist_ok=True)
+        _db = Database(HGP_DB_PATH)
+        _db.initialize()
+        _cas = CAS(HGP_CONTENT_DIR)
+        _lease_mgr = LeaseManager(_db)
+        _reconciler = Reconciler(_db, _cas, HGP_CONTENT_DIR)
+        _db.expire_leases()
+        _db.commit()
+        _reconciler.reconcile()
+    assert _db and _cas and _lease_mgr and _reconciler
+    return _db, _cas, _lease_mgr, _reconciler
+
+
+# ── MCP Tools ───────────────────────────────────────────────
+
+@mcp.tool()
+def hgp_create_operation(
+    op_type: str,
+    agent_id: str,
+    parent_op_ids: list[str] | None = None,
+    invalidates_op_ids: list[str] | None = None,
+    payload: str | None = None,
+    mime_type: str | None = None,
+    lease_id: str | None = None,
+    chain_hash: str | None = None,
+    subgraph_root_op_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a new operation in the causal history DAG."""
+    db, cas, lease_mgr, _ = _get_components()
+
+    # Validate parents exist
+    for pid in (parent_op_ids or []):
+        if not db.get_operation(pid):
+            raise ParentNotFoundError(f"Parent operation not found: {pid}")
+
+    root_op_id = subgraph_root_op_id or (parent_op_ids[0] if parent_op_ids else None)
+
+    # Phase 1: Pre-flight chain_hash check (advisory)
+    if chain_hash and root_op_id:
+        current = compute_chain_hash(db, root_op_id)
+        if current != chain_hash:
+            raise ChainStaleError(f"CHAIN_STALE: expected {chain_hash}, got {current}")
+
+    # Phase 2: Write blob to CAS (idempotent, outside transaction)
+    object_hash: str | None = None
+    if payload:
+        raw = base64.b64decode(payload)
+        object_hash = cas.store(raw)
+
+    # Phase 3: Atomic DB commit (BEGIN IMMEDIATE)
+    op_id = str(uuid.uuid4())
+    db.begin_immediate()
+    try:
+        # Re-validate under write lock (closes TOCTOU)
+        if chain_hash and root_op_id:
+            current = compute_chain_hash(db, root_op_id)
+            if current != chain_hash:
+                db.rollback()
+                raise ChainStaleError(f"CHAIN_STALE (under lock)")
+
+        seq = db.next_commit_seq()
+        db.insert_operation(
+            op_id=op_id,
+            op_type=op_type,
+            agent_id=agent_id,
+            commit_seq=seq,
+            chain_hash="sha256:pending",
+            object_hash=object_hash,
+            metadata=json.dumps(metadata) if metadata else None,
+            mime_type=mime_type,
+        )
+
+        for pid in (parent_op_ids or []):
+            db.insert_edge(op_id, pid, "causal")
+
+        for inv_id in (invalidates_op_ids or []):
+            db.insert_edge(op_id, inv_id, "invalidates")
+            db.update_operation_status(inv_id, "INVALIDATED")
+
+        # Compute final chain_hash AFTER all edges are inserted
+        new_root = subgraph_root_op_id or op_id
+        final_chain_hash = compute_chain_hash(db, new_root)
+        db.execute(
+            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
+            (final_chain_hash, op_id),
+        )
+
+        if lease_id:
+            db.execute(
+                "UPDATE leases SET status = 'RELEASED' WHERE lease_id = ? AND status = 'ACTIVE'",
+                (lease_id,),
+            )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "op_id": op_id,
+        "status": "COMPLETED",
+        "commit_seq": seq,
+        "object_hash": object_hash,
+        "chain_hash": final_chain_hash,
+    }
+
+
+@mcp.tool()
+def hgp_query_operations(
+    op_id: str | None = None,
+    agent_id: str | None = None,
+    op_type: str | None = None,
+    status: str | None = None,
+    since_commit_seq: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Query operations with optional filters."""
+    db, _, _, _ = _get_components()
+    if op_id:
+        op = db.get_operation(op_id)
+        return [op] if op else []
+    return db.query_operations(status=status, agent_id=agent_id, limit=limit)
+
+
+@mcp.tool()
+def hgp_query_subgraph(
+    root_op_id: str,
+    direction: str = "ancestors",
+    max_depth: int = 50,
+    include_invalidated: bool = False,
+) -> dict[str, Any]:
+    """Traverse the causal subgraph from root_op_id."""
+    db, _, _, _ = _get_components()
+    chain_hash = compute_chain_hash(db, root_op_id)
+    if direction == "ancestors":
+        ops = get_ancestors(db, root_op_id)
+    else:
+        ops = get_descendants(db, root_op_id)
+    if not include_invalidated:
+        ops = [o for o in ops if o["status"] != "INVALIDATED"]
+    return {"root_op_id": root_op_id, "chain_hash": chain_hash, "operations": ops}
+
+
+@mcp.tool()
+def hgp_acquire_lease(
+    agent_id: str,
+    subgraph_root_op_id: str,
+    ttl_seconds: int = 300,
+) -> dict[str, Any]:
+    """Acquire a lease on a subgraph for optimistic concurrency."""
+    _, _, lease_mgr, _ = _get_components()
+    lease = lease_mgr.acquire(agent_id, subgraph_root_op_id, ttl_seconds)
+    return {
+        "lease_id": lease.lease_id,
+        "chain_hash": lease.chain_hash,
+        "expires_at": lease.expires_at.isoformat(),
+    }
+
+
+@mcp.tool()
+def hgp_validate_lease(lease_id: str, extend: bool = True) -> dict[str, Any]:
+    """Validate (PING) a lease token before LLM compute."""
+    _, _, lease_mgr, _ = _get_components()
+    return lease_mgr.validate(lease_id, extend=extend)
+
+
+@mcp.tool()
+def hgp_release_lease(lease_id: str) -> dict[str, Any]:
+    """Release a lease token explicitly."""
+    _, _, lease_mgr, _ = _get_components()
+    lease_mgr.release(lease_id)
+    return {"released": True, "lease_id": lease_id}
+
+
+@mcp.tool()
+def hgp_get_artifact(object_hash: str) -> dict[str, Any]:
+    """Retrieve blob content from CAS by hash."""
+    _, cas, _, _ = _get_components()
+    data = cas.read(object_hash)
+    if data is None:
+        return {"error": "NOT_FOUND", "object_hash": object_hash}
+    return {
+        "object_hash": object_hash,
+        "size": len(data),
+        "content": base64.b64encode(data).decode(),
+    }
+
+
+@mcp.tool()
+def hgp_anchor_git(
+    op_id: str,
+    git_commit_sha: str,
+    repository: str | None = None,
+) -> dict[str, Any]:
+    """Link an HGP operation to a Git commit SHA."""
+    db, _, _, _ = _get_components()
+    if len(git_commit_sha) != 40:
+        return {"error": "INVALID_SHA", "message": "git_commit_sha must be 40 hex chars"}
+    db.execute(
+        "INSERT OR IGNORE INTO git_anchors (op_id, git_commit_sha, repository) VALUES (?, ?, ?)",
+        (op_id, git_commit_sha, repository),
+    )
+    db.commit()
+    return {"anchored": True, "op_id": op_id, "git_commit_sha": git_commit_sha}
+
+
+@mcp.tool()
+def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
+    """Run crash recovery reconciler."""
+    _, _, _, reconciler = _get_components()
+    report = reconciler.reconcile(dry_run=dry_run)
+    return report.model_dump()
+
+
+if __name__ == "__main__":
+    mcp.run()
