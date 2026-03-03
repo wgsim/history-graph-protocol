@@ -19,11 +19,23 @@ def _setup(hgp_dirs: dict) -> tuple[Database, CAS, Reconciler]:
 def test_rule1_2_completed_with_missing_blob(hgp_dirs: dict):
     """DB says COMPLETED but blob missing → MISSING_BLOB."""
     db, cas, rec = _setup(hgp_dirs)
+    missing_hash = "sha256:" + "a" * 64
     db.begin_immediate()
-    db.insert_operation("op-1", "artifact", "agent-1", 1, "sha256:" + "a" * 64)
+    db.insert_operation("op-1", "artifact", "agent-1", 1, "sha256:placeholder", object_hash=missing_hash)
     db.commit()
     report = rec.reconcile()
-    assert "sha256:" + "a" * 64 in report.missing_blobs
+    assert missing_hash in report.missing_blobs
+
+
+def test_chain_hash_not_treated_as_blob(hgp_dirs: dict):
+    """chain_hash is a computed SHA-256 digest, NOT a CAS blob — must not trigger MISSING_BLOB."""
+    db, cas, rec = _setup(hgp_dirs)
+    db.begin_immediate()
+    # Insert op with only chain_hash set (no object_hash) — chain_hash must not be CAS-checked
+    db.insert_operation("op-2", "artifact", "agent-1", 1, "sha256:" + "b" * 64)
+    db.commit()
+    report = rec.reconcile()
+    assert report.missing_blobs == []
 
 
 def test_rule3_orphan_blob_old(hgp_dirs: dict):

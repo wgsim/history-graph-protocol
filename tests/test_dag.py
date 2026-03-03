@@ -99,3 +99,52 @@ def test_get_ancestors(hgp_dirs: dict):
     db.commit()
     ancestors = get_ancestors(db, "leaf")
     assert {a["op_id"] for a in ancestors} == {"leaf", "mid", "root"}
+
+
+def test_get_descendants(hgp_dirs: dict):
+    """get_descendants returns all children/grandchildren including root."""
+    db = _make_db(hgp_dirs)
+    db.begin_immediate()
+    db.insert_operation("root", "artifact", "agent-1", 1, "sha256:r")
+    db.insert_operation("child", "artifact", "agent-1", 2, "sha256:c")
+    db.insert_operation("grandchild", "artifact", "agent-1", 3, "sha256:g")
+    db.insert_edge("child", "root")
+    db.insert_edge("grandchild", "child")
+    db.commit()
+    descs = get_descendants(db, "root")
+    assert {d["op_id"] for d in descs} == {"root", "child", "grandchild"}
+
+
+def test_get_ancestors_max_depth(hgp_dirs: dict):
+    """max_depth=1 limits traversal to root + its direct parent only."""
+    db = _make_db(hgp_dirs)
+    db.begin_immediate()
+    db.insert_operation("a", "artifact", "agent-1", 1, "sha256:a")
+    db.insert_operation("b", "artifact", "agent-1", 2, "sha256:b")
+    db.insert_operation("c", "artifact", "agent-1", 3, "sha256:c")
+    db.insert_edge("b", "a")
+    db.insert_edge("c", "b")
+    db.commit()
+    # max_depth=1 from "c": should return c (depth 0) and b (depth 1), not a (depth 2)
+    ancestors = get_ancestors(db, "c", max_depth=1)
+    ids = {r["op_id"] for r in ancestors}
+    assert "c" in ids
+    assert "b" in ids
+    assert "a" not in ids
+
+
+def test_get_descendants_max_depth(hgp_dirs: dict):
+    """max_depth=1 limits traversal to root + its direct children only."""
+    db = _make_db(hgp_dirs)
+    db.begin_immediate()
+    db.insert_operation("a", "artifact", "agent-1", 1, "sha256:a")
+    db.insert_operation("b", "artifact", "agent-1", 2, "sha256:b")
+    db.insert_operation("c", "artifact", "agent-1", 3, "sha256:c")
+    db.insert_edge("b", "a")
+    db.insert_edge("c", "b")
+    db.commit()
+    descs = get_descendants(db, "a", max_depth=1)
+    ids = {r["op_id"] for r in descs}
+    assert "a" in ids
+    assert "b" in ids
+    assert "c" not in ids

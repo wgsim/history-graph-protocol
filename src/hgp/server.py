@@ -159,7 +159,7 @@ def hgp_query_operations(
     if op_id:
         op = db.get_operation(op_id)
         return [op] if op else []
-    return db.query_operations(status=status, agent_id=agent_id, limit=limit)
+    return db.query_operations(status=status, agent_id=agent_id, op_type=op_type, since_commit_seq=since_commit_seq, limit=limit)
 
 
 @mcp.tool()
@@ -173,9 +173,9 @@ def hgp_query_subgraph(
     db, _, _, _ = _get_components()
     chain_hash = compute_chain_hash(db, root_op_id)
     if direction == "ancestors":
-        ops = get_ancestors(db, root_op_id)
+        ops = get_ancestors(db, root_op_id, max_depth=max_depth)
     else:
-        ops = get_descendants(db, root_op_id)
+        ops = get_descendants(db, root_op_id, max_depth=max_depth)
     if not include_invalidated:
         ops = [o for o in ops if o["status"] != "INVALIDATED"]
     return {"root_op_id": root_op_id, "chain_hash": chain_hash, "operations": ops}

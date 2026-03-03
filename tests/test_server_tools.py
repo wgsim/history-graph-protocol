@@ -1,0 +1,383 @@
+"""Tests for MCP tool functions in server.py.
+
+Monkey-patches server module globals to inject an isolated tmp DB/CAS,
+bypassing the _get_components() lazy-init guard (_db is None check).
+"""
+
+from __future__ import annotations
+
+import base64
+import pytest
+from pathlib import Path
+from typing import Any
+
+import hgp.server as server_module
+from hgp.server import (
+    hgp_create_operation,
+    hgp_query_operations,
+    hgp_query_subgraph,
+    hgp_acquire_lease,
+    hgp_validate_lease,
+    hgp_release_lease,
+    hgp_get_artifact,
+    hgp_anchor_git,
+    hgp_reconcile,
+)
+from hgp.db import Database
+from hgp.cas import CAS
+from hgp.lease import LeaseManager
+from hgp.reconciler import Reconciler
+from hgp.errors import ChainStaleError, ParentNotFoundError, PayloadTooLargeError
+
+
+@pytest.fixture
+def server_components(tmp_path: Path):
+    """Inject temp DB/CAS into server module globals, bypassing lazy init."""
+    content_dir = tmp_path / ".hgp_content"
+    content_dir.mkdir()
+
+    db = Database(tmp_path / "hgp.db")
+    db.initialize()
+    cas = CAS(content_dir)
+    lease_mgr = LeaseManager(db)
+    reconciler = Reconciler(db, cas, content_dir)
+
+    # Save originals
+    orig = (server_module._db, server_module._cas, server_module._lease_mgr, server_module._reconciler)
+
+    # Patch globals
+    server_module._db = db
+    server_module._cas = cas
+    server_module._lease_mgr = lease_mgr
+    server_module._reconciler = reconciler
+
+    yield {"db": db, "cas": cas, "lease_mgr": lease_mgr, "reconciler": reconciler, "content_dir": content_dir}
+
+    # Restore originals
+    server_module._db, server_module._cas, server_module._lease_mgr, server_module._reconciler = orig
+    db.close()
+
+
+# ── Task 1 Smoke test ────────────────────────────────────────────────────────
+
+def test_smoke_create_operation(server_components):
+    result = hgp_create_operation(op_type="artifact", agent_id="a")
+    assert "op_id" in result
+    assert result["status"] == "COMPLETED"
+    assert result["commit_seq"] >= 1
+    assert result["object_hash"] is None
+    assert result["chain_hash"].startswith("sha256:")
+
+
+# ── Task 5: hgp_create_operation ────────────────────────────────────────────
+
+def test_create_with_payload(server_components):
+    """Payload base64-encoded → stored in CAS → round-trip via get_artifact."""
+    raw = b"hello hgp"
+    encoded = base64.b64encode(raw).decode()
+    result = hgp_create_operation(op_type="artifact", agent_id="a", payload=encoded)
+    assert result["object_hash"] is not None
+    art = hgp_get_artifact(result["object_hash"])
+    assert base64.b64decode(art["content"]) == raw
+
+
+def test_create_with_parents(server_components):
+    """Parent edges are stored; child's ancestor includes parent."""
+    parent = hgp_create_operation(op_type="artifact", agent_id="a")
+    child = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[parent["op_id"]])
+    db = server_components["db"]
+    edge = db.execute(
+        "SELECT * FROM op_edges WHERE child_op_id=? AND parent_op_id=?",
+        (child["op_id"], parent["op_id"]),
+    ).fetchone()
+    assert edge is not None
+    assert edge["edge_type"] == "causal"
+
+
+def test_create_parent_not_found(server_components):
+    with pytest.raises(ParentNotFoundError):
+        hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=["nonexistent-id"])
+
+
+def test_create_chain_stale(server_components):
+    """Providing an outdated chain_hash raises ChainStaleError."""
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    stale_hash = op["chain_hash"]
+    # Mutate the subgraph
+    server_components["db"].update_operation_status(op["op_id"], "INVALIDATED")
+    server_components["db"].commit()
+    with pytest.raises(ChainStaleError):
+        hgp_create_operation(
+            op_type="artifact",
+            agent_id="a",
+            parent_op_ids=[op["op_id"]],
+            subgraph_root_op_id=op["op_id"],
+            chain_hash=stale_hash,
+        )
+
+
+def test_create_invalidates_cascade(server_components):
+    """Creating an op with invalidates_op_ids sets target to INVALIDATED."""
+    target = hgp_create_operation(op_type="artifact", agent_id="a")
+    hgp_create_operation(
+        op_type="invalidation",
+        agent_id="a",
+        invalidates_op_ids=[target["op_id"]],
+    )
+    db = server_components["db"]
+    row = db.get_operation(target["op_id"])
+    assert row is not None
+    assert row["status"] == "INVALIDATED"
+
+
+def test_create_lease_auto_release(server_components):
+    """Providing lease_id in create releases the lease."""
+    parent = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=parent["op_id"])
+    hgp_create_operation(
+        op_type="artifact",
+        agent_id="a",
+        parent_op_ids=[parent["op_id"]],
+        lease_id=lease["lease_id"],
+    )
+    db = server_components["db"]
+    row = db.execute("SELECT status FROM leases WHERE lease_id=?", (lease["lease_id"],)).fetchone()
+    assert row["status"] == "RELEASED"
+
+
+def test_create_with_metadata(server_components):
+    """Metadata dict is round-trippable via query_operations."""
+    meta = {"model": "claude-sonnet-4-6", "version": 1}
+    result = hgp_create_operation(op_type="artifact", agent_id="a", metadata=meta)
+    ops = hgp_query_operations(op_id=result["op_id"])
+    import json
+    assert json.loads(ops[0]["metadata"]) == meta
+
+
+# ── Task 5: hgp_query_operations ────────────────────────────────────────────
+
+def test_query_by_op_id(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    ops = hgp_query_operations(op_id=r["op_id"])
+    assert len(ops) == 1
+    assert ops[0]["op_id"] == r["op_id"]
+
+
+def test_query_by_agent_id(server_components):
+    hgp_create_operation(op_type="artifact", agent_id="agent-x")
+    hgp_create_operation(op_type="artifact", agent_id="agent-y")
+    ops = hgp_query_operations(agent_id="agent-x")
+    assert all(o["agent_id"] == "agent-x" for o in ops)
+    assert len(ops) == 1
+
+
+def test_query_by_status(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=[r["op_id"]])
+    ops = hgp_query_operations(status="INVALIDATED")
+    assert any(o["op_id"] == r["op_id"] for o in ops)
+
+
+def test_query_by_op_type(server_components):
+    """op_type filter must be forwarded to db.query_operations (Bug 2 fix)."""
+    hgp_create_operation(op_type="artifact", agent_id="a")
+    hgp_create_operation(op_type="hypothesis", agent_id="a")
+    ops = hgp_query_operations(op_type="hypothesis")
+    assert len(ops) == 1
+    assert ops[0]["op_type"] == "hypothesis"
+
+
+def test_query_by_since_commit_seq(server_components):
+    """since_commit_seq filter must be forwarded to db.query_operations (Bug 2 fix)."""
+    r1 = hgp_create_operation(op_type="artifact", agent_id="a")
+    r2 = hgp_create_operation(op_type="artifact", agent_id="a")
+    r3 = hgp_create_operation(op_type="artifact", agent_id="a")
+    seq1 = r1["commit_seq"]
+    ops = hgp_query_operations(since_commit_seq=seq1)
+    op_ids = {o["op_id"] for o in ops}
+    assert r1["op_id"] not in op_ids
+    assert r2["op_id"] in op_ids
+    assert r3["op_id"] in op_ids
+
+
+# ── Task 5: hgp_query_subgraph ───────────────────────────────────────────────
+
+def test_query_subgraph_ancestors(server_components):
+    a = hgp_create_operation(op_type="artifact", agent_id="a")
+    b = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[a["op_id"]])
+    result = hgp_query_subgraph(root_op_id=b["op_id"], direction="ancestors")
+    ids = {o["op_id"] for o in result["operations"]}
+    assert a["op_id"] in ids
+    assert b["op_id"] in ids
+
+
+def test_query_subgraph_descendants(server_components):
+    a = hgp_create_operation(op_type="artifact", agent_id="a")
+    b = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[a["op_id"]])
+    result = hgp_query_subgraph(root_op_id=a["op_id"], direction="descendants")
+    ids = {o["op_id"] for o in result["operations"]}
+    assert a["op_id"] in ids
+    assert b["op_id"] in ids
+
+
+def test_query_subgraph_max_depth(server_components):
+    """max_depth=1 from root A should return only A and B (not C or D). Bug 3 fix."""
+    a = hgp_create_operation(op_type="artifact", agent_id="a")
+    b = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[a["op_id"]])
+    c = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[b["op_id"]])
+    d = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[c["op_id"]])
+    result = hgp_query_subgraph(root_op_id=a["op_id"], direction="descendants", max_depth=1)
+    ids = {o["op_id"] for o in result["operations"]}
+    assert a["op_id"] in ids
+    assert b["op_id"] in ids
+    assert c["op_id"] not in ids
+    assert d["op_id"] not in ids
+
+
+def test_query_subgraph_include_invalidated(server_components):
+    """include_invalidated=False (default) filters INVALIDATED ops."""
+    a = hgp_create_operation(op_type="artifact", agent_id="a")
+    b = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[a["op_id"]])
+    hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=[b["op_id"]])
+
+    result_no_inv = hgp_query_subgraph(root_op_id=b["op_id"], direction="ancestors", include_invalidated=False)
+    ids_no_inv = {o["op_id"] for o in result_no_inv["operations"]}
+    assert b["op_id"] not in ids_no_inv
+
+    result_with_inv = hgp_query_subgraph(root_op_id=b["op_id"], direction="ancestors", include_invalidated=True)
+    ids_with_inv = {o["op_id"] for o in result_with_inv["operations"]}
+    assert b["op_id"] in ids_with_inv
+
+
+# ── Task 5: hgp_get_artifact ─────────────────────────────────────────────────
+
+def test_get_artifact_roundtrip(server_components):
+    raw = b"artifact content bytes"
+    encoded = base64.b64encode(raw).decode()
+    r = hgp_create_operation(op_type="artifact", agent_id="a", payload=encoded)
+    art = hgp_get_artifact(r["object_hash"])
+    assert art["object_hash"] == r["object_hash"]
+    assert art["size"] == len(raw)
+    assert base64.b64decode(art["content"]) == raw
+
+
+def test_get_artifact_not_found(server_components):
+    result = hgp_get_artifact("sha256:" + "0" * 64)
+    assert result["error"] == "NOT_FOUND"
+
+
+# ── Task 5: lease lifecycle ───────────────────────────────────────────────────
+
+def test_lease_lifecycle(server_components):
+    """acquire → validate → release full lifecycle."""
+    root = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=root["op_id"])
+    assert "lease_id" in lease
+    assert lease["chain_hash"].startswith("sha256:")
+
+    validated = hgp_validate_lease(lease["lease_id"])
+    assert validated["valid"] is True
+
+    released = hgp_release_lease(lease["lease_id"])
+    assert released["released"] is True
+
+    after = hgp_validate_lease(lease["lease_id"])
+    assert after["valid"] is False
+
+
+def test_lease_validate_extend_false(server_components):
+    """extend=False returns current expires_at without updating it."""
+    root = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=root["op_id"], ttl_seconds=300)
+    original_expires = server_components["db"].execute(
+        "SELECT expires_at FROM leases WHERE lease_id=?", (lease["lease_id"],)
+    ).fetchone()["expires_at"]
+
+    hgp_validate_lease(lease["lease_id"], extend=False)
+
+    after_expires = server_components["db"].execute(
+        "SELECT expires_at FROM leases WHERE lease_id=?", (lease["lease_id"],)
+    ).fetchone()["expires_at"]
+    assert original_expires == after_expires
+
+
+def test_lease_not_found(server_components):
+    result = hgp_validate_lease("nonexistent-lease-id")
+    assert result["valid"] is False
+    assert result["reason"] == "LEASE_NOT_FOUND"
+
+
+# ── Task 5: git anchor ────────────────────────────────────────────────────────
+
+def test_git_anchor_basic(server_components):
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    sha = "a" * 40
+    result = hgp_anchor_git(op_id=op["op_id"], git_commit_sha=sha)
+    assert result["anchored"] is True
+    assert result["git_commit_sha"] == sha
+
+
+def test_git_anchor_invalid_sha(server_components):
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_anchor_git(op_id=op["op_id"], git_commit_sha="tooshort")
+    assert result["error"] == "INVALID_SHA"
+
+
+def test_git_anchor_idempotent(server_components):
+    """Anchoring the same op+sha twice must not raise (INSERT OR IGNORE)."""
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    sha = "b" * 40
+    hgp_anchor_git(op_id=op["op_id"], git_commit_sha=sha)
+    result = hgp_anchor_git(op_id=op["op_id"], git_commit_sha=sha)
+    assert result["anchored"] is True
+
+
+# ── Task 5: reconcile ────────────────────────────────────────────────────────
+
+def test_reconcile_through_tool(server_components):
+    """Reconcile tool finds operation with missing CAS blob."""
+    db = server_components["db"]
+    missing_hash = "sha256:" + "c" * 64
+    db.begin_immediate()
+    db.insert_operation("op-missing", "artifact", "agent-1", 999, "sha256:placeholder", object_hash=missing_hash)
+    db.commit()
+    report = hgp_reconcile(dry_run=True)
+    assert missing_hash in report["missing_blobs"]
+
+
+def test_reconcile_dry_run_no_mutation(server_components):
+    """dry_run=True must not change operation status."""
+    db = server_components["db"]
+    missing_hash = "sha256:" + "d" * 64
+    db.begin_immediate()
+    db.insert_operation("op-dry", "artifact", "agent-1", 998, "sha256:placeholder", object_hash=missing_hash)
+    db.commit()
+    hgp_reconcile(dry_run=True)
+    row = db.get_operation("op-dry")
+    assert row is not None
+    assert row["status"] == "COMPLETED"  # not mutated
+
+
+# ── Task 7: Edge cases ────────────────────────────────────────────────────────
+
+def test_create_empty_payload(server_components):
+    """Empty base64 payload (b'') is treated as no payload."""
+    empty_b64 = base64.b64encode(b"").decode()
+    result = hgp_create_operation(op_type="artifact", agent_id="a", payload=empty_b64)
+    assert result["object_hash"] is None
+
+
+def test_create_max_payload_ok(server_components):
+    """Exactly 10 MB payload is accepted."""
+    MAX = 10 * 1024 * 1024
+    payload = base64.b64encode(b"x" * MAX).decode()
+    result = hgp_create_operation(op_type="artifact", agent_id="a", payload=payload)
+    assert result["object_hash"] is not None
+
+
+def test_create_max_payload_exceeded(server_components):
+    """10 MB + 1 byte raises PayloadTooLargeError."""
+    TOO_BIG = 10 * 1024 * 1024 + 1
+    payload = base64.b64encode(b"x" * TOO_BIG).decode()
+    with pytest.raises(PayloadTooLargeError):
+        hgp_create_operation(op_type="artifact", agent_id="a", payload=payload)

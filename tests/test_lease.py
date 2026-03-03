@@ -51,3 +51,17 @@ def test_release_lease(hgp_dirs: dict):
     mgr.release(lease.lease_id)
     row = db.execute("SELECT status FROM leases WHERE lease_id=?", (lease.lease_id,)).fetchone()
     assert row["status"] == "RELEASED"
+
+
+def test_validate_expired_lease(hgp_dirs: dict):
+    """Lease with expires_at in the past is reported as LEASE_EXPIRED."""
+    db, mgr = _setup(hgp_dirs)
+    lease = mgr.acquire("agent-1", "root-op", ttl_seconds=300)
+    # Manually backdate the lease to 1 second ago
+    from datetime import datetime, timezone, timedelta
+    past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    db.execute("UPDATE leases SET expires_at = ? WHERE lease_id = ?", (past, lease.lease_id))
+    db.commit()
+    result = mgr.validate(lease.lease_id)
+    assert result["valid"] is False
+    assert result["reason"] == "LEASE_EXPIRED"

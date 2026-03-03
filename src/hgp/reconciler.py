@@ -23,16 +23,14 @@ class Reconciler:
         now = datetime.now(timezone.utc)
 
         # Rules 1 & 2: COMPLETED op with missing blob → MISSING_BLOB
-        # Check both object_hash and chain_hash as potential CAS blob references.
+        # Only object_hash references a CAS blob; chain_hash is a computed digest, not a stored blob.
         completed_ops = self._db.query_operations(status="COMPLETED")
         for op in completed_ops:
-            for field in ("object_hash", "chain_hash"):
-                candidate = op.get(field)
-                if candidate and not self._cas.exists(candidate):
-                    report.missing_blobs.append(candidate)
-                    if not dry_run:
-                        self._db.update_operation_status(op["op_id"], "MISSING_BLOB")
-                    break  # One report per operation
+            candidate = op.get("object_hash")
+            if candidate and not self._cas.exists(candidate):
+                report.missing_blobs.append(candidate)
+                if not dry_run:
+                    self._db.update_operation_status(op["op_id"], "MISSING_BLOB")
 
         # Rule 3: Blob with no DB reference + older than grace → ORPHAN_CANDIDATE
         for obj_hash, mtime in self._cas.list_all_blobs_with_mtime():

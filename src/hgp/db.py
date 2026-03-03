@@ -187,6 +187,8 @@ class Database:
         self,
         status: str | None = None,
         agent_id: str | None = None,
+        op_type: str | None = None,
+        since_commit_seq: int | None = None,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
         assert self._conn
@@ -198,6 +200,12 @@ class Database:
         if agent_id:
             clauses.append("agent_id = ?")
             params.append(agent_id)
+        if op_type:
+            clauses.append("op_type = ?")
+            params.append(op_type)
+        if since_commit_seq is not None:
+            clauses.append("commit_seq > ?")
+            params.append(since_commit_seq)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         rows = self._conn.execute(

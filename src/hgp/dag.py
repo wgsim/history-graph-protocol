@@ -50,6 +50,36 @@ JOIN descendants d ON o.op_id = d.op_id
 ORDER BY o.commit_seq
 """
 
+_ANCESTOR_DEPTH_SQL = """
+WITH RECURSIVE ancestors(op_id, depth) AS (
+    SELECT :root_op_id, 0
+    UNION
+    SELECT e.parent_op_id, a.depth + 1
+    FROM op_edges e
+    JOIN ancestors a ON e.child_op_id = a.op_id
+    WHERE a.depth < :max_depth
+)
+SELECT o.op_id, o.status, o.commit_seq
+FROM operations o
+JOIN ancestors a ON o.op_id = a.op_id
+ORDER BY o.op_id
+"""
+
+_DESCENDANTS_DEPTH_SQL = """
+WITH RECURSIVE descendants(op_id, depth) AS (
+    SELECT :root_op_id, 0
+    UNION
+    SELECT e.child_op_id, d.depth + 1
+    FROM op_edges e
+    JOIN descendants d ON e.parent_op_id = d.op_id
+    WHERE d.depth < :max_depth
+)
+SELECT o.*
+FROM operations o
+JOIN descendants d ON o.op_id = d.op_id
+ORDER BY o.commit_seq
+"""
+
 
 def compute_chain_hash(db: Database, root_op_id: str) -> str:
     """Compute the chain_hash for a subgraph rooted at root_op_id.
@@ -70,13 +100,19 @@ def compute_chain_hash(db: Database, root_op_id: str) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def get_ancestors(db: Database, root_op_id: str) -> list[dict[str, Any]]:
+def get_ancestors(db: Database, root_op_id: str, max_depth: int | None = None) -> list[dict[str, Any]]:
     """Return all ancestor operations including root, sorted by op_id."""
-    rows = db.execute(_ANCESTOR_SQL, {"root_op_id": root_op_id}).fetchall()
+    if max_depth is None:
+        rows = db.execute(_ANCESTOR_SQL, {"root_op_id": root_op_id}).fetchall()
+    else:
+        rows = db.execute(_ANCESTOR_DEPTH_SQL, {"root_op_id": root_op_id, "max_depth": max_depth}).fetchall()
     return [dict(r) for r in rows]
 
 
-def get_descendants(db: Database, root_op_id: str) -> list[dict[str, Any]]:
+def get_descendants(db: Database, root_op_id: str, max_depth: int | None = None) -> list[dict[str, Any]]:
     """Return all descendant operations including root, sorted by commit_seq."""
-    rows = db.execute(_DESCENDANTS_SQL, {"root_op_id": root_op_id}).fetchall()
+    if max_depth is None:
+        rows = db.execute(_DESCENDANTS_SQL, {"root_op_id": root_op_id}).fetchall()
+    else:
+        rows = db.execute(_DESCENDANTS_DEPTH_SQL, {"root_op_id": root_op_id, "max_depth": max_depth}).fetchall()
     return [dict(r) for r in rows]
