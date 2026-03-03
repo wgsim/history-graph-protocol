@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
@@ -50,7 +50,7 @@ class Operation(BaseModel):
     object_hash: str | None = None
     chain_hash: str | None = None
     metadata: dict[str, Any] | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
 
 
@@ -65,7 +65,7 @@ class StoredObject(BaseModel):
     size: int
     mime_type: str | None = None
     status: ObjectStatus = ObjectStatus.VALID
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     gc_marked_at: datetime | None = None
 
 
@@ -74,7 +74,7 @@ class Lease(BaseModel):
     agent_id: str
     subgraph_root_op_id: str
     chain_hash: str
-    issued_at: datetime = Field(default_factory=datetime.utcnow)
+    issued_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime
     status: LeaseStatus = LeaseStatus.ACTIVE
 
@@ -83,7 +83,7 @@ class GitAnchor(BaseModel):
     op_id: str
     git_commit_sha: str  # 40-char hex
     repository: str | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class ReconcileReport(BaseModel):
