@@ -60,7 +60,7 @@ class Reconciler:
             self._db.commit()
         else:
             pulse_row = self._db.execute(
-                "SELECT COALESCE(MAX(last_accessed), MAX(created_at)) FROM operations"
+                "SELECT MAX(COALESCE(last_accessed, created_at)) FROM operations"
             ).fetchone()
             if pulse_row and pulse_row[0]:
                 row = self._db.execute(

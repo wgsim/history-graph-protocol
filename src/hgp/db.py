@@ -274,11 +274,7 @@ class Database:
             )
         else:
             self._conn.execute(
-                """UPDATE operations
-                   SET access_count = access_count + ?,
-                       memory_tier = CASE WHEN memory_tier = 'inactive' THEN 'long_term'
-                                         ELSE memory_tier END
-                   WHERE op_id = ?""",
+                "UPDATE operations SET access_count = access_count + ? WHERE op_id = ?",
                 (weight, op_id),
             )
 
@@ -296,7 +292,7 @@ class Database:
         """
         assert self._conn
         pulse_row = self._conn.execute(
-            "SELECT COALESCE(MAX(last_accessed), MAX(created_at)) FROM operations"
+            "SELECT MAX(COALESCE(last_accessed, created_at)) FROM operations"
         ).fetchone()
         if not pulse_row or pulse_row[0] is None:
             return 0
@@ -321,11 +317,14 @@ class Database:
             """
         )
         # Demote short_term ops whose only active lease just expired
+        # NOT EXISTS is used instead of NOT IN to avoid NULL-sensitivity issues
         self._conn.execute(
             """UPDATE operations SET memory_tier = 'long_term'
                WHERE memory_tier = 'short_term'
-                 AND op_id NOT IN (
-                     SELECT subgraph_root_op_id FROM leases WHERE status = 'ACTIVE'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM leases
+                     WHERE leases.subgraph_root_op_id = operations.op_id
+                       AND leases.status = 'ACTIVE'
                  )"""
         )
         return cur.rowcount
