@@ -114,3 +114,17 @@ def test_reconcile_demote_dry_run(hgp_dirs: dict):
     report = rec.reconcile(dry_run=True)
     assert report.demoted_to_inactive >= 1
     assert db.get_operation("old-op")["memory_tier"] == "long_term"  # not mutated
+
+
+def test_reconcile_checks_inactive_ops_for_missing_blob(hgp_dirs: dict):
+    """Fix 1: inactive COMPLETED ops must still be checked for blob integrity."""
+    missing_hash = "sha256:" + "b" * 64
+    db, cas, rec = _setup(hgp_dirs)
+    db.begin_immediate()
+    db.insert_operation("inactive-op", "artifact", "agent-1", 1, "sha256:placeholder",
+                        object_hash=missing_hash)
+    db.commit()
+    db.execute("UPDATE operations SET memory_tier = 'inactive' WHERE op_id = 'inactive-op'")
+    db.commit()
+    report = rec.reconcile()
+    assert missing_hash in report.missing_blobs

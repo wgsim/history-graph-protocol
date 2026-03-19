@@ -492,3 +492,27 @@ def test_set_memory_tier_invalid(server_components):
     r = hgp_create_operation(op_type="artifact", agent_id="a")
     result = hgp_set_memory_tier(op_id=r["op_id"], tier="nonexistent")
     assert "error" in result
+
+
+def test_release_lease_with_another_active_lease_keeps_short_term(server_components):
+    """Fix 2: releasing one lease must not demote root if another active lease exists."""
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease1 = hgp_acquire_lease(agent_id="agent-1", subgraph_root_op_id=r["op_id"])
+    lease2 = hgp_acquire_lease(agent_id="agent-2", subgraph_root_op_id=r["op_id"])
+    hgp_release_lease(lease1["lease_id"])
+    assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "short_term"
+    hgp_release_lease(lease2["lease_id"])
+    assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "long_term"
+
+
+def test_create_operation_auto_release_demotes_root(server_components):
+    """Fix 3: create_operation(lease_id=...) auto-release path must demote root to long_term."""
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=r["op_id"])
+    assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "short_term"
+    hgp_create_operation(
+        op_type="artifact", agent_id="a",
+        parent_op_ids=[r["op_id"]],
+        lease_id=lease["lease_id"],
+    )
+    assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "long_term"

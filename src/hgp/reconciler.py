@@ -24,7 +24,7 @@ class Reconciler:
 
         # Rules 1 & 2: COMPLETED op with missing blob → MISSING_BLOB
         # Only object_hash references a CAS blob; chain_hash is a computed digest, not a stored blob.
-        completed_ops = self._db.query_operations(status="COMPLETED")
+        completed_ops = self._db.query_operations(status="COMPLETED", include_inactive=True)
         for op in completed_ops:
             candidate = op.get("object_hash")
             if candidate and not self._cas.exists(candidate):

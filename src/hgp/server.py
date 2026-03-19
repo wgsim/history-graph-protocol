@@ -126,10 +126,21 @@ def hgp_create_operation(
         )
 
         if lease_id:
+            lease_root = db.execute(
+                "SELECT subgraph_root_op_id FROM leases WHERE lease_id = ? AND status = 'ACTIVE'",
+                (lease_id,),
+            ).fetchone()
             db.execute(
                 "UPDATE leases SET status = 'RELEASED' WHERE lease_id = ? AND status = 'ACTIVE'",
                 (lease_id,),
             )
+            if lease_root:
+                other_active = db.execute(
+                    "SELECT COUNT(*) FROM leases WHERE subgraph_root_op_id = ? AND status = 'ACTIVE'",
+                    (lease_root["subgraph_root_op_id"],),
+                ).fetchone()[0]
+                if other_active == 0:
+                    db.set_memory_tier(lease_root["subgraph_root_op_id"], "long_term")
 
         db.commit()
     except Exception:
@@ -250,8 +261,13 @@ def hgp_release_lease(lease_id: str) -> dict[str, Any]:
     ).fetchone()
     lease_mgr.release(lease_id)
     if root_row:
-        db.set_memory_tier(root_row["subgraph_root_op_id"], "long_term")
-        db.commit()
+        other_active = db.execute(
+            "SELECT COUNT(*) FROM leases WHERE subgraph_root_op_id = ? AND status = 'ACTIVE'",
+            (root_row["subgraph_root_op_id"],),
+        ).fetchone()[0]
+        if other_active == 0:
+            db.set_memory_tier(root_row["subgraph_root_op_id"], "long_term")
+            db.commit()
     return {"released": True, "lease_id": lease_id}
 
 
