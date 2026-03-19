@@ -109,15 +109,17 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
-        # V2 migration: add memory tier columns to existing DBs
+        # V2 migration: add memory tier columns to existing DBs (each column guarded independently)
         existing_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(operations)").fetchall()}
+        if "access_count" not in existing_cols:
+            self._conn.execute("ALTER TABLE operations ADD COLUMN access_count REAL NOT NULL DEFAULT 0.0")
+        if "last_accessed" not in existing_cols:
+            self._conn.execute("ALTER TABLE operations ADD COLUMN last_accessed TEXT")
         if "memory_tier" not in existing_cols:
-            self._conn.executescript("""
-                ALTER TABLE operations ADD COLUMN access_count REAL NOT NULL DEFAULT 0.0;
-                ALTER TABLE operations ADD COLUMN last_accessed TEXT;
-                ALTER TABLE operations ADD COLUMN memory_tier TEXT NOT NULL DEFAULT 'long_term'
-                    CHECK (memory_tier IN ('short_term', 'long_term', 'inactive'));
-            """)
+            self._conn.execute(
+                "ALTER TABLE operations ADD COLUMN memory_tier TEXT NOT NULL DEFAULT 'long_term'"
+                " CHECK (memory_tier IN ('short_term', 'long_term', 'inactive'))"
+            )
 
     def close(self) -> None:
         if self._conn:
