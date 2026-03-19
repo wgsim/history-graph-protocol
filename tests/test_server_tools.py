@@ -381,3 +381,114 @@ def test_create_max_payload_exceeded(server_components):
     payload = base64.b64encode(b"x" * TOO_BIG).decode()
     with pytest.raises(PayloadTooLargeError):
         hgp_create_operation(op_type="artifact", agent_id="a", payload=payload)
+
+
+# ── V2 Memory Tier Tests ─────────────────────────────────────
+
+from hgp.server import hgp_set_memory_tier
+
+
+def test_acquire_lease_promotes_to_short_term(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "long_term"
+    hgp_acquire_lease(agent_id="a", subgraph_root_op_id=r["op_id"])
+    assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "short_term"
+
+
+def test_release_lease_demotes_to_long_term(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=r["op_id"])
+    hgp_release_lease(lease["lease_id"])
+    assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "long_term"
+
+
+def test_query_inactive_excluded_by_default(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    server_components["db"].set_memory_tier(r["op_id"], "inactive")
+    server_components["db"].commit()
+    ops = hgp_query_operations()
+    assert r["op_id"] not in {o["op_id"] for o in ops}
+
+
+def test_query_inactive_included_when_requested(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    server_components["db"].set_memory_tier(r["op_id"], "inactive")
+    server_components["db"].commit()
+    ops = hgp_query_operations(include_inactive=True)
+    assert r["op_id"] in {o["op_id"] for o in ops}
+
+
+def test_query_by_op_id_records_access(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    hgp_query_operations(op_id=r["op_id"])
+    op = server_components["db"].get_operation(r["op_id"])
+    assert op["access_count"] == pytest.approx(1.0)
+    assert op["last_accessed"] is not None
+
+
+def test_subgraph_records_access_with_decay(server_components):
+    a = hgp_create_operation(op_type="artifact", agent_id="a")
+    b = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[a["op_id"]])
+    hgp_query_subgraph(root_op_id=b["op_id"], direction="ancestors")
+    db = server_components["db"]
+    # b is root (depth 0) → weight 1.0; a is ancestor (depth 1) → weight 0.7
+    assert db.get_operation(b["op_id"])["access_count"] == pytest.approx(1.0)
+    assert db.get_operation(a["op_id"])["access_count"] == pytest.approx(0.7)
+
+
+def test_subgraph_depth3_no_last_accessed_update(server_components):
+    """Ops at depth >= 3 get access_count update but NOT last_accessed."""
+    ops = []
+    prev = None
+    for i in range(5):
+        o = hgp_create_operation(
+            op_type="artifact", agent_id="a",
+            parent_op_ids=[prev] if prev else None,
+        )
+        ops.append(o)
+        prev = o["op_id"]
+    # Query from the leaf (depth 0) — root is at depth 4
+    hgp_query_subgraph(root_op_id=ops[-1]["op_id"], direction="ancestors")
+    db = server_components["db"]
+    root_op = db.get_operation(ops[0]["op_id"])
+    assert root_op["access_count"] > 0        # access_count updated
+    assert root_op["last_accessed"] is None    # last_accessed NOT updated (depth 4)
+
+
+def test_subgraph_tier_projection(server_components):
+    """inactive ops return stub; long_term ops return summary."""
+    a = hgp_create_operation(op_type="artifact", agent_id="a")
+    b = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[a["op_id"]])
+    server_components["db"].set_memory_tier(a["op_id"], "inactive")
+    server_components["db"].commit()
+    result = hgp_query_subgraph(root_op_id=b["op_id"], direction="ancestors")
+    projected = {o["op_id"]: o for o in result["operations"]}
+    # b is long_term → summary fields only
+    assert "object_hash" not in projected[b["op_id"]]
+    assert "status" in projected[b["op_id"]]
+    # a is inactive → stub fields only
+    assert "status" not in projected[a["op_id"]]
+    assert projected[a["op_id"]]["memory_tier"] == "inactive"
+
+
+def test_query_tier_ordering(server_components):
+    a = hgp_create_operation(op_type="artifact", agent_id="a")
+    b = hgp_create_operation(op_type="artifact", agent_id="a")
+    server_components["db"].set_memory_tier(a["op_id"], "short_term")
+    server_components["db"].commit()
+    ops = hgp_query_operations()
+    ids = [o["op_id"] for o in ops]
+    assert ids.index(a["op_id"]) < ids.index(b["op_id"])
+
+
+def test_set_memory_tier_explicit(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_set_memory_tier(op_id=r["op_id"], tier="inactive")
+    assert result["tier"] == "inactive"
+    assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "inactive"
+
+
+def test_set_memory_tier_invalid(server_components):
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_set_memory_tier(op_id=r["op_id"], tier="nonexistent")
+    assert "error" in result

@@ -54,7 +54,21 @@ class Reconciler:
                 except FileNotFoundError:
                     pass  # Concurrent cleanup
 
+        # Rule 4: Tier demotion — ops not accessed within threshold become inactive
         if not dry_run:
+            report.demoted_to_inactive = self._db.demote_inactive(threshold_days=30)
             self._db.commit()
+        else:
+            pulse_row = self._db.execute(
+                "SELECT COALESCE(MAX(last_accessed), MAX(created_at)) FROM operations"
+            ).fetchone()
+            if pulse_row and pulse_row[0]:
+                row = self._db.execute(
+                    """SELECT COUNT(*) FROM operations
+                       WHERE memory_tier = 'long_term'
+                         AND (julianday(?) - julianday(COALESCE(last_accessed, created_at))) > 30""",
+                    (pulse_row[0],),
+                ).fetchone()
+                report.demoted_to_inactive = row[0] if row else 0
 
         return report

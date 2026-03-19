@@ -86,9 +86,16 @@ class GitAnchor(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class MemoryTier(StrEnum):
+    SHORT_TERM = "short_term"
+    LONG_TERM = "long_term"
+    INACTIVE = "inactive"
+
+
 class ReconcileReport(BaseModel):
     missing_blobs: list[str] = Field(default_factory=list)
     orphan_candidates: list[str] = Field(default_factory=list)
     staging_cleaned: int = 0
     skipped_young_blobs: int = 0
+    demoted_to_inactive: int = 0
     errors: list[str] = Field(default_factory=list)

@@ -50,6 +50,20 @@ JOIN descendants d ON o.op_id = d.op_id
 ORDER BY o.commit_seq
 """
 
+_ANCESTOR_FULL_SQL = """
+WITH RECURSIVE ancestors(op_id, depth) AS (
+    SELECT :root_op_id, 0
+    UNION
+    SELECT e.parent_op_id, a.depth + 1
+    FROM op_edges e
+    JOIN ancestors a ON e.child_op_id = a.op_id
+)
+SELECT o.*, a.depth
+FROM operations o
+JOIN ancestors a ON o.op_id = a.op_id
+ORDER BY a.depth, o.op_id
+"""
+
 _ANCESTOR_DEPTH_SQL = """
 WITH RECURSIVE ancestors(op_id, depth) AS (
     SELECT :root_op_id, 0
@@ -59,10 +73,24 @@ WITH RECURSIVE ancestors(op_id, depth) AS (
     JOIN ancestors a ON e.child_op_id = a.op_id
     WHERE a.depth < :max_depth
 )
-SELECT o.op_id, o.status, o.commit_seq
+SELECT o.*, a.depth
 FROM operations o
 JOIN ancestors a ON o.op_id = a.op_id
-ORDER BY o.op_id
+ORDER BY a.depth, o.op_id
+"""
+
+_DESCENDANTS_FULL_SQL = """
+WITH RECURSIVE descendants(op_id, depth) AS (
+    SELECT :root_op_id, 0
+    UNION
+    SELECT e.child_op_id, d.depth + 1
+    FROM op_edges e
+    JOIN descendants d ON e.parent_op_id = d.op_id
+)
+SELECT o.*, d.depth
+FROM operations o
+JOIN descendants d ON o.op_id = d.op_id
+ORDER BY d.depth, o.commit_seq
 """
 
 _DESCENDANTS_DEPTH_SQL = """
@@ -74,10 +102,10 @@ WITH RECURSIVE descendants(op_id, depth) AS (
     JOIN descendants d ON e.parent_op_id = d.op_id
     WHERE d.depth < :max_depth
 )
-SELECT o.*
+SELECT o.*, d.depth
 FROM operations o
 JOIN descendants d ON o.op_id = d.op_id
-ORDER BY o.commit_seq
+ORDER BY d.depth, o.commit_seq
 """
 
 
@@ -101,18 +129,18 @@ def compute_chain_hash(db: Database, root_op_id: str) -> str:
 
 
 def get_ancestors(db: Database, root_op_id: str, max_depth: int | None = None) -> list[dict[str, Any]]:
-    """Return all ancestor operations including root, sorted by op_id."""
+    """Return all ancestor operations including root, with CTE depth column."""
     if max_depth is None:
-        rows = db.execute(_ANCESTOR_SQL, {"root_op_id": root_op_id}).fetchall()
+        rows = db.execute(_ANCESTOR_FULL_SQL, {"root_op_id": root_op_id}).fetchall()
     else:
         rows = db.execute(_ANCESTOR_DEPTH_SQL, {"root_op_id": root_op_id, "max_depth": max_depth}).fetchall()
     return [dict(r) for r in rows]
 
 
 def get_descendants(db: Database, root_op_id: str, max_depth: int | None = None) -> list[dict[str, Any]]:
-    """Return all descendant operations including root, sorted by commit_seq."""
+    """Return all descendant operations including root, with CTE depth column."""
     if max_depth is None:
-        rows = db.execute(_DESCENDANTS_SQL, {"root_op_id": root_op_id}).fetchall()
+        rows = db.execute(_DESCENDANTS_FULL_SQL, {"root_op_id": root_op_id}).fetchall()
     else:
         rows = db.execute(_DESCENDANTS_DEPTH_SQL, {"root_op_id": root_op_id, "max_depth": max_depth}).fetchall()
     return [dict(r) for r in rows]

@@ -25,6 +25,10 @@ CREATE TABLE IF NOT EXISTS operations (
     metadata        TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     completed_at    TEXT,
+    access_count    REAL NOT NULL DEFAULT 0.0,
+    last_accessed   TEXT,
+    memory_tier     TEXT NOT NULL DEFAULT 'long_term'
+                        CHECK (memory_tier IN ('short_term', 'long_term', 'inactive')),
     FOREIGN KEY (object_hash) REFERENCES objects(hash)
 );
 
@@ -105,6 +109,15 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
+        # V2 migration: add memory tier columns to existing DBs
+        existing_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(operations)").fetchall()}
+        if "memory_tier" not in existing_cols:
+            self._conn.executescript("""
+                ALTER TABLE operations ADD COLUMN access_count REAL NOT NULL DEFAULT 0.0;
+                ALTER TABLE operations ADD COLUMN last_accessed TEXT;
+                ALTER TABLE operations ADD COLUMN memory_tier TEXT NOT NULL DEFAULT 'long_term'
+                    CHECK (memory_tier IN ('short_term', 'long_term', 'inactive'));
+            """)
 
     def close(self) -> None:
         if self._conn:
@@ -189,6 +202,7 @@ class Database:
         agent_id: str | None = None,
         op_type: str | None = None,
         since_commit_seq: int | None = None,
+        include_inactive: bool = False,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
         assert self._conn
@@ -206,10 +220,17 @@ class Database:
         if since_commit_seq is not None:
             clauses.append("commit_seq > ?")
             params.append(since_commit_seq)
+        if not include_inactive:
+            clauses.append("memory_tier != 'inactive'")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order = """ORDER BY CASE memory_tier
+            WHEN 'short_term' THEN 1
+            WHEN 'long_term'  THEN 2
+            WHEN 'inactive'   THEN 3
+        END, commit_seq DESC"""
         params.append(limit)
         rows = self._conn.execute(
-            f"SELECT * FROM operations {where} LIMIT ?", params
+            f"SELECT * FROM operations {where} {order} LIMIT ?", params
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -238,6 +259,57 @@ class Database:
             "UPDATE operations SET status = ? WHERE op_id = ?", (status, op_id)
         )
 
+    def record_access(self, op_id: str, weight: float = 1.0) -> None:
+        """Increment access counter; update last_accessed only for weight >= 0.4 (depth 0-2)."""
+        assert self._conn
+        if weight >= 0.4:
+            self._conn.execute(
+                """UPDATE operations
+                   SET access_count = access_count + ?,
+                       last_accessed = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                       memory_tier = CASE WHEN memory_tier = 'inactive' THEN 'long_term'
+                                         ELSE memory_tier END
+                   WHERE op_id = ?""",
+                (weight, op_id),
+            )
+        else:
+            self._conn.execute(
+                """UPDATE operations
+                   SET access_count = access_count + ?,
+                       memory_tier = CASE WHEN memory_tier = 'inactive' THEN 'long_term'
+                                         ELSE memory_tier END
+                   WHERE op_id = ?""",
+                (weight, op_id),
+            )
+
+    def set_memory_tier(self, op_id: str, tier: str) -> None:
+        assert self._conn
+        self._conn.execute(
+            "UPDATE operations SET memory_tier = ? WHERE op_id = ?", (tier, op_id)
+        )
+
+    def demote_inactive(self, threshold_days: int = 30) -> int:
+        """Demote long_term ops to inactive using relative project_pulse baseline.
+
+        inactive if: project_pulse - COALESCE(last_accessed, created_at) > threshold_days
+        project_pulse = MAX(last_accessed) or MAX(created_at) if nothing ever accessed.
+        """
+        assert self._conn
+        pulse_row = self._conn.execute(
+            "SELECT COALESCE(MAX(last_accessed), MAX(created_at)) FROM operations"
+        ).fetchone()
+        if not pulse_row or pulse_row[0] is None:
+            return 0
+        project_pulse = pulse_row[0]
+        cur = self._conn.execute(
+            """UPDATE operations
+               SET memory_tier = 'inactive'
+               WHERE memory_tier = 'long_term'
+                 AND (julianday(?) - julianday(COALESCE(last_accessed, created_at))) > ?""",
+            (project_pulse, threshold_days),
+        )
+        return cur.rowcount
+
     def expire_leases(self) -> int:
         """Mark all past-expiry ACTIVE leases as EXPIRED. Returns count."""
         assert self._conn
@@ -247,5 +319,13 @@ class Database:
             WHERE status = 'ACTIVE'
               AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             """
+        )
+        # Demote short_term ops whose only active lease just expired
+        self._conn.execute(
+            """UPDATE operations SET memory_tier = 'long_term'
+               WHERE memory_tier = 'short_term'
+                 AND op_id NOT IN (
+                     SELECT subgraph_root_op_id FROM leases WHERE status = 'ACTIVE'
+                 )"""
         )
         return cur.rowcount

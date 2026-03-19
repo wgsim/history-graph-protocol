@@ -85,3 +85,163 @@ def test_expire_leases(hgp_dirs: dict):
     new_row = db.execute("SELECT status FROM leases WHERE lease_id='lease-new'").fetchone()
     assert old_row["status"] == "EXPIRED"
     assert new_row["status"] == "ACTIVE"
+
+
+# ── V2 Memory Tier Tests ─────────────────────────────────────
+
+
+def test_memory_tier_columns_exist(hgp_dirs: dict):
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    cols = {row[1] for row in db.execute("PRAGMA table_info(operations)").fetchall()}
+    assert "memory_tier" in cols
+    assert "access_count" in cols
+    assert "last_accessed" in cols
+
+
+def test_access_count_is_real(hgp_dirs: dict):
+    """access_count must support fractional decay values."""
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("op-1", "artifact", "agent-1", 1, "sha256:x")
+    db.commit()
+    db.record_access("op-1", weight=0.7)
+    db.commit()
+    op = db.get_operation("op-1")
+    assert op["access_count"] == pytest.approx(0.7)
+
+
+def test_new_operation_default_tier(hgp_dirs: dict):
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("op-1", "artifact", "agent-1", 1, "sha256:x")
+    db.commit()
+    op = db.get_operation("op-1")
+    assert op["memory_tier"] == "long_term"
+    assert op["access_count"] == 0
+    assert op["last_accessed"] is None
+
+
+def test_record_access_full_weight(hgp_dirs: dict):
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("op-1", "artifact", "agent-1", 1, "sha256:x")
+    db.commit()
+    db.record_access("op-1")
+    db.commit()
+    op = db.get_operation("op-1")
+    assert op["access_count"] == pytest.approx(1.0)
+    assert op["last_accessed"] is not None
+
+
+def test_record_access_low_weight_no_last_accessed(hgp_dirs: dict):
+    """Depth 3+ (weight=0.1) must NOT update last_accessed."""
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("op-1", "artifact", "agent-1", 1, "sha256:x")
+    db.commit()
+    db.record_access("op-1", weight=0.1)
+    db.commit()
+    op = db.get_operation("op-1")
+    assert op["access_count"] == pytest.approx(0.1)
+    assert op["last_accessed"] is None  # NOT updated
+
+
+def test_record_access_promotes_inactive(hgp_dirs: dict):
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("op-2", "artifact", "agent-1", 1, "sha256:x")
+    db.commit()
+    db.execute("UPDATE operations SET memory_tier = 'inactive' WHERE op_id = 'op-2'")
+    db.commit()
+    db.record_access("op-2")
+    db.commit()
+    assert db.get_operation("op-2")["memory_tier"] == "long_term"
+
+
+def test_demote_inactive_relative_baseline(hgp_dirs: dict):
+    """Ops not accessed for > threshold relative to project_pulse are demoted."""
+    from datetime import datetime, timezone, timedelta
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("old-op", "artifact", "agent-1", 1, "sha256:x")
+    db.insert_operation("new-op", "artifact", "agent-1", 2, "sha256:y")
+    db.commit()
+    # old-op: last_accessed 40 days ago; new-op: accessed now
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    now_ts = datetime.now(timezone.utc).isoformat()
+    db.execute("UPDATE operations SET last_accessed = ? WHERE op_id = 'old-op'", (old_ts,))
+    db.execute("UPDATE operations SET last_accessed = ? WHERE op_id = 'new-op'", (now_ts,))
+    db.commit()
+    count = db.demote_inactive(threshold_days=30)
+    db.commit()
+    assert count == 1
+    assert db.get_operation("old-op")["memory_tier"] == "inactive"
+    assert db.get_operation("new-op")["memory_tier"] == "long_term"
+
+
+def test_demote_inactive_hibernated_project(hgp_dirs: dict):
+    """If all ops are old (hibernated project), none should be demoted."""
+    from datetime import datetime, timezone, timedelta
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("op-a", "artifact", "agent-1", 1, "sha256:x")
+    db.insert_operation("op-b", "artifact", "agent-1", 2, "sha256:y")
+    db.commit()
+    # Both ops accessed 60 days ago — hibernated project
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    db.execute("UPDATE operations SET last_accessed = ? WHERE op_id IN ('op-a', 'op-b')", (old_ts,))
+    db.commit()
+    count = db.demote_inactive(threshold_days=30)
+    # project_pulse = 60 days ago; both ops accessed at pulse → gap = 0 → not demoted
+    assert count == 0
+
+
+def test_query_excludes_inactive_by_default(hgp_dirs: dict):
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("active-op", "artifact", "agent-1", 1, "sha256:x")
+    db.insert_operation("inactive-op", "artifact", "agent-1", 2, "sha256:y")
+    db.commit()
+    db.execute("UPDATE operations SET memory_tier = 'inactive' WHERE op_id = 'inactive-op'")
+    db.commit()
+    results = db.query_operations()
+    ids = {r["op_id"] for r in results}
+    assert "active-op" in ids
+    assert "inactive-op" not in ids
+
+
+def test_query_includes_inactive_when_requested(hgp_dirs: dict):
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("inactive-op", "artifact", "agent-1", 1, "sha256:x")
+    db.commit()
+    db.execute("UPDATE operations SET memory_tier = 'inactive' WHERE op_id = 'inactive-op'")
+    db.commit()
+    results = db.query_operations(include_inactive=True)
+    ids = {r["op_id"] for r in results}
+    assert "inactive-op" in ids
+
+
+def test_query_tier_ordering(hgp_dirs: dict):
+    """short_term ops appear before long_term in results."""
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("long-op", "artifact", "agent-1", 1, "sha256:x")
+    db.insert_operation("short-op", "artifact", "agent-1", 2, "sha256:y")
+    db.commit()
+    db.set_memory_tier("short-op", "short_term")
+    db.commit()
+    results = db.query_operations()
+    ids = [r["op_id"] for r in results]
+    assert ids.index("short-op") < ids.index("long-op")

@@ -145,6 +145,31 @@ def hgp_create_operation(
     }
 
 
+_SUMMARY_FIELDS = {"op_id", "op_type", "status", "commit_seq", "agent_id", "memory_tier"}
+_STUB_FIELDS = {"op_id", "op_type", "memory_tier"}
+
+
+def _project(op: dict[str, Any], tier: str) -> dict[str, Any]:
+    if tier == "short_term":
+        return {k: v for k, v in op.items() if k != "depth"}
+    if tier == "long_term":
+        return {k: v for k, v in op.items() if k in _SUMMARY_FIELDS}
+    return {k: v for k, v in op.items() if k in _STUB_FIELDS}
+
+
+def _record_access_with_decay(db: Database, ops: list[dict[str, Any]]) -> None:
+    """Best-effort depth-based access recording. Uses CTE depth column."""
+    DECAY = [1.0, 0.7, 0.4, 0.1]
+    try:
+        for op in ops:
+            depth = int(op.get("depth", 0))
+            weight = DECAY[min(depth, len(DECAY) - 1)]
+            db.record_access(op["op_id"], weight)
+        db.commit()
+    except Exception:
+        pass  # Best-effort: never blocks read results
+
+
 @mcp.tool()
 def hgp_query_operations(
     op_id: str | None = None,
@@ -152,14 +177,22 @@ def hgp_query_operations(
     op_type: str | None = None,
     status: str | None = None,
     since_commit_seq: int | None = None,
+    include_inactive: bool = False,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """Query operations with optional filters."""
     db, _, _, _ = _get_components()
     if op_id:
         op = db.get_operation(op_id)
+        if op:
+            db.record_access(op_id)
+            db.commit()
         return [op] if op else []
-    return db.query_operations(status=status, agent_id=agent_id, op_type=op_type, since_commit_seq=since_commit_seq, limit=limit)
+    return db.query_operations(
+        status=status, agent_id=agent_id, op_type=op_type,
+        since_commit_seq=since_commit_seq,
+        include_inactive=include_inactive, limit=limit,
+    )
 
 
 @mcp.tool()
@@ -178,7 +211,9 @@ def hgp_query_subgraph(
         ops = get_descendants(db, root_op_id, max_depth=max_depth)
     if not include_invalidated:
         ops = [o for o in ops if o["status"] != "INVALIDATED"]
-    return {"root_op_id": root_op_id, "chain_hash": chain_hash, "operations": ops}
+    projected = [_project(op, op.get("memory_tier", "long_term")) for op in ops]
+    _record_access_with_decay(db, ops)
+    return {"root_op_id": root_op_id, "chain_hash": chain_hash, "operations": projected}
 
 
 @mcp.tool()
@@ -188,8 +223,10 @@ def hgp_acquire_lease(
     ttl_seconds: int = 300,
 ) -> dict[str, Any]:
     """Acquire a lease on a subgraph for optimistic concurrency."""
-    _, _, lease_mgr, _ = _get_components()
+    db, _, lease_mgr, _ = _get_components()
     lease = lease_mgr.acquire(agent_id, subgraph_root_op_id, ttl_seconds)
+    db.set_memory_tier(subgraph_root_op_id, "short_term")
+    db.commit()
     return {
         "lease_id": lease.lease_id,
         "chain_hash": lease.chain_hash,
@@ -207,9 +244,27 @@ def hgp_validate_lease(lease_id: str, extend: bool = True) -> dict[str, Any]:
 @mcp.tool()
 def hgp_release_lease(lease_id: str) -> dict[str, Any]:
     """Release a lease token explicitly."""
-    _, _, lease_mgr, _ = _get_components()
+    db, _, lease_mgr, _ = _get_components()
+    root_row = db.execute(
+        "SELECT subgraph_root_op_id FROM leases WHERE lease_id = ?", (lease_id,)
+    ).fetchone()
     lease_mgr.release(lease_id)
+    if root_row:
+        db.set_memory_tier(root_row["subgraph_root_op_id"], "long_term")
+        db.commit()
     return {"released": True, "lease_id": lease_id}
+
+
+@mcp.tool()
+def hgp_set_memory_tier(op_id: str, tier: str) -> dict[str, Any]:
+    """Explicitly set the memory tier of an operation."""
+    valid = {"short_term", "long_term", "inactive"}
+    if tier not in valid:
+        return {"error": "INVALID_TIER", "valid_tiers": sorted(valid)}
+    db, _, _, _ = _get_components()
+    db.set_memory_tier(op_id, tier)
+    db.commit()
+    return {"op_id": op_id, "tier": tier}
 
 
 @mcp.tool()

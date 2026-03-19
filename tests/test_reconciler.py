@@ -76,3 +76,41 @@ def test_staging_cleanup(hgp_dirs: dict):
     report = rec.reconcile()
     assert not old_tmp.exists()
     assert report.staging_cleaned >= 1
+
+
+# ── V2 Reconciler Demotion Tests ─────────────────────────────
+
+
+def test_reconcile_demotes_inactive_ops(hgp_dirs: dict):
+    from datetime import datetime, timezone, timedelta
+    db, cas, rec = _setup(hgp_dirs)
+    db.begin_immediate()
+    db.insert_operation("old-op", "artifact", "agent-1", 1, "sha256:x")
+    db.insert_operation("new-op", "artifact", "agent-1", 2, "sha256:y")
+    db.commit()
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    now_ts = datetime.now(timezone.utc).isoformat()
+    db.execute("UPDATE operations SET last_accessed = ? WHERE op_id = 'old-op'", (old_ts,))
+    db.execute("UPDATE operations SET last_accessed = ? WHERE op_id = 'new-op'", (now_ts,))
+    db.commit()
+    report = rec.reconcile()
+    assert report.demoted_to_inactive >= 1
+    assert db.get_operation("old-op")["memory_tier"] == "inactive"
+    assert db.get_operation("new-op")["memory_tier"] == "long_term"
+
+
+def test_reconcile_demote_dry_run(hgp_dirs: dict):
+    from datetime import datetime, timezone, timedelta
+    db, cas, rec = _setup(hgp_dirs)
+    db.begin_immediate()
+    db.insert_operation("old-op", "artifact", "agent-1", 1, "sha256:x")
+    db.insert_operation("new-op", "artifact", "agent-1", 2, "sha256:y")
+    db.commit()
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+    now_ts = datetime.now(timezone.utc).isoformat()
+    db.execute("UPDATE operations SET last_accessed = ? WHERE op_id = 'old-op'", (old_ts,))
+    db.execute("UPDATE operations SET last_accessed = ? WHERE op_id = 'new-op'", (now_ts,))
+    db.commit()
+    report = rec.reconcile(dry_run=True)
+    assert report.demoted_to_inactive >= 1
+    assert db.get_operation("old-op")["memory_tier"] == "long_term"  # not mutated
