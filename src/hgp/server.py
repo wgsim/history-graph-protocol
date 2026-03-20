@@ -178,7 +178,7 @@ def _record_access_with_decay(db: Database, ops: list[dict[str, Any]]) -> None:
             db.record_access(op["op_id"], weight)
         db.commit()
     except Exception:
-        pass  # Best-effort: never blocks read results
+        db.rollback()  # Best-effort: clear any pending implicit transaction
 
 
 @mcp.tool()
