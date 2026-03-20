@@ -229,6 +229,7 @@ class Database:
             WHEN 'short_term' THEN 1
             WHEN 'long_term'  THEN 2
             WHEN 'inactive'   THEN 3
+            ELSE 4
         END, commit_seq DESC"""
         params.append(limit)
         rows = self._conn.execute(
