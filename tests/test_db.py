@@ -87,6 +87,48 @@ def test_expire_leases(hgp_dirs: dict):
     assert new_row["status"] == "ACTIVE"
 
 
+def test_expire_leases_demotes_short_term_with_no_active_lease(hgp_dirs: dict):
+    """expire_leases() demotes short_term root to long_term when its only active lease expires."""
+    from datetime import datetime, timezone, timedelta
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("root-a", "artifact", "agent-1", 1, "sha256:a")
+    db.insert_operation("root-b", "artifact", "agent-1", 2, "sha256:b")
+    db.commit()
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    future = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    # root-a: one expired lease (no active leases remain → should be demoted)
+    db.execute(
+        "INSERT INTO leases (lease_id, agent_id, subgraph_root_op_id, chain_hash, issued_at, expires_at, status) "
+        "VALUES ('lease-a', 'agent-1', 'root-a', 'sha256:h', ?, ?, 'ACTIVE')",
+        (now_ts, past),
+    )
+    # root-b: one expired lease + one still-active lease (should stay short_term)
+    db.execute(
+        "INSERT INTO leases (lease_id, agent_id, subgraph_root_op_id, chain_hash, issued_at, expires_at, status) "
+        "VALUES ('lease-b1', 'agent-1', 'root-b', 'sha256:h', ?, ?, 'ACTIVE')",
+        (now_ts, past),
+    )
+    db.execute(
+        "INSERT INTO leases (lease_id, agent_id, subgraph_root_op_id, chain_hash, issued_at, expires_at, status) "
+        "VALUES ('lease-b2', 'agent-1', 'root-b', 'sha256:h', ?, ?, 'ACTIVE')",
+        (now_ts, future),
+    )
+    db.set_memory_tier("root-a", "short_term")
+    db.set_memory_tier("root-b", "short_term")
+    db.commit()
+
+    db.expire_leases()
+    db.commit()
+
+    assert db.get_operation("root-a")["memory_tier"] == "long_term"  # demoted: no active lease
+    assert db.get_operation("root-b")["memory_tier"] == "short_term"  # kept: still has active lease
+
+
 # ── V2 Memory Tier Tests ─────────────────────────────────────
 
 

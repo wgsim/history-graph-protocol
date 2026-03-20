@@ -191,7 +191,7 @@ def hgp_query_operations(
     include_inactive: bool = False,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """Query operations with optional filters."""
+    """Query operations with optional filters. By default excludes inactive-tier ops; pass include_inactive=True to include them."""
     db, _, _, _ = _get_components()
     if op_id:
         op = db.get_operation(op_id)
@@ -278,8 +278,10 @@ def hgp_set_memory_tier(op_id: str, tier: str) -> dict[str, Any]:
     if tier not in valid:
         return {"error": "INVALID_TIER", "valid_tiers": sorted(valid)}
     db, _, _, _ = _get_components()
-    db.set_memory_tier(op_id, tier)
+    cur = db.execute("UPDATE operations SET memory_tier = ? WHERE op_id = ?", (tier, op_id))
     db.commit()
+    if cur.rowcount == 0:
+        return {"error": "OP_NOT_FOUND", "op_id": op_id}
     return {"op_id": op_id, "tier": tier}
 
 
