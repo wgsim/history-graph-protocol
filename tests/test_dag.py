@@ -148,3 +148,33 @@ def test_get_descendants_max_depth(hgp_dirs: dict):
     assert "a" in ids
     assert "b" in ids
     assert "c" not in ids
+
+
+# ── Security: C-2 DoS depth cap ─────────────────────────────────────────────
+
+def test_compute_chain_hash_depth_cap_limits_traversal(hgp_dirs: dict):
+    """compute_chain_hash must respect _max_depth to prevent DoS on deep chains.
+
+    With a small cap, distant ancestors are excluded, producing a different hash
+    than full traversal — proving the depth limit is active.
+    """
+    db = _make_db(hgp_dirs)
+    db.begin_immediate()
+    db.insert_operation("op-0", "artifact", "agent-1", 1, "sha256:" + "0" * 64)
+    db.insert_operation("op-1", "artifact", "agent-1", 2, "sha256:" + "1" * 64)
+    db.insert_operation("op-2", "artifact", "agent-1", 3, "sha256:" + "2" * 64)
+    db.insert_operation("op-3", "artifact", "agent-1", 4, "sha256:" + "3" * 64)
+    db.insert_edge("op-1", "op-0")
+    db.insert_edge("op-2", "op-1")
+    db.insert_edge("op-3", "op-2")
+    db.commit()
+
+    h_full = compute_chain_hash(db, "op-3", _max_depth=10)   # all 4 nodes
+    h_capped = compute_chain_hash(db, "op-3", _max_depth=1)  # op-3 + op-2 only
+    assert h_full != h_capped
+
+
+def test_compute_chain_hash_max_depth_constant_exists(hgp_dirs: dict):
+    """MAX_CHAIN_HASH_DEPTH must be exported from hgp.dag and be a reasonable bound."""
+    from hgp.dag import MAX_CHAIN_HASH_DEPTH
+    assert 100 <= MAX_CHAIN_HASH_DEPTH <= 2000

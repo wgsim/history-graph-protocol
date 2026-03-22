@@ -109,14 +109,20 @@ ORDER BY d.depth, o.commit_seq
 """
 
 
-def compute_chain_hash(db: Database, root_op_id: str) -> str:
+MAX_CHAIN_HASH_DEPTH = 500
+
+
+def compute_chain_hash(db: Database, root_op_id: str, _max_depth: int = MAX_CHAIN_HASH_DEPTH) -> str:
     """Compute the chain_hash for a subgraph rooted at root_op_id.
 
     Includes both operations (nodes) and edges for structural sensitivity.
-    Always traverses the full ancestor graph — no depth limit.
+    Traversal is depth-bounded by _max_depth to prevent DoS on deep DAGs.
     """
-    ops = db.execute(_ANCESTOR_SQL, {"root_op_id": root_op_id}).fetchall()
+    ops = db.execute(_ANCESTOR_DEPTH_SQL, {"root_op_id": root_op_id, "max_depth": _max_depth}).fetchall()
+    ancestor_ids = {row["op_id"] for row in ops}
     edges = db.execute(_EDGES_IN_SUBGRAPH_SQL, {"root_op_id": root_op_id}).fetchall()
+    # Filter edges to only those within the depth-bounded ancestor set
+    edges = [e for e in edges if e["child_op_id"] in ancestor_ids and e["parent_op_id"] in ancestor_ids]
 
     ops_part = "|".join(
         f"{row['op_id']}:{row['status']}:{row['commit_seq']}" for row in ops
