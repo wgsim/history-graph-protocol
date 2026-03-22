@@ -63,3 +63,26 @@ def test_list_all_blobs_with_mtime(hgp_dirs: dict):
     blobs = list(cas.list_all_blobs_with_mtime())
     assert len(blobs) == 2
     assert all(h.startswith("sha256:") for h, _ in blobs)
+
+
+# ── Security: C-1 Path traversal ────────────────────────────────────────────
+
+def test_path_traversal_rejected(hgp_dirs: dict):
+    """_hash_to_path must reject path traversal sequences."""
+    cas = CAS(hgp_dirs["content_dir"])
+    with pytest.raises(ValueError, match="Invalid object_hash"):
+        cas.read("sha256:../../etc/passwd")
+
+
+def test_invalid_hash_length_rejected(hgp_dirs: dict):
+    """_hash_to_path must reject hashes that are not 64 hex chars."""
+    cas = CAS(hgp_dirs["content_dir"])
+    with pytest.raises(ValueError, match="Invalid object_hash"):
+        cas.read("sha256:abc123")
+
+
+def test_invalid_hash_uppercase_rejected(hgp_dirs: dict):
+    """_hash_to_path must reject uppercase hex (sha256 output is always lowercase)."""
+    cas = CAS(hgp_dirs["content_dir"])
+    with pytest.raises(ValueError, match="Invalid object_hash"):
+        cas.read("sha256:" + "A" * 64)

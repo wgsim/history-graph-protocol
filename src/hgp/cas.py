@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 from hgp.errors import BlobWriteError, PayloadTooLargeError
+
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 MAX_PAYLOAD_BYTES = 10 * 1024 * 1024  # 10 MB V1 limit
 
@@ -91,5 +94,7 @@ class CAS:
                     yield f"sha256:{hex_hash}", mtime
 
     def _hash_to_path(self, object_hash: str) -> Path:
-        hex_hash = object_hash.removeprefix("sha256:")
+        if not _SHA256_RE.fullmatch(object_hash):
+            raise ValueError(f"Invalid object_hash: {object_hash!r}")
+        hex_hash = object_hash[7:]
         return self._content_dir / hex_hash[:2] / hex_hash[2:]
