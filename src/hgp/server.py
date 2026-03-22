@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
+
+_VALID_OP_TYPES = frozenset({"artifact", "hypothesis", "merge", "invalidation"})
+_VALID_STATUSES = frozenset({"PENDING", "COMPLETED", "INVALIDATED", "MISSING_BLOB"})
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_MAX_TTL_SECONDS = 86400
 
 from mcp.server.fastmcp import FastMCP
 
@@ -64,6 +70,9 @@ def hgp_create_operation(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a new operation in the causal history DAG."""
+    if op_type not in _VALID_OP_TYPES:
+        return {"error": "INVALID_OP_TYPE", "message": f"op_type must be one of {sorted(_VALID_OP_TYPES)}"}
+
     db, cas, _, _ = _get_components()
 
     # Validate parents exist
@@ -192,6 +201,10 @@ def hgp_query_operations(
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """Query operations with optional filters. By default excludes inactive-tier ops; pass include_inactive=True to include them."""
+    if status is not None and status not in _VALID_STATUSES:
+        return {"error": "INVALID_STATUS", "message": f"status must be one of {sorted(_VALID_STATUSES)}"}
+
+
     db, _, _, _ = _get_components()
     if op_id:
         op = db.get_operation(op_id)
@@ -215,11 +228,16 @@ def hgp_query_subgraph(
 ) -> dict[str, Any]:
     """Traverse the causal subgraph from root_op_id."""
     db, _, _, _ = _get_components()
-    chain_hash = compute_chain_hash(db, root_op_id)
-    if direction == "ancestors":
-        ops = get_ancestors(db, root_op_id, max_depth=max_depth)
-    else:
-        ops = get_descendants(db, root_op_id, max_depth=max_depth)
+    # Use a single deferred transaction so chain_hash and ops come from the same snapshot.
+    db.begin_deferred()
+    try:
+        chain_hash = compute_chain_hash(db, root_op_id)
+        if direction == "ancestors":
+            ops = get_ancestors(db, root_op_id, max_depth=max_depth)
+        else:
+            ops = get_descendants(db, root_op_id, max_depth=max_depth)
+    finally:
+        db.commit()
     if not include_invalidated:
         ops = [o for o in ops if o["status"] != "INVALIDATED"]
     projected = [_project(op, op.get("memory_tier", "long_term")) for op in ops]
@@ -235,7 +253,7 @@ def hgp_acquire_lease(
 ) -> dict[str, Any]:
     """Acquire a lease on a subgraph for optimistic concurrency."""
     db, _, lease_mgr, _ = _get_components()
-    lease = lease_mgr.acquire(agent_id, subgraph_root_op_id, ttl_seconds)
+    lease = lease_mgr.acquire(agent_id, subgraph_root_op_id, min(ttl_seconds, _MAX_TTL_SECONDS))
     db.set_memory_tier(subgraph_root_op_id, "short_term")
     db.commit()
     return {
@@ -307,8 +325,8 @@ def hgp_anchor_git(
 ) -> dict[str, Any]:
     """Link an HGP operation to a Git commit SHA."""
     db, _, _, _ = _get_components()
-    if len(git_commit_sha) != 40:
-        return {"error": "INVALID_SHA", "message": "git_commit_sha must be 40 hex chars"}
+    if not _GIT_SHA_RE.fullmatch(git_commit_sha):
+        return {"error": "INVALID_SHA", "message": "git_commit_sha must be 40 lowercase hex chars"}
     db.execute(
         "INSERT OR IGNORE INTO git_anchors (op_id, git_commit_sha, repository) VALUES (?, ?, ?)",
         (op_id, git_commit_sha, repository),

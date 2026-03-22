@@ -360,6 +360,56 @@ def test_reconcile_dry_run_no_mutation(server_components):
 
 # ── Task 7: Edge cases ────────────────────────────────────────────────────────
 
+# ── Security: H-3 op_type / status enum validation ───────────────────────────
+
+def test_create_operation_invalid_op_type_returns_error(server_components):
+    """op_type not in allowed set must return structured error, not IntegrityError."""
+    result = hgp_create_operation(op_type="EVIL_TYPE", agent_id="a")
+    assert result.get("error") == "INVALID_OP_TYPE"
+
+
+def test_query_operations_invalid_status_returns_error(server_components):
+    """status not in allowed set must return structured error, not IntegrityError."""
+    result = hgp_query_operations(status="NOT_A_STATUS")
+    assert isinstance(result, dict)
+    assert result.get("error") == "INVALID_STATUS"
+
+
+# ── Security: H-4 git_commit_sha hex validation ──────────────────────────────
+
+def test_git_anchor_non_hex_sha_rejected(server_components):
+    """40-char non-hex SHA (e.g. with uppercase/special chars) must return INVALID_SHA."""
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_anchor_git(op_id=op["op_id"], git_commit_sha="G" * 40)
+    assert result["error"] == "INVALID_SHA"
+
+
+def test_git_anchor_hex_sha_accepted(server_components):
+    """Valid 40-char lowercase hex SHA must succeed."""
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_anchor_git(op_id=op["op_id"], git_commit_sha="a" * 40)
+    assert result["anchored"] is True
+
+
+# ── Security: H-5 ttl_seconds upper bound ────────────────────────────────────
+
+def test_acquire_lease_ttl_capped_at_86400(server_components):
+    """ttl_seconds > 86400 must be silently capped to 86400."""
+    root = hgp_create_operation(op_type="artifact", agent_id="a")
+    hgp_acquire_lease(agent_id="a", subgraph_root_op_id=root["op_id"], ttl_seconds=999999)
+    db = server_components["db"]
+    row = db.execute(
+        "SELECT expires_at, issued_at FROM leases ORDER BY issued_at DESC LIMIT 1"
+    ).fetchone()
+    from datetime import datetime, timezone
+    issued = datetime.fromisoformat(row["issued_at"].replace("Z", "+00:00"))
+    expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+    diff_seconds = (expires - issued).total_seconds()
+    assert diff_seconds <= 86400 + 5  # +5s tolerance for test timing
+
+
+# ── Edge cases ────────────────────────────────────────────────────────────────
+
 def test_create_empty_payload(server_components):
     """Empty base64 payload (b'') is treated as no payload."""
     empty_b64 = base64.b64encode(b"").decode()

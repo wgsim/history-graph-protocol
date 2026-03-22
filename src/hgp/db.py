@@ -198,6 +198,10 @@ class Database:
         assert self._conn
         self._conn.execute("BEGIN IMMEDIATE")
 
+    def begin_deferred(self) -> None:
+        assert self._conn
+        self._conn.execute("BEGIN DEFERRED")
+
     def query_operations(
         self,
         status: str | None = None,

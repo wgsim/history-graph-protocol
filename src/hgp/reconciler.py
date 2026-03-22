@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+_STAGING_FILE_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$"
+)
 
 from hgp.cas import CAS
 from hgp.db import Database
@@ -45,6 +50,8 @@ class Reconciler:
         # Clean stale staging files older than grace period
         if self._staging_dir.exists():
             for tmp_file in self._staging_dir.glob("*.tmp"):
+                if not _STAGING_FILE_RE.fullmatch(tmp_file.name):
+                    continue
                 try:
                     mtime = datetime.fromtimestamp(tmp_file.stat().st_mtime, tz=timezone.utc)
                     if now - mtime > ORPHAN_GRACE_PERIOD:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import time
+import os
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from hgp.db import Database
@@ -64,11 +65,10 @@ def test_rule3_orphan_blob_young_skipped(hgp_dirs: dict):
 
 
 def test_staging_cleanup(hgp_dirs: dict):
-    """Stale .tmp files older than grace period are removed."""
+    """Stale UUID4 .tmp files older than grace period are removed."""
     staging = hgp_dirs["content_dir"] / ".staging"
-    old_tmp = staging / "stale.tmp"
+    old_tmp = staging / f"{uuid.uuid4()}.tmp"
     old_tmp.write_bytes(b"leftover")
-    import os
     old_time = (datetime.now() - timedelta(hours=1)).timestamp()
     os.utime(old_tmp, (old_time, old_time))
 
@@ -128,3 +128,19 @@ def test_reconcile_checks_inactive_ops_for_missing_blob(hgp_dirs: dict):
     db.commit()
     report = rec.reconcile()
     assert missing_hash in report.missing_blobs
+
+
+# ── Security: M-3 staging glob too broad ─────────────────────────────────────
+
+def test_staging_non_uuid_tmp_not_deleted(hgp_dirs: dict):
+    """Reconciler must only delete UUID4-named .tmp files, not arbitrary .tmp names."""
+    staging = hgp_dirs["content_dir"] / ".staging"
+    # Non-UUID4 filename that should NOT be deleted even if stale
+    non_uuid_tmp = staging / "exploit.tmp"
+    non_uuid_tmp.write_bytes(b"should survive")
+    old_time = (datetime.now() - timedelta(hours=1)).timestamp()
+    os.utime(non_uuid_tmp, (old_time, old_time))
+
+    _, cas, rec = _setup(hgp_dirs)
+    rec.reconcile()
+    assert non_uuid_tmp.exists(), "Non-UUID4 .tmp file must not be deleted by reconciler"
