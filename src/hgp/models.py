@@ -99,3 +99,42 @@ class ReconcileReport(BaseModel):
     skipped_young_blobs: int = 0
     demoted_to_inactive: int = 0
     errors: list[str] = Field(default_factory=list)
+
+
+# ── V3 Evidence Trail ─────────────────────────────────────────
+
+class EvidenceRelation(StrEnum):
+    SUPPORTS = "supports"
+    REFUTES  = "refutes"
+    CONTEXT  = "context"
+    METHOD   = "method"
+    SOURCE   = "source"
+
+
+class EvidenceRef(BaseModel):
+    op_id:     str
+    relation:  EvidenceRelation
+    scope:     str | None = None
+    inference: str | None = None
+
+
+class EvidenceRecord(BaseModel):
+    cited_op_id:  str
+    op_type:      str
+    status:       str
+    memory_tier:  str
+    relation:     str
+    scope:        str | None
+    inference:    str | None
+    created_at:   str
+
+
+class CitingRecord(BaseModel):
+    citing_op_id: str
+    op_type:      str
+    status:       str
+    memory_tier:  str
+    relation:     str
+    scope:        str | None
+    inference:    str | None
+    created_at:   str

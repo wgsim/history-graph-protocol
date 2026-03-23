@@ -21,6 +21,7 @@ from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
 from hgp.db import Database
 from hgp.errors import ChainStaleError, ParentNotFoundError
 from hgp.lease import LeaseManager
+from hgp.models import EvidenceRef
 from hgp.reconciler import Reconciler
 
 # ── Server initialization ───────────────────────────────────
@@ -68,10 +69,19 @@ def hgp_create_operation(
     chain_hash: str | None = None,
     subgraph_root_op_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a new operation in the causal history DAG."""
     if op_type not in _VALID_OP_TYPES:
         return {"error": "INVALID_OP_TYPE", "message": f"op_type must be one of {sorted(_VALID_OP_TYPES)}"}
+
+    # Validate evidence_refs early (before any DB work) to fail fast on bad input
+    parsed_refs: list[EvidenceRef] = []
+    if evidence_refs:
+        try:
+            parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
+        except Exception as exc:
+            return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
     db, cas, _, _ = _get_components()
 
@@ -125,6 +135,13 @@ def hgp_create_operation(
         for inv_id in (invalidates_op_ids or []):
             db.insert_edge(op_id, inv_id, "invalidates")
             db.update_operation_status(inv_id, "INVALIDATED")
+
+        if parsed_refs:
+            try:
+                db.insert_evidence(op_id, parsed_refs)
+            except ValueError as exc:
+                db.rollback()
+                return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
         # Compute final chain_hash AFTER all edges are inserted
         new_root = subgraph_root_op_id or op_id
@@ -341,6 +358,24 @@ def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
     _, _, _, reconciler = _get_components()
     report = reconciler.reconcile(dry_run=dry_run)
     return report.model_dump()
+
+
+@mcp.tool()
+def hgp_get_evidence(op_id: str) -> list[dict[str, Any]]:
+    """Return all operations that op_id cited as evidence."""
+    db, _, _, _ = _get_components()
+    rows = db.get_evidence(op_id)
+    db.commit()
+    return rows
+
+
+@mcp.tool()
+def hgp_get_citing_ops(op_id: str) -> list[dict[str, Any]]:
+    """Return all operations that cited op_id as evidence (reverse direction)."""
+    db, _, _, _ = _get_components()
+    rows = db.get_citing_ops(op_id)
+    db.commit()
+    return rows
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from hgp.models import (
     Operation, OpEdge, StoredObject, Lease, GitAnchor, ReconcileReport,
     OpType, OpStatus, EdgeType, LeaseStatus, ObjectStatus,
+    EvidenceRelation, EvidenceRef, EvidenceRecord, CitingRecord,
 )
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -48,3 +49,55 @@ def test_op_type_string_equality():
     assert OpType.ARTIFACT == "artifact"
     assert OpStatus.COMPLETED == "COMPLETED"
     assert EdgeType.CAUSAL == "causal"
+
+
+# ── V3 Evidence Trail Models ──────────────────────────────────
+
+def test_evidence_relation_values():
+    assert EvidenceRelation.SUPPORTS == "supports"
+    assert EvidenceRelation.REFUTES == "refutes"
+    assert EvidenceRelation.CONTEXT == "context"
+    assert EvidenceRelation.METHOD == "method"
+    assert EvidenceRelation.SOURCE == "source"
+
+
+def test_evidence_ref_required_fields():
+    ref = EvidenceRef(op_id="op-1", relation=EvidenceRelation.SUPPORTS)
+    assert ref.scope is None
+    assert ref.inference is None
+
+
+def test_evidence_ref_invalid_relation():
+    import pytest
+    with pytest.raises(Exception):
+        EvidenceRef(op_id="op-1", relation="invalid")
+
+
+def test_evidence_record_fields():
+    rec = EvidenceRecord(
+        cited_op_id="op-2",
+        op_type="artifact",
+        status="COMPLETED",
+        memory_tier="long_term",
+        relation="supports",
+        scope=None,
+        inference="conclusion",
+        created_at="2026-03-22T00:00:00.000Z",
+    )
+    assert rec.cited_op_id == "op-2"
+    assert rec.inference == "conclusion"
+
+
+def test_citing_record_fields():
+    rec = CitingRecord(
+        citing_op_id="op-3",
+        op_type="hypothesis",
+        status="COMPLETED",
+        memory_tier="long_term",
+        relation="context",
+        scope="field.x",
+        inference=None,
+        created_at="2026-03-22T00:00:00.000Z",
+    )
+    assert rec.citing_op_id == "op-3"
+    assert rec.scope == "field.x"

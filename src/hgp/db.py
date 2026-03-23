@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from hgp.models import EvidenceRef
 
 _SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
@@ -89,6 +92,23 @@ CREATE TABLE IF NOT EXISTS git_anchors (
     PRIMARY KEY (op_id, git_commit_sha),
     FOREIGN KEY (op_id) REFERENCES operations(op_id)
 );
+
+CREATE TABLE IF NOT EXISTS op_evidence (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    citing_op_id  TEXT NOT NULL,
+    cited_op_id   TEXT NOT NULL,
+    relation      TEXT NOT NULL CHECK (relation IN
+                    ('supports', 'refutes', 'context', 'method', 'source')),
+    scope         TEXT DEFAULT NULL,
+    inference     TEXT DEFAULT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (citing_op_id, cited_op_id),
+    FOREIGN KEY (citing_op_id) REFERENCES operations(op_id),
+    FOREIGN KEY (cited_op_id)  REFERENCES operations(op_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_citing ON op_evidence(citing_op_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_cited  ON op_evidence(cited_op_id);
 """
 
 
@@ -335,3 +355,51 @@ class Database:
                  )"""
         )
         return cur.rowcount
+
+    def insert_evidence(self, citing_op_id: str, refs: list[EvidenceRef]) -> None:
+        """Insert evidence rows. Must be called inside an existing transaction."""
+        assert self._conn
+        for ref in refs:
+            if ref.op_id == citing_op_id:
+                raise ValueError(f"self-reference: citing_op_id == cited_op_id == {ref.op_id!r}")
+            exists = self._conn.execute(
+                "SELECT 1 FROM operations WHERE op_id = ?", (ref.op_id,)
+            ).fetchone()
+            if not exists:
+                raise ValueError(f"cited_op_id not found: {ref.op_id!r}")
+            self._conn.execute(
+                """INSERT INTO op_evidence
+                   (citing_op_id, cited_op_id, relation, scope, inference)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (citing_op_id, ref.op_id, str(ref.relation), ref.scope, ref.inference),
+            )
+
+    def get_evidence(self, op_id: str) -> list[dict[str, Any]]:
+        """Return all ops cited by op_id, recording access with depth-decay weights."""
+        assert self._conn
+        rows = self._conn.execute(
+            """SELECT e.cited_op_id, o.op_type, o.status, o.memory_tier,
+                      e.relation, e.scope, e.inference, e.created_at
+               FROM op_evidence e
+               JOIN operations o ON o.op_id = e.cited_op_id
+               WHERE e.citing_op_id = ?""",
+            (op_id,),
+        ).fetchall()
+        self.record_access(op_id, weight=1.0)
+        for row in rows:
+            self.record_access(row["cited_op_id"], weight=0.7)
+        return [dict(r) for r in rows]
+
+    def get_citing_ops(self, op_id: str) -> list[dict[str, Any]]:
+        """Return all ops that cited op_id as evidence, recording access on cited op only."""
+        assert self._conn
+        rows = self._conn.execute(
+            """SELECT e.citing_op_id, o.op_type, o.status, o.memory_tier,
+                      e.relation, e.scope, e.inference, e.created_at
+               FROM op_evidence e
+               JOIN operations o ON o.op_id = e.citing_op_id
+               WHERE e.cited_op_id = ?""",
+            (op_id,),
+        ).fetchall()
+        self.record_access(op_id, weight=1.0)
+        return [dict(r) for r in rows]
