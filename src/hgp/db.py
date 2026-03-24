@@ -375,7 +375,7 @@ class Database:
             )
 
     def get_evidence(self, op_id: str) -> list[dict[str, Any]]:
-        """Return all ops cited by op_id, recording access with depth-decay weights."""
+        """Return all ops cited by op_id, recording access with depth-decay weights (best-effort)."""
         assert self._conn
         rows = self._conn.execute(
             """SELECT e.cited_op_id, o.op_type, o.status, o.memory_tier,
@@ -385,13 +385,16 @@ class Database:
                WHERE e.citing_op_id = ?""",
             (op_id,),
         ).fetchall()
-        self.record_access(op_id, weight=1.0)
-        for row in rows:
-            self.record_access(row["cited_op_id"], weight=0.7)
+        try:
+            self.record_access(op_id, weight=1.0)
+            for row in rows:
+                self.record_access(row["cited_op_id"], weight=0.7)
+        except Exception:
+            pass  # access recording is best-effort; read result is still valid
         return [dict(r) for r in rows]
 
     def get_citing_ops(self, op_id: str) -> list[dict[str, Any]]:
-        """Return all ops that cited op_id as evidence, recording access on cited op only."""
+        """Return all ops that cited op_id as evidence, recording access on cited op only (best-effort)."""
         assert self._conn
         rows = self._conn.execute(
             """SELECT e.citing_op_id, o.op_type, o.status, o.memory_tier,
@@ -401,5 +404,8 @@ class Database:
                WHERE e.cited_op_id = ?""",
             (op_id,),
         ).fetchall()
-        self.record_access(op_id, weight=1.0)
+        try:
+            self.record_access(op_id, weight=1.0)
+        except Exception:
+            pass  # access recording is best-effort; read result is still valid
         return [dict(r) for r in rows]

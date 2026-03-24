@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ _VALID_OP_TYPES = frozenset({"artifact", "hypothesis", "merge", "invalidation"})
 _VALID_STATUSES = frozenset({"PENDING", "COMPLETED", "INVALIDATED", "MISSING_BLOB"})
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MAX_TTL_SECONDS = 86400
+_MAX_EVIDENCE_REFS = 50
 
 from mcp.server.fastmcp import FastMCP
 
@@ -78,6 +80,8 @@ def hgp_create_operation(
     # Validate evidence_refs early (before any DB work) to fail fast on bad input
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
+        if len(evidence_refs) > _MAX_EVIDENCE_REFS:
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
         try:
             parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
         except Exception as exc:
@@ -139,7 +143,7 @@ def hgp_create_operation(
         if parsed_refs:
             try:
                 db.insert_evidence(op_id, parsed_refs)
-            except ValueError as exc:
+            except (ValueError, sqlite3.IntegrityError) as exc:
                 db.rollback()
                 return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
@@ -361,18 +365,22 @@ def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
 
 
 @mcp.tool()
-def hgp_get_evidence(op_id: str) -> list[dict[str, Any]]:
+def hgp_get_evidence(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
     """Return all operations that op_id cited as evidence."""
     db, _, _, _ = _get_components()
+    if not db.get_operation(op_id):
+        return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
     rows = db.get_evidence(op_id)
     db.commit()
     return rows
 
 
 @mcp.tool()
-def hgp_get_citing_ops(op_id: str) -> list[dict[str, Any]]:
+def hgp_get_citing_ops(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
     """Return all operations that cited op_id as evidence (reverse direction)."""
     db, _, _, _ = _get_components()
+    if not db.get_operation(op_id):
+        return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
     rows = db.get_citing_ops(op_id)
     db.commit()
     return rows

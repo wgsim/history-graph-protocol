@@ -663,3 +663,73 @@ def test_create_operation_evidence_nonexistent_cited(server_components):
         evidence_refs=[{"op_id": "ghost-op-id", "relation": "supports"}],
     )
     assert "error" in result
+
+
+# ── V3 Audit Fix Tests ────────────────────────────────────────
+
+def test_create_operation_duplicate_evidence_returns_error_dict(server_components):
+    """Duplicate (citing, cited) pair must return error dict, not raise IntegrityError."""
+    from hgp.server import hgp_get_evidence
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    # First creation succeeds
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports"}],
+    )
+    assert "op_id" in citing
+
+    # Second op tries to cite the same op twice in one call (duplicate in list)
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[
+            {"op_id": cited["op_id"], "relation": "supports"},
+            {"op_id": cited["op_id"], "relation": "refutes"},  # duplicate cited_op_id
+        ],
+    )
+    assert "error" in result  # must NOT raise, must return error dict
+
+
+def test_hgp_get_evidence_nonexistent_op_returns_error(server_components):
+    """hgp_get_evidence on unknown op_id returns error dict, not empty list."""
+    from hgp.server import hgp_get_evidence
+    result = hgp_get_evidence("nonexistent-op-id")
+    assert isinstance(result, dict)
+    assert "error" in result
+
+
+def test_hgp_get_citing_ops_nonexistent_op_returns_error(server_components):
+    """hgp_get_citing_ops on unknown op_id returns error dict, not empty list."""
+    from hgp.server import hgp_get_citing_ops
+    result = hgp_get_citing_ops("nonexistent-op-id")
+    assert isinstance(result, dict)
+    assert "error" in result
+
+
+def test_create_operation_too_many_evidence_refs(server_components):
+    """More than _MAX_EVIDENCE_REFS evidence_refs returns error dict."""
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    # Build 51 refs (all pointing to same op_id — will hit fan-out cap before duplicate check)
+    from hgp.server import _MAX_EVIDENCE_REFS
+    refs = [{"op_id": cited["op_id"], "relation": "supports"}] * (_MAX_EVIDENCE_REFS + 1)
+    result = hgp_create_operation(op_type="hypothesis", agent_id="a", evidence_refs=refs)
+    assert "error" in result
+
+
+def test_evidence_ref_scope_too_long(server_components):
+    """scope exceeding max_length triggers validation error."""
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports", "scope": "x" * 2000}],
+    )
+    assert "error" in result
+
+
+def test_evidence_ref_inference_too_long(server_components):
+    """inference exceeding max_length triggers validation error."""
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports", "inference": "y" * 5000}],
+    )
+    assert "error" in result
