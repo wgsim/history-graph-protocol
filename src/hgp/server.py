@@ -10,14 +10,15 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+from mcp.server.fastmcp import FastMCP
+
 _VALID_OP_TYPES = frozenset({"artifact", "hypothesis", "merge", "invalidation"})
 _VALID_STATUSES = frozenset({"PENDING", "COMPLETED", "INVALIDATED", "MISSING_BLOB"})
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MAX_TTL_SECONDS = 86400
+# Limits evidence refs per operation to cap O(N) existence checks inside BEGIN IMMEDIATE.
 _MAX_EVIDENCE_REFS = 50
-
-from pydantic import ValidationError
-from mcp.server.fastmcp import FastMCP
 
 from hgp.cas import CAS
 from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
@@ -369,22 +370,24 @@ def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
 def hgp_get_evidence(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
     """Return all operations that op_id cited as evidence."""
     db, _, _, _ = _get_components()
-    if not db.get_operation(op_id):
-        return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
-    rows = db.get_evidence(op_id)
-    db.commit()
-    return rows
+    try:
+        if not db.get_operation(op_id):
+            return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
+        return db.get_evidence(op_id)
+    except Exception as exc:
+        return {"error": "DB_ERROR", "message": str(exc)}
 
 
 @mcp.tool()
 def hgp_get_citing_ops(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
     """Return all operations that cited op_id as evidence (reverse direction)."""
     db, _, _, _ = _get_components()
-    if not db.get_operation(op_id):
-        return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
-    rows = db.get_citing_ops(op_id)
-    db.commit()
-    return rows
+    try:
+        if not db.get_operation(op_id):
+            return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
+        return db.get_citing_ops(op_id)
+    except Exception as exc:
+        return {"error": "DB_ERROR", "message": str(exc)}
 
 
 if __name__ == "__main__":

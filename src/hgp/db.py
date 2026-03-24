@@ -111,6 +111,10 @@ CREATE INDEX IF NOT EXISTS idx_evidence_citing ON op_evidence(citing_op_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_cited  ON op_evidence(cited_op_id);
 """
 
+# Server-side cap on evidence result sets — prevents reverse fan-out DoS where
+# one widely-cited op triggers an unbounded JOIN over all citing ops.
+_MAX_EVIDENCE_RESULTS = 200
+
 
 class Database:
     """Thread-safe SQLite wrapper for HGP."""
@@ -362,6 +366,13 @@ class Database:
     def insert_evidence(self, citing_op_id: str, refs: list[EvidenceRef]) -> None:
         """Insert evidence rows. Must be called inside an existing transaction."""
         assert self._conn
+        # Pre-flight duplicate check: raises ValueError before any SQL so the caller
+        # receives a clean message rather than a raw sqlite3.IntegrityError.
+        seen: set[str] = set()
+        for ref in refs:
+            if ref.op_id in seen:
+                raise ValueError(f"duplicate cited_op_id in refs: {ref.op_id!r}")
+            seen.add(ref.op_id)
         for ref in refs:
             if ref.op_id == citing_op_id:
                 raise ValueError(f"self-reference: citing_op_id == cited_op_id == {ref.op_id!r}")
@@ -377,16 +388,17 @@ class Database:
                 (citing_op_id, ref.op_id, str(ref.relation), ref.scope, ref.inference),
             )
 
-    def get_evidence(self, op_id: str) -> list[dict[str, Any]]:
-        """Return all ops cited by op_id, recording access with depth-decay weights (best-effort)."""
+    def get_evidence(self, op_id: str, max_results: int = _MAX_EVIDENCE_RESULTS) -> list[dict[str, Any]]:
+        """Return ops cited by op_id (up to max_results), recording access at flat weight=0.7 (best-effort)."""
         assert self._conn
         rows = self._conn.execute(
             """SELECT e.cited_op_id, o.op_type, o.status, o.memory_tier,
                       e.relation, e.scope, e.inference, e.created_at
                FROM op_evidence e
                JOIN operations o ON o.op_id = e.cited_op_id
-               WHERE e.citing_op_id = ?""",
-            (op_id,),
+               WHERE e.citing_op_id = :op_id
+               LIMIT :max_results""",
+            {"op_id": op_id, "max_results": max_results},
         ).fetchall()
         try:
             self.record_access(op_id, weight=1.0)
@@ -396,16 +408,17 @@ class Database:
             pass  # access recording is best-effort; read result is still valid
         return [dict(r) for r in rows]
 
-    def get_citing_ops(self, op_id: str) -> list[dict[str, Any]]:
-        """Return all ops that cited op_id as evidence, recording access on cited op only (best-effort)."""
+    def get_citing_ops(self, op_id: str, max_results: int = _MAX_EVIDENCE_RESULTS) -> list[dict[str, Any]]:
+        """Return ops that cited op_id (up to max_results), recording access on cited op only (best-effort)."""
         assert self._conn
         rows = self._conn.execute(
             """SELECT e.citing_op_id, o.op_type, o.status, o.memory_tier,
                       e.relation, e.scope, e.inference, e.created_at
                FROM op_evidence e
                JOIN operations o ON o.op_id = e.citing_op_id
-               WHERE e.cited_op_id = ?""",
-            (op_id,),
+               WHERE e.cited_op_id = :op_id
+               LIMIT :max_results""",
+            {"op_id": op_id, "max_results": max_results},
         ).fetchall()
         try:
             self.record_access(op_id, weight=1.0)

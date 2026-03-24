@@ -1,3 +1,5 @@
+import pytest
+
 from hgp.models import (
     Operation, OpEdge, StoredObject, Lease, GitAnchor, ReconcileReport,
     OpType, OpStatus, EdgeType, LeaseStatus, ObjectStatus,
@@ -101,3 +103,9 @@ def test_citing_record_fields():
     )
     assert rec.citing_op_id == "op-3"
     assert rec.scope == "field.x"
+
+
+def test_evidence_ref_empty_op_id_rejected():
+    """EvidenceRef with empty string op_id must fail validation."""
+    with pytest.raises(Exception):
+        EvidenceRef(op_id="", relation=EvidenceRelation.SUPPORTS)

@@ -408,8 +408,8 @@ def test_get_evidence_promotes_inactive_cited(hgp_dirs: dict):
     db.insert_operation("cited", "artifact", "agent-1", 2, "sha256:b")
     db.commit()
 
-    # Manually demote cited to inactive
-    db.execute("UPDATE operations SET memory_tier = 'inactive' WHERE op_id = 'cited'")
+    # Demote cited to inactive via the proper API
+    db.set_memory_tier("cited", "inactive")
     db.commit()
 
     db.begin_immediate()
@@ -417,7 +417,6 @@ def test_get_evidence_promotes_inactive_cited(hgp_dirs: dict):
     db.commit()
 
     db.get_evidence("citing")
-    db.commit()
     assert db.get_operation("cited")["memory_tier"] == "long_term"
 
 
@@ -452,3 +451,66 @@ def test_evidence_persists_after_db_reopen(hgp_dirs: dict):
     assert rows[0]["cited_op_id"] == "cited"
     assert rows[0]["scope"] == "s1"
     assert rows[0]["inference"] == "i1"
+
+
+# ── V3 Third Audit Fix Tests ──────────────────────────────────
+
+def test_insert_evidence_duplicate_cited_op_raises_clean_valueerror(hgp_dirs: dict):
+    """Duplicate cited_op_id within refs list → clean ValueError before any SQL."""
+    from hgp.models import EvidenceRef, EvidenceRelation
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("citing", "artifact", "agent-1", 1, "sha256:a")
+    db.insert_operation("cited",  "artifact", "agent-1", 2, "sha256:b")
+    db.commit()
+
+    db.begin_immediate()
+    with pytest.raises(ValueError, match="duplicate"):
+        db.insert_evidence("citing", [
+            EvidenceRef(op_id="cited", relation=EvidenceRelation.SUPPORTS),
+            EvidenceRef(op_id="cited", relation=EvidenceRelation.REFUTES),
+        ])
+    db.rollback()
+
+
+def test_get_evidence_respects_max_results(hgp_dirs: dict):
+    """get_evidence(max_results=N) returns at most N rows even if more exist."""
+    from hgp.models import EvidenceRef, EvidenceRelation
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("citing", "artifact", "agent-1", 1, "sha256:a")
+    for i in range(5):
+        db.insert_operation(f"cited-{i}", "artifact", "agent-1", i + 2, f"sha256:{i}")
+    db.commit()
+    db.begin_immediate()
+    db.insert_evidence("citing", [
+        EvidenceRef(op_id=f"cited-{i}", relation=EvidenceRelation.CONTEXT)
+        for i in range(5)
+    ])
+    db.commit()
+
+    rows = db.get_evidence("citing", max_results=3)
+    assert len(rows) == 3
+
+
+def test_get_citing_ops_respects_max_results(hgp_dirs: dict):
+    """get_citing_ops(max_results=N) returns at most N rows even if more exist."""
+    from hgp.models import EvidenceRef, EvidenceRelation
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("cited", "artifact", "agent-1", 1, "sha256:a")
+    for i in range(5):
+        db.insert_operation(f"citing-{i}", "artifact", "agent-1", i + 2, f"sha256:{i}")
+    db.commit()
+    for i in range(5):
+        db.begin_immediate()
+        db.insert_evidence(f"citing-{i}", [
+            EvidenceRef(op_id="cited", relation=EvidenceRelation.SOURCE)
+        ])
+        db.commit()
+
+    rows = db.get_citing_ops("cited", max_results=2)
+    assert len(rows) == 2

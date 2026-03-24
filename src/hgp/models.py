@@ -112,7 +112,7 @@ class EvidenceRelation(StrEnum):
 
 
 class EvidenceRef(BaseModel):
-    op_id:     str
+    op_id:     str = Field(min_length=1)
     relation:  EvidenceRelation
     scope:     str | None = Field(default=None, max_length=1024)
     inference: str | None = Field(default=None, max_length=4096)
