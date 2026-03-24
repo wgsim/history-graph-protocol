@@ -392,7 +392,7 @@ def test_insert_evidence_duplicate_raises(hgp_dirs: dict):
     db.commit()
 
     db.begin_immediate()
-    with pytest.raises(Exception):  # IntegrityError from UNIQUE constraint
+    with pytest.raises(sqlite3.IntegrityError):
         db.insert_evidence("citing", [EvidenceRef(op_id="cited", relation=EvidenceRelation.REFUTES)])
         db.commit()
     db.rollback()
@@ -514,3 +514,42 @@ def test_get_citing_ops_respects_max_results(hgp_dirs: dict):
 
     rows = db.get_citing_ops("cited", max_results=2)
     assert len(rows) == 2
+
+
+def test_get_evidence_zero_max_results_clamped_to_one(hgp_dirs: dict):
+    """max_results=0 must be clamped to 1 — LIMIT 0 returns nothing, which is wrong."""
+    from hgp.models import EvidenceRef, EvidenceRelation
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("citing", "artifact", "agent-1", 1, "sha256:a")
+    db.insert_operation("cited",  "artifact", "agent-1", 2, "sha256:b")
+    db.commit()
+    db.begin_immediate()
+    db.insert_evidence("citing", [EvidenceRef(op_id="cited", relation=EvidenceRelation.CONTEXT)])
+    db.commit()
+    # max_results=0 → LIMIT 0 returns zero rows without clamping (wrong)
+    # after clamping to max(1, 0) = 1 → returns the 1 existing row
+    rows = db.get_evidence("citing", max_results=0)
+    assert len(rows) == 1
+
+
+def test_get_evidence_default_cap_enforced(hgp_dirs: dict):
+    """Calling get_evidence with no max_results arg caps at _MAX_EVIDENCE_RESULTS."""
+    from hgp.models import EvidenceRef, EvidenceRelation
+    from hgp.db import _MAX_EVIDENCE_RESULTS
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    n = _MAX_EVIDENCE_RESULTS + 1
+    db.begin_immediate()
+    db.insert_operation("citing", "artifact", "agent-1", 1, "sha256:a")
+    for i in range(n):
+        db.insert_operation(f"c{i}", "artifact", "agent-1", i + 2, f"sha256:{i}")
+    db.commit()
+    db.begin_immediate()
+    db.insert_evidence("citing", [
+        EvidenceRef(op_id=f"c{i}", relation=EvidenceRelation.CONTEXT) for i in range(n)
+    ])
+    db.commit()
+    rows = db.get_evidence("citing")  # no max_results — uses default
+    assert len(rows) == _MAX_EVIDENCE_RESULTS

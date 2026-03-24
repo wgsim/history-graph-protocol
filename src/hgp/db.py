@@ -133,6 +133,8 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
+        # executescript() issues an implicit COMMIT; re-assert per-connection PRAGMA.
+        self._conn.execute("PRAGMA foreign_keys = ON")
         # V2 migration: add memory tier columns to existing DBs (each column guarded independently)
         existing_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(operations)").fetchall()}
         if "access_count" not in existing_cols:
@@ -391,6 +393,7 @@ class Database:
     def get_evidence(self, op_id: str, max_results: int = _MAX_EVIDENCE_RESULTS) -> list[dict[str, Any]]:
         """Return ops cited by op_id (up to max_results), recording access at flat weight=0.7 (best-effort)."""
         assert self._conn
+        max_results = max(1, min(max_results, _MAX_EVIDENCE_RESULTS))  # clamp: 1 ≤ n ≤ cap
         rows = self._conn.execute(
             """SELECT e.cited_op_id, o.op_type, o.status, o.memory_tier,
                       e.relation, e.scope, e.inference, e.created_at
@@ -411,6 +414,7 @@ class Database:
     def get_citing_ops(self, op_id: str, max_results: int = _MAX_EVIDENCE_RESULTS) -> list[dict[str, Any]]:
         """Return ops that cited op_id (up to max_results), recording access on cited op only (best-effort)."""
         assert self._conn
+        max_results = max(1, min(max_results, _MAX_EVIDENCE_RESULTS))  # clamp: 1 ≤ n ≤ cap
         rows = self._conn.execute(
             """SELECT e.citing_op_id, o.op_type, o.status, o.memory_tier,
                       e.relation, e.scope, e.inference, e.created_at

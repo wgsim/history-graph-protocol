@@ -374,8 +374,8 @@ def hgp_get_evidence(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
         if not db.get_operation(op_id):
             return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
         return db.get_evidence(op_id)
-    except Exception as exc:
-        return {"error": "DB_ERROR", "message": str(exc)}
+    except sqlite3.Error:
+        return {"error": "DB_ERROR", "message": "Internal database error"}
 
 
 @mcp.tool()
@@ -386,8 +386,8 @@ def hgp_get_citing_ops(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
         if not db.get_operation(op_id):
             return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
         return db.get_citing_ops(op_id)
-    except Exception as exc:
-        return {"error": "DB_ERROR", "message": str(exc)}
+    except sqlite3.Error:
+        return {"error": "DB_ERROR", "message": "Internal database error"}
 
 
 if __name__ == "__main__":
