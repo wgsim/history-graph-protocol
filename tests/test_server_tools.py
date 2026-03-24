@@ -789,3 +789,110 @@ def test_create_operation_exactly_max_evidence_refs_succeeds(server_components):
     result = hgp_create_operation(op_type="hypothesis", agent_id="a", evidence_refs=refs)
     assert "op_id" in result  # must succeed, not error
     assert "error" not in result
+
+
+# ── V3 Fifth Audit Fix Tests ──────────────────────────────────
+
+def test_create_operation_multiple_distinct_evidence_refs(server_components):
+    """Multiple distinct cited ops in one call — all rows must be stored and returned."""
+    from hgp.server import hgp_get_evidence
+    cited1 = hgp_create_operation(op_type="artifact", agent_id="a")
+    cited2 = hgp_create_operation(op_type="artifact", agent_id="a")
+    cited3 = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[
+            {"op_id": cited1["op_id"], "relation": "supports"},
+            {"op_id": cited2["op_id"], "relation": "refutes"},
+            {"op_id": cited3["op_id"], "relation": "context"},
+        ],
+    )
+    assert "op_id" in citing
+    ev = hgp_get_evidence(citing["op_id"])
+    cited_ids = {e["cited_op_id"] for e in ev}
+    assert len(ev) == 3
+    assert cited1["op_id"] in cited_ids
+    assert cited2["op_id"] in cited_ids
+    assert cited3["op_id"] in cited_ids
+
+
+def test_hgp_get_evidence_with_inactive_cited_op(server_components):
+    """get_evidence returns rows even when cited op is inactive; promotes it back to long_term."""
+    from hgp.server import hgp_get_evidence
+    db = server_components["db"]
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "source"}],
+    )
+    db.set_memory_tier(cited["op_id"], "inactive")
+    db.commit()
+    assert db.get_operation(cited["op_id"])["memory_tier"] == "inactive"
+
+    ev = hgp_get_evidence(citing["op_id"])
+    assert len(ev) == 1
+    assert ev[0]["cited_op_id"] == cited["op_id"]
+    assert ev[0]["memory_tier"] == "inactive"  # row reflects tier at read time
+    # record_access with weight=0.7 (>=0.4) must have promoted the cited op
+    assert db.get_operation(cited["op_id"])["memory_tier"] == "long_term"
+
+
+def test_evidence_relation_refutes_round_trip(server_components):
+    """'refutes' relation is stored and returned correctly end-to-end at server layer."""
+    from hgp.server import hgp_get_evidence
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "refutes", "inference": "contradicts obs"}],
+    )
+    ev = hgp_get_evidence(citing["op_id"])
+    assert len(ev) == 1
+    assert ev[0]["relation"] == "refutes"
+    assert ev[0]["inference"] == "contradicts obs"
+
+
+def test_evidence_created_at_is_iso8601(server_components):
+    """created_at field in evidence records must be parseable ISO-8601 with ms precision."""
+    from hgp.server import hgp_get_evidence
+    from datetime import datetime
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "method"}],
+    )
+    ev = hgp_get_evidence(citing["op_id"])
+    assert len(ev) == 1
+    # SQLite stores: 2026-03-24T19:30:00.000Z — must parse without error
+    created_at = ev[0]["created_at"]
+    parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    assert parsed.year >= 2026
+
+
+def test_create_operation_integrity_error_returns_sanitized_message(server_components):
+    """sqlite3.IntegrityError from insert_evidence returns DUPLICATE_EVIDENCE_REF with sanitized message.
+
+    Simulates the DB-level UNIQUE constraint violation via monkeypatching so the
+    server's IntegrityError branch is exercised through the public tool API.
+    """
+    import sqlite3 as _sqlite3
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    db = server_components["db"]
+
+    # Monkeypatch db.insert_evidence to raise IntegrityError with raw schema-leaking message
+    original = db.insert_evidence
+    def raise_integrity_error(citing_op_id, refs):
+        raise _sqlite3.IntegrityError(
+            "UNIQUE constraint failed: op_evidence.citing_op_id, op_evidence.cited_op_id"
+        )
+    db.insert_evidence = raise_integrity_error
+    try:
+        result = hgp_create_operation(
+            op_type="hypothesis", agent_id="a",
+            evidence_refs=[{"op_id": cited["op_id"], "relation": "supports"}],
+        )
+    finally:
+        db.insert_evidence = original
+
+    assert result.get("error") == "DUPLICATE_EVIDENCE_REF"
+    assert "op_evidence" not in result.get("message", "")
+    assert "citing_op_id" not in result.get("message", "")

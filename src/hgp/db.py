@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hgp.models import EvidenceRef
@@ -99,8 +102,8 @@ CREATE TABLE IF NOT EXISTS op_evidence (
     cited_op_id   TEXT NOT NULL,
     relation      TEXT NOT NULL CHECK (relation IN
                     ('supports', 'refutes', 'context', 'method', 'source')),
-    scope         TEXT DEFAULT NULL,
-    inference     TEXT DEFAULT NULL,
+    scope         TEXT DEFAULT NULL CHECK (scope IS NULL OR length(scope) <= 1024),
+    inference     TEXT DEFAULT NULL CHECK (inference IS NULL OR length(inference) <= 4096),
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (citing_op_id, cited_op_id),
     FOREIGN KEY (citing_op_id) REFERENCES operations(op_id),
@@ -213,15 +216,21 @@ class Database:
         assert self._conn
         try:
             self._conn.execute("COMMIT")
-        except sqlite3.OperationalError:
-            pass  # No active transaction in autocommit mode — already committed
+        except sqlite3.OperationalError as exc:
+            # Suppress only "no active transaction" (autocommit mode).
+            # Re-raise real I/O failures (SQLITE_FULL, SQLITE_IOERR, etc.)
+            # which also arrive as OperationalError but with different messages.
+            if "no transaction" not in str(exc).lower():
+                raise
 
     def rollback(self) -> None:
         assert self._conn
         try:
             self._conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            pass  # No active transaction in autocommit mode — nothing to roll back
+        except sqlite3.OperationalError as exc:
+            # Suppress only "no active transaction" (autocommit mode).
+            if "no transaction" not in str(exc).lower():
+                raise
 
     def begin_immediate(self) -> None:
         assert self._conn
@@ -407,8 +416,10 @@ class Database:
             self.record_access(op_id, weight=1.0)
             for row in rows:
                 self.record_access(row["cited_op_id"], weight=0.7)
-        except sqlite3.Error:
-            pass  # access recording is best-effort; read result is still valid
+        except sqlite3.OperationalError:
+            pass  # expected: write-lock contention when another writer holds BEGIN IMMEDIATE
+        except sqlite3.Error as exc:
+            _log.warning("record_access failed unexpectedly in get_evidence op_id=%r: %s", op_id, exc)
         return [dict(r) for r in rows]
 
     def get_citing_ops(self, op_id: str, max_results: int = _MAX_EVIDENCE_RESULTS) -> list[dict[str, Any]]:
@@ -426,6 +437,8 @@ class Database:
         ).fetchall()
         try:
             self.record_access(op_id, weight=1.0)
-        except sqlite3.Error:
-            pass  # access recording is best-effort; read result is still valid
+        except sqlite3.OperationalError:
+            pass  # expected: write-lock contention when another writer holds BEGIN IMMEDIATE
+        except sqlite3.Error as exc:
+            _log.warning("record_access failed unexpectedly in get_citing_ops op_id=%r: %s", op_id, exc)
         return [dict(r) for r in rows]

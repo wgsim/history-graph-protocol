@@ -109,3 +109,21 @@ def test_evidence_ref_empty_op_id_rejected():
     """EvidenceRef with empty string op_id must fail validation."""
     with pytest.raises(Exception):
         EvidenceRef(op_id="", relation=EvidenceRelation.SUPPORTS)
+
+
+def test_evidence_ref_whitespace_only_op_id_rejected():
+    """EvidenceRef with whitespace-only op_id must fail the custom validator."""
+    with pytest.raises(Exception):
+        EvidenceRef(op_id="   ", relation=EvidenceRelation.SUPPORTS)
+
+
+def test_evidence_ref_op_id_stripped():
+    """EvidenceRef strips leading/trailing whitespace from op_id."""
+    ref = EvidenceRef(op_id="  abc-123  ", relation=EvidenceRelation.SUPPORTS)
+    assert ref.op_id == "abc-123"
+
+
+def test_evidence_ref_op_id_max_length():
+    """EvidenceRef with op_id exceeding max_length=128 must fail validation."""
+    with pytest.raises(Exception):
+        EvidenceRef(op_id="x" * 129, relation=EvidenceRelation.SUPPORTS)

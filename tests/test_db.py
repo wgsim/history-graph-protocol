@@ -394,7 +394,6 @@ def test_insert_evidence_duplicate_raises(hgp_dirs: dict):
     db.begin_immediate()
     with pytest.raises(sqlite3.IntegrityError):
         db.insert_evidence("citing", [EvidenceRef(op_id="cited", relation=EvidenceRelation.REFUTES)])
-        db.commit()
     db.rollback()
 
 
@@ -553,3 +552,48 @@ def test_get_evidence_default_cap_enforced(hgp_dirs: dict):
     db.commit()
     rows = db.get_evidence("citing")  # no max_results — uses default
     assert len(rows) == _MAX_EVIDENCE_RESULTS
+
+
+def test_commit_without_active_transaction_does_not_raise(hgp_dirs: dict):
+    """commit() in autocommit mode must not raise (symmetric with rollback test)."""
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.commit()  # must not raise sqlite3.OperationalError
+
+
+def test_op_evidence_schema_check_scope_length(hgp_dirs: dict):
+    """DB-level CHECK(length(scope)<=1024) rejects scope > 1024 chars on fresh install."""
+    import sqlite3
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("citing", "artifact", "agent-1", 1, "sha256:a")
+    db.insert_operation("cited", "artifact", "agent-1", 2, "sha256:b")
+    db.commit()
+
+    db.begin_immediate()
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "INSERT INTO op_evidence (citing_op_id, cited_op_id, relation, scope) VALUES (?, ?, ?, ?)",
+            ("citing", "cited", "supports", "x" * 1025),
+        )
+    db.rollback()
+
+
+def test_op_evidence_schema_check_inference_length(hgp_dirs: dict):
+    """DB-level CHECK(length(inference)<=4096) rejects inference > 4096 chars on fresh install."""
+    import sqlite3
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("citing", "artifact", "agent-1", 1, "sha256:a")
+    db.insert_operation("cited", "artifact", "agent-1", 2, "sha256:b")
+    db.commit()
+
+    db.begin_immediate()
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "INSERT INTO op_evidence (citing_op_id, cited_op_id, relation, inference) VALUES (?, ?, ?, ?)",
+            ("citing", "cited", "supports", "y" * 4097),
+        )
+    db.rollback()
