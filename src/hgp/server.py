@@ -16,6 +16,7 @@ _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MAX_TTL_SECONDS = 86400
 _MAX_EVIDENCE_REFS = 50
 
+from pydantic import ValidationError
 from mcp.server.fastmcp import FastMCP
 
 from hgp.cas import CAS
@@ -84,7 +85,7 @@ def hgp_create_operation(
             return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
         try:
             parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
-        except Exception as exc:
+        except ValidationError as exc:
             return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
     db, cas, _, _ = _get_components()

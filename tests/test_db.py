@@ -419,3 +419,36 @@ def test_get_evidence_promotes_inactive_cited(hgp_dirs: dict):
     db.get_evidence("citing")
     db.commit()
     assert db.get_operation("cited")["memory_tier"] == "long_term"
+
+
+def test_rollback_without_active_transaction_does_not_raise(hgp_dirs: dict):
+    """rollback() in autocommit mode must not raise (mirrors commit() behavior)."""
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    # No transaction opened — should be safe to call
+    db.rollback()  # must not raise sqlite3.OperationalError
+
+
+def test_evidence_persists_after_db_reopen(hgp_dirs: dict):
+    """Evidence rows survive db.close() + new Database() at same path."""
+    from hgp.models import EvidenceRef, EvidenceRelation
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("citing", "artifact", "agent-1", 1, "sha256:a")
+    db.insert_operation("cited",  "artifact", "agent-1", 2, "sha256:b")
+    db.commit()
+    db.begin_immediate()
+    db.insert_evidence("citing", [
+        EvidenceRef(op_id="cited", relation=EvidenceRelation.METHOD, scope="s1", inference="i1"),
+    ])
+    db.commit()
+    db.close()
+
+    db2 = Database(hgp_dirs["db_path"])
+    db2.initialize()
+    rows = db2.get_evidence("citing")
+    assert len(rows) == 1
+    assert rows[0]["cited_op_id"] == "cited"
+    assert rows[0]["scope"] == "s1"
+    assert rows[0]["inference"] == "i1"

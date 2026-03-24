@@ -642,17 +642,15 @@ def test_create_operation_evidence_invalid_relation(server_components):
 
 
 def test_create_operation_evidence_self_reference(server_components):
-    """Self-reference in evidence_refs → error response."""
-    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    """evidence_refs with a nonexistent op_id returns error dict.
+    Note: the actual self-reference guard (ValueError from db.insert_evidence) is
+    tested at the DB layer in test_insert_evidence_self_reference_raises. At the
+    tool layer, the op_id is generated server-side so a genuine self-ref cannot be
+    constructed pre-call; this test covers the nonexistent-op rejection path."""
     result = hgp_create_operation(
         op_type="hypothesis", agent_id="a",
-        parent_op_ids=[op["op_id"]],
-        evidence_refs=[{"op_id": "SELF", "relation": "supports"}],
+        evidence_refs=[{"op_id": "definitely-nonexistent-op", "relation": "supports"}],
     )
-    # SELF is a placeholder — actual self-ref needs the real op_id which is unknown pre-creation
-    # Instead test with an op citing itself is caught: create op first, then attempt update
-    # The tool must prevent self-ref by checking citing_op_id != cited_op_id
-    # This test verifies non-existent op_id → error
     assert "error" in result
 
 
@@ -733,3 +731,61 @@ def test_evidence_ref_inference_too_long(server_components):
         evidence_refs=[{"op_id": cited["op_id"], "relation": "supports", "inference": "y" * 5000}],
     )
     assert "error" in result
+
+
+# ── V3 Second Audit Fix Tests ─────────────────────────────────
+
+def test_evidence_scope_and_inference_round_trip(server_components):
+    """scope and inference are stored and retrieved correctly end-to-end."""
+    from hgp.server import hgp_get_evidence
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{
+            "op_id": cited["op_id"],
+            "relation": "method",
+            "scope": "field.x[0:10]",
+            "inference": "the first 10 elements support the hypothesis",
+        }],
+    )
+    # Re-fetch citing op via query
+    from hgp.server import hgp_query_operations
+    ops = hgp_query_operations(agent_id="a", op_type="hypothesis")
+    citing_id = ops[0]["op_id"]
+    ev = hgp_get_evidence(citing_id)
+    assert len(ev) == 1
+    assert ev[0]["scope"] == "field.x[0:10]"
+    assert ev[0]["inference"] == "the first 10 elements support the hypothesis"
+
+
+def test_get_citing_ops_multiple_citing_ops(server_components):
+    """hgp_get_citing_ops returns all citing ops when multiple ops cite the same op."""
+    from hgp.server import hgp_get_citing_ops
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing1 = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports"}],
+    )
+    citing2 = hgp_create_operation(
+        op_type="hypothesis", agent_id="b",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "refutes"}],
+    )
+    result = hgp_get_citing_ops(cited["op_id"])
+    citing_ids = {r["citing_op_id"] for r in result}
+    assert len(result) == 2
+    assert citing1["op_id"] in citing_ids
+    assert citing2["op_id"] in citing_ids
+
+
+def test_create_operation_exactly_max_evidence_refs_succeeds(server_components):
+    """Exactly _MAX_EVIDENCE_REFS evidence refs must succeed (boundary: > not >=)."""
+    from hgp.server import _MAX_EVIDENCE_REFS
+    # Create _MAX_EVIDENCE_REFS distinct cited ops
+    cited_ids = []
+    for i in range(_MAX_EVIDENCE_REFS):
+        r = hgp_create_operation(op_type="artifact", agent_id="a")
+        cited_ids.append(r["op_id"])
+    refs = [{"op_id": cid, "relation": "context"} for cid in cited_ids]
+    result = hgp_create_operation(op_type="hypothesis", agent_id="a", evidence_refs=refs)
+    assert "op_id" in result  # must succeed, not error
+    assert "error" not in result

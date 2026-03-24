@@ -212,7 +212,10 @@ class Database:
 
     def rollback(self) -> None:
         assert self._conn
-        self._conn.execute("ROLLBACK")
+        try:
+            self._conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass  # No active transaction in autocommit mode — nothing to roll back
 
     def begin_immediate(self) -> None:
         assert self._conn
@@ -389,7 +392,7 @@ class Database:
             self.record_access(op_id, weight=1.0)
             for row in rows:
                 self.record_access(row["cited_op_id"], weight=0.7)
-        except Exception:
+        except sqlite3.Error:
             pass  # access recording is best-effort; read result is still valid
         return [dict(r) for r in rows]
 
@@ -406,6 +409,6 @@ class Database:
         ).fetchall()
         try:
             self.record_access(op_id, weight=1.0)
-        except Exception:
+        except sqlite3.Error:
             pass  # access recording is best-effort; read result is still valid
         return [dict(r) for r in rows]
