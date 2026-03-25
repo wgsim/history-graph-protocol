@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+_log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from hgp.models import EvidenceRef
 
 _SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
@@ -89,7 +95,28 @@ CREATE TABLE IF NOT EXISTS git_anchors (
     PRIMARY KEY (op_id, git_commit_sha),
     FOREIGN KEY (op_id) REFERENCES operations(op_id)
 );
+
+CREATE TABLE IF NOT EXISTS op_evidence (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    citing_op_id  TEXT NOT NULL,
+    cited_op_id   TEXT NOT NULL,
+    relation      TEXT NOT NULL CHECK (relation IN
+                    ('supports', 'refutes', 'context', 'method', 'source')),
+    scope         TEXT DEFAULT NULL CHECK (scope IS NULL OR length(scope) <= 1024),
+    inference     TEXT DEFAULT NULL CHECK (inference IS NULL OR length(inference) <= 4096),
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (citing_op_id, cited_op_id),
+    FOREIGN KEY (citing_op_id) REFERENCES operations(op_id),
+    FOREIGN KEY (cited_op_id)  REFERENCES operations(op_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_citing ON op_evidence(citing_op_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_cited  ON op_evidence(cited_op_id);
 """
+
+# Server-side cap on evidence result sets — prevents reverse fan-out DoS where
+# one widely-cited op triggers an unbounded JOIN over all citing ops.
+_MAX_EVIDENCE_RESULTS = 200
 
 
 class Database:
@@ -109,6 +136,8 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
+        # executescript() issues an implicit COMMIT; re-assert per-connection PRAGMA.
+        self._conn.execute("PRAGMA foreign_keys = ON")
         # V2 migration: add memory tier columns to existing DBs (each column guarded independently)
         existing_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(operations)").fetchall()}
         if "access_count" not in existing_cols:
@@ -187,12 +216,21 @@ class Database:
         assert self._conn
         try:
             self._conn.execute("COMMIT")
-        except sqlite3.OperationalError:
-            pass  # No active transaction in autocommit mode — already committed
+        except sqlite3.OperationalError as exc:
+            # Suppress only "no active transaction" (autocommit mode).
+            # Re-raise real I/O failures (SQLITE_FULL, SQLITE_IOERR, etc.)
+            # which also arrive as OperationalError but with different messages.
+            if "no transaction" not in str(exc).lower():
+                raise
 
     def rollback(self) -> None:
         assert self._conn
-        self._conn.execute("ROLLBACK")
+        try:
+            self._conn.execute("ROLLBACK")
+        except sqlite3.OperationalError as exc:
+            # Suppress only "no active transaction" (autocommit mode).
+            if "no transaction" not in str(exc).lower():
+                raise
 
     def begin_immediate(self) -> None:
         assert self._conn
@@ -335,3 +373,72 @@ class Database:
                  )"""
         )
         return cur.rowcount
+
+    def insert_evidence(self, citing_op_id: str, refs: list[EvidenceRef]) -> None:
+        """Insert evidence rows. Must be called inside an existing transaction."""
+        assert self._conn
+        # Pre-flight duplicate check: raises ValueError before any SQL so the caller
+        # receives a clean message rather than a raw sqlite3.IntegrityError.
+        seen: set[str] = set()
+        for ref in refs:
+            if ref.op_id in seen:
+                raise ValueError(f"duplicate cited_op_id in refs: {ref.op_id!r}")
+            seen.add(ref.op_id)
+        for ref in refs:
+            if ref.op_id == citing_op_id:
+                raise ValueError(f"self-reference: citing_op_id == cited_op_id == {ref.op_id!r}")
+            exists = self._conn.execute(
+                "SELECT 1 FROM operations WHERE op_id = ?", (ref.op_id,)
+            ).fetchone()
+            if not exists:
+                raise ValueError(f"cited_op_id not found: {ref.op_id!r}")
+            self._conn.execute(
+                """INSERT INTO op_evidence
+                   (citing_op_id, cited_op_id, relation, scope, inference)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (citing_op_id, ref.op_id, str(ref.relation), ref.scope, ref.inference),
+            )
+
+    def get_evidence(self, op_id: str, max_results: int = _MAX_EVIDENCE_RESULTS) -> list[dict[str, Any]]:
+        """Return ops cited by op_id (up to max_results), recording access at flat weight=0.7 (best-effort)."""
+        assert self._conn
+        max_results = max(1, min(max_results, _MAX_EVIDENCE_RESULTS))  # clamp: 1 ≤ n ≤ cap
+        rows = self._conn.execute(
+            """SELECT e.cited_op_id, o.op_type, o.status, o.memory_tier,
+                      e.relation, e.scope, e.inference, e.created_at
+               FROM op_evidence e
+               JOIN operations o ON o.op_id = e.cited_op_id
+               WHERE e.citing_op_id = :op_id
+               LIMIT :max_results""",
+            {"op_id": op_id, "max_results": max_results},
+        ).fetchall()
+        try:
+            self.record_access(op_id, weight=1.0)
+            for row in rows:
+                self.record_access(row["cited_op_id"], weight=0.7)
+        except sqlite3.OperationalError:
+            pass  # expected: write-lock contention when another writer holds BEGIN IMMEDIATE
+        except sqlite3.Error as exc:
+            _log.warning("record_access failed unexpectedly in get_evidence op_id=%r: %s", op_id, exc)
+        return [dict(r) for r in rows]
+
+    def get_citing_ops(self, op_id: str, max_results: int = _MAX_EVIDENCE_RESULTS) -> list[dict[str, Any]]:
+        """Return ops that cited op_id (up to max_results), recording access on cited op only (best-effort)."""
+        assert self._conn
+        max_results = max(1, min(max_results, _MAX_EVIDENCE_RESULTS))  # clamp: 1 ≤ n ≤ cap
+        rows = self._conn.execute(
+            """SELECT e.citing_op_id, o.op_type, o.status, o.memory_tier,
+                      e.relation, e.scope, e.inference, e.created_at
+               FROM op_evidence e
+               JOIN operations o ON o.op_id = e.citing_op_id
+               WHERE e.cited_op_id = :op_id
+               LIMIT :max_results""",
+            {"op_id": op_id, "max_results": max_results},
+        ).fetchall()
+        try:
+            self.record_access(op_id, weight=1.0)
+        except sqlite3.OperationalError:
+            pass  # expected: write-lock contention when another writer holds BEGIN IMMEDIATE
+        except sqlite3.Error as exc:
+            _log.warning("record_access failed unexpectedly in get_citing_ops op_id=%r: %s", op_id, exc)
+        return [dict(r) for r in rows]

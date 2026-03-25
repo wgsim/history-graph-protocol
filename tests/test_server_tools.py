@@ -566,3 +566,333 @@ def test_create_operation_auto_release_demotes_root(server_components):
         lease_id=lease["lease_id"],
     )
     assert server_components["db"].get_operation(r["op_id"])["memory_tier"] == "long_term"
+
+
+# ── V3 Evidence Trail Tool Tests ──────────────────────────────
+
+def test_create_operation_with_evidence_refs(server_components):
+    """hgp_create_operation with evidence_refs inserts rows into op_evidence."""
+    from hgp.server import hgp_get_evidence
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports", "inference": "confirmed"}],
+    )
+    assert "op_id" in citing
+    ev = hgp_get_evidence(citing["op_id"])
+    assert len(ev) == 1
+    assert ev[0]["cited_op_id"] == cited["op_id"]
+    assert ev[0]["relation"] == "supports"
+    assert ev[0]["inference"] == "confirmed"
+
+
+def test_hgp_get_evidence_records_access(server_components):
+    """hgp_get_evidence records access on both citing and cited ops."""
+    from hgp.server import hgp_get_evidence
+    db = server_components["db"]
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "context"}],
+    )
+    hgp_get_evidence(citing["op_id"])
+    assert db.get_operation(cited["op_id"])["access_count"] > 0
+
+
+def test_hgp_get_citing_ops(server_components):
+    """hgp_get_citing_ops returns ops that cited the given op."""
+    from hgp.server import hgp_get_citing_ops
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "source"}],
+    )
+    result = hgp_get_citing_ops(cited["op_id"])
+    assert len(result) == 1
+    assert result[0]["citing_op_id"] == citing["op_id"]
+    assert result[0]["relation"] == "source"
+
+
+def test_hgp_get_citing_ops_records_cited_access_not_citing(server_components):
+    """hgp_get_citing_ops records access on cited op, NOT on citing ops."""
+    from hgp.server import hgp_get_citing_ops
+    db = server_components["db"]
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "method"}],
+    )
+    # Reset access counts manually
+    db.execute("UPDATE operations SET access_count = 0 WHERE op_id IN (?, ?)",
+               (cited["op_id"], citing["op_id"]))
+    db.commit()
+    hgp_get_citing_ops(cited["op_id"])
+    assert db.get_operation(cited["op_id"])["access_count"] > 0
+    assert db.get_operation(citing["op_id"])["access_count"] == 0
+
+
+def test_create_operation_evidence_invalid_relation(server_components):
+    """Invalid relation enum value → error response."""
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "invalid_relation"}],
+    )
+    assert "error" in result
+
+
+def test_create_operation_evidence_self_reference(server_components):
+    """evidence_refs with a nonexistent op_id returns error dict.
+    Note: the actual self-reference guard (ValueError from db.insert_evidence) is
+    tested at the DB layer in test_insert_evidence_self_reference_raises. At the
+    tool layer, the op_id is generated server-side so a genuine self-ref cannot be
+    constructed pre-call; this test covers the nonexistent-op rejection path."""
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": "definitely-nonexistent-op", "relation": "supports"}],
+    )
+    assert "error" in result
+
+
+def test_create_operation_evidence_nonexistent_cited(server_components):
+    """Non-existent cited op_id in evidence_refs → error response."""
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": "ghost-op-id", "relation": "supports"}],
+    )
+    assert "error" in result
+
+
+# ── V3 Audit Fix Tests ────────────────────────────────────────
+
+def test_create_operation_duplicate_evidence_returns_error_dict(server_components):
+    """Duplicate (citing, cited) pair must return error dict, not raise IntegrityError."""
+    from hgp.server import hgp_get_evidence
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    # First creation succeeds
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports"}],
+    )
+    assert "op_id" in citing
+
+    # Second op tries to cite the same op twice in one call (duplicate in list)
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[
+            {"op_id": cited["op_id"], "relation": "supports"},
+            {"op_id": cited["op_id"], "relation": "refutes"},  # duplicate cited_op_id
+        ],
+    )
+    assert "error" in result  # must NOT raise, must return error dict
+
+
+def test_hgp_get_evidence_nonexistent_op_returns_error(server_components):
+    """hgp_get_evidence on unknown op_id returns error dict, not empty list."""
+    from hgp.server import hgp_get_evidence
+    result = hgp_get_evidence("nonexistent-op-id")
+    assert isinstance(result, dict)
+    assert "error" in result
+
+
+def test_hgp_get_citing_ops_nonexistent_op_returns_error(server_components):
+    """hgp_get_citing_ops on unknown op_id returns error dict, not empty list."""
+    from hgp.server import hgp_get_citing_ops
+    result = hgp_get_citing_ops("nonexistent-op-id")
+    assert isinstance(result, dict)
+    assert "error" in result
+
+
+def test_create_operation_too_many_evidence_refs(server_components):
+    """More than _MAX_EVIDENCE_REFS evidence_refs returns error dict."""
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    # Build 51 refs (all pointing to same op_id — will hit fan-out cap before duplicate check)
+    from hgp.server import _MAX_EVIDENCE_REFS
+    refs = [{"op_id": cited["op_id"], "relation": "supports"}] * (_MAX_EVIDENCE_REFS + 1)
+    result = hgp_create_operation(op_type="hypothesis", agent_id="a", evidence_refs=refs)
+    assert "error" in result
+
+
+def test_evidence_ref_scope_too_long(server_components):
+    """scope exceeding max_length triggers validation error."""
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports", "scope": "x" * 2000}],
+    )
+    assert "error" in result
+
+
+def test_evidence_ref_inference_too_long(server_components):
+    """inference exceeding max_length triggers validation error."""
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports", "inference": "y" * 5000}],
+    )
+    assert "error" in result
+
+
+# ── V3 Second Audit Fix Tests ─────────────────────────────────
+
+def test_evidence_scope_and_inference_round_trip(server_components):
+    """scope and inference are stored and retrieved correctly end-to-end."""
+    from hgp.server import hgp_get_evidence
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{
+            "op_id": cited["op_id"],
+            "relation": "method",
+            "scope": "field.x[0:10]",
+            "inference": "the first 10 elements support the hypothesis",
+        }],
+    )
+    # Re-fetch citing op via query
+    from hgp.server import hgp_query_operations
+    ops = hgp_query_operations(agent_id="a", op_type="hypothesis")
+    citing_id = ops[0]["op_id"]
+    ev = hgp_get_evidence(citing_id)
+    assert len(ev) == 1
+    assert ev[0]["scope"] == "field.x[0:10]"
+    assert ev[0]["inference"] == "the first 10 elements support the hypothesis"
+
+
+def test_get_citing_ops_multiple_citing_ops(server_components):
+    """hgp_get_citing_ops returns all citing ops when multiple ops cite the same op."""
+    from hgp.server import hgp_get_citing_ops
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing1 = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "supports"}],
+    )
+    citing2 = hgp_create_operation(
+        op_type="hypothesis", agent_id="b",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "refutes"}],
+    )
+    result = hgp_get_citing_ops(cited["op_id"])
+    citing_ids = {r["citing_op_id"] for r in result}
+    assert len(result) == 2
+    assert citing1["op_id"] in citing_ids
+    assert citing2["op_id"] in citing_ids
+
+
+def test_create_operation_exactly_max_evidence_refs_succeeds(server_components):
+    """Exactly _MAX_EVIDENCE_REFS evidence refs must succeed (boundary: > not >=)."""
+    from hgp.server import _MAX_EVIDENCE_REFS
+    # Create _MAX_EVIDENCE_REFS distinct cited ops
+    cited_ids = []
+    for i in range(_MAX_EVIDENCE_REFS):
+        r = hgp_create_operation(op_type="artifact", agent_id="a")
+        cited_ids.append(r["op_id"])
+    refs = [{"op_id": cid, "relation": "context"} for cid in cited_ids]
+    result = hgp_create_operation(op_type="hypothesis", agent_id="a", evidence_refs=refs)
+    assert "op_id" in result  # must succeed, not error
+    assert "error" not in result
+
+
+# ── V3 Fifth Audit Fix Tests ──────────────────────────────────
+
+def test_create_operation_multiple_distinct_evidence_refs(server_components):
+    """Multiple distinct cited ops in one call — all rows must be stored and returned."""
+    from hgp.server import hgp_get_evidence
+    cited1 = hgp_create_operation(op_type="artifact", agent_id="a")
+    cited2 = hgp_create_operation(op_type="artifact", agent_id="a")
+    cited3 = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[
+            {"op_id": cited1["op_id"], "relation": "supports"},
+            {"op_id": cited2["op_id"], "relation": "refutes"},
+            {"op_id": cited3["op_id"], "relation": "context"},
+        ],
+    )
+    assert "op_id" in citing
+    ev = hgp_get_evidence(citing["op_id"])
+    cited_ids = {e["cited_op_id"] for e in ev}
+    assert len(ev) == 3
+    assert cited1["op_id"] in cited_ids
+    assert cited2["op_id"] in cited_ids
+    assert cited3["op_id"] in cited_ids
+
+
+def test_hgp_get_evidence_with_inactive_cited_op(server_components):
+    """get_evidence returns rows even when cited op is inactive; promotes it back to long_term."""
+    from hgp.server import hgp_get_evidence
+    db = server_components["db"]
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "source"}],
+    )
+    db.set_memory_tier(cited["op_id"], "inactive")
+    db.commit()
+    assert db.get_operation(cited["op_id"])["memory_tier"] == "inactive"
+
+    ev = hgp_get_evidence(citing["op_id"])
+    assert len(ev) == 1
+    assert ev[0]["cited_op_id"] == cited["op_id"]
+    assert ev[0]["memory_tier"] == "inactive"  # row reflects tier at read time
+    # record_access with weight=0.7 (>=0.4) must have promoted the cited op
+    assert db.get_operation(cited["op_id"])["memory_tier"] == "long_term"
+
+
+def test_evidence_relation_refutes_round_trip(server_components):
+    """'refutes' relation is stored and returned correctly end-to-end at server layer."""
+    from hgp.server import hgp_get_evidence
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "refutes", "inference": "contradicts obs"}],
+    )
+    ev = hgp_get_evidence(citing["op_id"])
+    assert len(ev) == 1
+    assert ev[0]["relation"] == "refutes"
+    assert ev[0]["inference"] == "contradicts obs"
+
+
+def test_evidence_created_at_is_iso8601(server_components):
+    """created_at field in evidence records must be parseable ISO-8601 with ms precision."""
+    from hgp.server import hgp_get_evidence
+    from datetime import datetime
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    citing = hgp_create_operation(
+        op_type="hypothesis", agent_id="a",
+        evidence_refs=[{"op_id": cited["op_id"], "relation": "method"}],
+    )
+    ev = hgp_get_evidence(citing["op_id"])
+    assert len(ev) == 1
+    # SQLite stores: 2026-03-24T19:30:00.000Z — must parse without error
+    created_at = ev[0]["created_at"]
+    parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    assert parsed.year >= 2026
+
+
+def test_create_operation_integrity_error_returns_sanitized_message(server_components):
+    """sqlite3.IntegrityError from insert_evidence returns DUPLICATE_EVIDENCE_REF with sanitized message.
+
+    Simulates the DB-level UNIQUE constraint violation via monkeypatching so the
+    server's IntegrityError branch is exercised through the public tool API.
+    """
+    import sqlite3 as _sqlite3
+    cited = hgp_create_operation(op_type="artifact", agent_id="a")
+    db = server_components["db"]
+
+    # Monkeypatch db.insert_evidence to raise IntegrityError with raw schema-leaking message
+    original = db.insert_evidence
+    def raise_integrity_error(citing_op_id, refs):
+        raise _sqlite3.IntegrityError(
+            "UNIQUE constraint failed: op_evidence.citing_op_id, op_evidence.cited_op_id"
+        )
+    db.insert_evidence = raise_integrity_error
+    try:
+        result = hgp_create_operation(
+            op_type="hypothesis", agent_id="a",
+            evidence_refs=[{"op_id": cited["op_id"], "relation": "supports"}],
+        )
+    finally:
+        db.insert_evidence = original
+
+    assert result.get("error") == "DUPLICATE_EVIDENCE_REF"
+    assert "op_evidence" not in result.get("message", "")
+    assert "citing_op_id" not in result.get("message", "")

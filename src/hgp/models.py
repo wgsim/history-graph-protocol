@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class OpType(StrEnum):
@@ -99,3 +99,50 @@ class ReconcileReport(BaseModel):
     skipped_young_blobs: int = 0
     demoted_to_inactive: int = 0
     errors: list[str] = Field(default_factory=list)
+
+
+# ── V3 Evidence Trail ─────────────────────────────────────────
+
+class EvidenceRelation(StrEnum):
+    SUPPORTS = "supports"
+    REFUTES  = "refutes"
+    CONTEXT  = "context"
+    METHOD   = "method"
+    SOURCE   = "source"
+
+
+class EvidenceRef(BaseModel):
+    op_id:     str = Field(min_length=1, max_length=128)
+    relation:  EvidenceRelation
+    scope:     str | None = Field(default=None, max_length=1024)
+    inference: str | None = Field(default=None, max_length=4096)
+
+    @field_validator("op_id")
+    @classmethod
+    def op_id_not_whitespace(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("op_id must not be whitespace-only")
+        return stripped
+
+
+class EvidenceRecord(BaseModel):
+    cited_op_id:  str
+    op_type:      str
+    status:       str
+    memory_tier:  str
+    relation:     str
+    scope:        str | None
+    inference:    str | None
+    created_at:   str
+
+
+class CitingRecord(BaseModel):
+    citing_op_id: str
+    op_type:      str
+    status:       str
+    memory_tier:  str
+    relation:     str
+    scope:        str | None
+    inference:    str | None
+    created_at:   str

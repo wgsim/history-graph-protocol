@@ -59,7 +59,9 @@ class Reconciler:
                             tmp_file.unlink()
                         report.staging_cleaned += 1
                 except FileNotFoundError:
-                    pass  # Concurrent cleanup
+                    pass  # Concurrent cleanup — expected, ignore
+                except OSError as exc:
+                    report.errors.append(f"staging cleanup error for {tmp_file.name}: {exc}")
 
         # Rule 4: Tier demotion — ops not accessed within threshold become inactive
         if not dry_run:

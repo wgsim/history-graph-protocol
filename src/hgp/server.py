@@ -4,23 +4,31 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
+
+from pydantic import ValidationError
+from mcp.server.fastmcp import FastMCP
 
 _VALID_OP_TYPES = frozenset({"artifact", "hypothesis", "merge", "invalidation"})
 _VALID_STATUSES = frozenset({"PENDING", "COMPLETED", "INVALIDATED", "MISSING_BLOB"})
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MAX_TTL_SECONDS = 86400
-
-from mcp.server.fastmcp import FastMCP
+# Limits evidence refs per operation to cap O(N) existence checks inside BEGIN IMMEDIATE.
+_MAX_EVIDENCE_REFS = 50
 
 from hgp.cas import CAS
 from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
 from hgp.db import Database
 from hgp.errors import ChainStaleError, ParentNotFoundError
 from hgp.lease import LeaseManager
+from hgp.models import EvidenceRef
 from hgp.reconciler import Reconciler
 
 # ── Server initialization ───────────────────────────────────
@@ -40,16 +48,25 @@ _reconciler: Reconciler | None = None
 def _get_components() -> tuple[Database, CAS, LeaseManager, Reconciler]:
     global _db, _cas, _lease_mgr, _reconciler
     if _db is None:
-        HGP_DIR.mkdir(parents=True, exist_ok=True)
-        HGP_CONTENT_DIR.mkdir(exist_ok=True)
-        _db = Database(HGP_DB_PATH)
-        _db.initialize()
-        _cas = CAS(HGP_CONTENT_DIR)
-        _lease_mgr = LeaseManager(_db)
-        _reconciler = Reconciler(_db, _cas, HGP_CONTENT_DIR)
-        _db.expire_leases()
-        _db.commit()
-        _reconciler.reconcile()
+        # Use locals to avoid partial global state on failure: only assign globals
+        # after all components initialize successfully.
+        db = Database(HGP_DB_PATH)
+        try:
+            HGP_DIR.mkdir(parents=True, exist_ok=True)
+            HGP_CONTENT_DIR.mkdir(exist_ok=True)
+            db.initialize()
+            cas = CAS(HGP_CONTENT_DIR)
+            lease_mgr = LeaseManager(db)
+            reconciler = Reconciler(db, cas, HGP_CONTENT_DIR)
+            db.expire_leases()
+            db.commit()
+            startup_report = reconciler.reconcile()
+            if startup_report.errors:
+                _log.warning("startup reconcile reported errors: %s", startup_report.errors)
+        except Exception:
+            db.close()
+            raise
+        _db, _cas, _lease_mgr, _reconciler = db, cas, lease_mgr, reconciler
     assert _db and _cas and _lease_mgr and _reconciler
     return _db, _cas, _lease_mgr, _reconciler
 
@@ -68,10 +85,21 @@ def hgp_create_operation(
     chain_hash: str | None = None,
     subgraph_root_op_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a new operation in the causal history DAG."""
     if op_type not in _VALID_OP_TYPES:
         return {"error": "INVALID_OP_TYPE", "message": f"op_type must be one of {sorted(_VALID_OP_TYPES)}"}
+
+    # Validate evidence_refs early (before any DB work) to fail fast on bad input
+    parsed_refs: list[EvidenceRef] = []
+    if evidence_refs:
+        if len(evidence_refs) > _MAX_EVIDENCE_REFS:
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
+        try:
+            parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
+        except ValidationError as exc:
+            return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
     db, cas, _, _ = _get_components()
 
@@ -126,6 +154,17 @@ def hgp_create_operation(
             db.insert_edge(op_id, inv_id, "invalidates")
             db.update_operation_status(inv_id, "INVALIDATED")
 
+        if parsed_refs:
+            try:
+                db.insert_evidence(op_id, parsed_refs)
+            except ValueError as exc:
+                db.rollback()
+                return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+            except sqlite3.IntegrityError:
+                db.rollback()
+                # Do not expose column names from the raw IntegrityError message.
+                return {"error": "DUPLICATE_EVIDENCE_REF", "message": "Evidence link already exists"}
+
         # Compute final chain_hash AFTER all edges are inserted
         new_root = subgraph_root_op_id or op_id
         final_chain_hash = compute_chain_hash(db, new_root)
@@ -153,7 +192,10 @@ def hgp_create_operation(
 
         db.commit()
     except Exception:
-        db.rollback()
+        try:
+            db.rollback()
+        except Exception as rb_exc:
+            _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
         raise
 
     return {
@@ -178,7 +220,14 @@ def _project(op: dict[str, Any], tier: str) -> dict[str, Any]:
 
 
 def _record_access_with_decay(db: Database, ops: list[dict[str, Any]]) -> None:
-    """Best-effort depth-based access recording. Uses CTE depth column."""
+    """Best-effort depth-based access recording. Uses CTE depth column.
+
+    Called in autocommit mode (no open transaction). record_access() UPDATEs
+    auto-commit per-statement; the db.commit() call here is a documented no-op
+    retained for symmetry in case the calling context ever opens a transaction.
+    db.rollback() is likewise a no-op in autocommit mode but guards the case
+    where an explicit transaction is somehow open.
+    """
     DECAY = [1.0, 0.7, 0.4, 0.1]
     try:
         for op in ops:
@@ -186,8 +235,18 @@ def _record_access_with_decay(db: Database, ops: list[dict[str, Any]]) -> None:
             weight = DECAY[min(depth, len(DECAY) - 1)]
             db.record_access(op["op_id"], weight)
         db.commit()
+    except sqlite3.Error as exc:
+        _log.debug("access recording skipped (lock contention or transient error): %s", exc)
+        try:
+            db.rollback()
+        except Exception as rb_exc:
+            _log.debug("rollback in _record_access_with_decay failed: %s", rb_exc)
     except Exception:
-        db.rollback()  # Best-effort: clear any pending implicit transaction
+        _log.error("Unexpected error in _record_access_with_decay", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 @mcp.tool()
@@ -209,8 +268,15 @@ def hgp_query_operations(
     if op_id:
         op = db.get_operation(op_id)
         if op:
-            db.record_access(op_id)
-            db.commit()
+            try:
+                db.record_access(op_id)
+                db.commit()
+            except sqlite3.Error as exc:
+                _log.debug("access recording skipped in hgp_query_operations op_id=%r: %s", op_id, exc)
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         return [op] if op else []
     return db.query_operations(
         status=status, agent_id=agent_id, op_type=op_type,
@@ -236,8 +302,10 @@ def hgp_query_subgraph(
             ops = get_ancestors(db, root_op_id, max_depth=max_depth)
         else:
             ops = get_descendants(db, root_op_id, max_depth=max_depth)
-    finally:
         db.commit()
+    except Exception:
+        db.rollback()
+        raise
     if not include_invalidated:
         ops = [o for o in ops if o["status"] != "INVALIDATED"]
     projected = [_project(op, op.get("memory_tier", "long_term")) for op in ops]
@@ -341,6 +409,32 @@ def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
     _, _, _, reconciler = _get_components()
     report = reconciler.reconcile(dry_run=dry_run)
     return report.model_dump()
+
+
+@mcp.tool()
+def hgp_get_evidence(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
+    """Return all operations that op_id cited as evidence."""
+    db, _, _, _ = _get_components()
+    try:
+        if not db.get_operation(op_id):
+            return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
+        return db.get_evidence(op_id)
+    except sqlite3.Error as exc:
+        _log.error("DB error in hgp_get_evidence op_id=%r: %s", op_id, exc, exc_info=True)
+        return {"error": "DB_ERROR", "message": "Internal database error"}
+
+
+@mcp.tool()
+def hgp_get_citing_ops(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
+    """Return all operations that cited op_id as evidence (reverse direction)."""
+    db, _, _, _ = _get_components()
+    try:
+        if not db.get_operation(op_id):
+            return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
+        return db.get_citing_ops(op_id)
+    except sqlite3.Error as exc:
+        _log.error("DB error in hgp_get_citing_ops op_id=%r: %s", op_id, exc, exc_info=True)
+        return {"error": "DB_ERROR", "message": "Internal database error"}
 
 
 if __name__ == "__main__":
