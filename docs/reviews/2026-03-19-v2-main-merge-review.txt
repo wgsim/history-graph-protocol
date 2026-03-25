@@ -1,0 +1,72 @@
+V2 -> main merge review
+Date: 2026-03-19 UTC
+Assumption: target branch is local main (HEAD 6df92ff on review time). If the target is origin/main instead, the functional findings below are unchanged.
+
+Summary
+- Physical merge conflict: none
+- Merge shape: fast-forward candidate
+- Recommendation: do not merge yet
+
+Why
+- feat/v2-memory-tier is a direct descendant of local main, so Git merge itself is straightforward.
+- The blockers are behavioral regressions, not textual conflicts.
+
+Findings
+1. High: inactive COMPLETED operations are skipped by reconciler missing-blob checks.
+   Code:
+   - /home/woogwangsim/git_repos/history-graph-protocol/.worktrees/feat-v2-memory-tier/src/hgp/reconciler.py#L27
+   - /home/woogwangsim/git_repos/history-graph-protocol/.worktrees/feat-v2-memory-tier/src/hgp/db.py#L199
+   Detail:
+   - Reconciler still calls query_operations(status="COMPLETED").
+   - In V2, query_operations excludes memory_tier='inactive' by default.
+   - Result: cold history with missing blobs is silently skipped and stays COMPLETED.
+   Reproduction observed:
+   - missing_blobs = []
+   - status = COMPLETED
+   - memory_tier = inactive
+
+2. High: releasing one lease demotes the root to long_term even when another active lease still exists.
+   Code:
+   - /home/woogwangsim/git_repos/history-graph-protocol/.worktrees/feat-v2-memory-tier/src/hgp/lease.py#L29
+   - /home/woogwangsim/git_repos/history-graph-protocol/.worktrees/feat-v2-memory-tier/src/hgp/server.py#L245
+   Detail:
+   - LeaseManager only auto-releases prior ACTIVE leases for the same agent + subgraph.
+   - Different agents can still hold ACTIVE leases on the same root.
+   - hgp_release_lease() does not check for other ACTIVE leases before demoting the root tier.
+   Reproduction observed:
+   - one lease remained ACTIVE
+   - root memory_tier became long_term
+
+3. Medium: acquire -> create_operation(lease_id=...) -> auto-release leaves the root stuck in short_term.
+   Code:
+   - /home/woogwangsim/git_repos/history-graph-protocol/.worktrees/feat-v2-memory-tier/src/hgp/server.py#L128
+   - /home/woogwangsim/git_repos/history-graph-protocol/.worktrees/feat-v2-memory-tier/src/hgp/server.py#L220
+   Detail:
+   - acquire promotes the root to short_term
+   - create_operation auto-releases the lease by status update only
+   - this path never demotes the root back to long_term
+   Reproduction observed:
+   - lease_status = RELEASED
+   - active_leases = 0
+   - parent_memory_tier = short_term
+
+Open question
+- hgp_query_subgraph() now reduces returned fields for long_term and inactive operations.
+  Code:
+  - /home/woogwangsim/git_repos/history-graph-protocol/.worktrees/feat-v2-memory-tier/src/hgp/server.py#L152
+  - /home/woogwangsim/git_repos/history-graph-protocol/.worktrees/feat-v2-memory-tier/src/hgp/server.py#L198
+  Note:
+  - This looks intentional, but it is also a silent API shape change.
+  - If any existing consumer expects full rows from query_subgraph, compatibility should be confirmed before merge.
+
+Validation
+- V2 worktree tests: uv run pytest -q -> 97 passed
+- main -> V2 temporary DB migration smoke test: passed
+- Static checks in this environment:
+  - main baseline: ruff 52 issues, pyright 262 errors
+  - V2 branch: ruff 57 issues, pyright 364 errors
+  - Interpretation: baseline was already red, but V2 worsens it further
+
+Final assessment
+- The branch is mergeable from Git's perspective.
+- The branch is not ready to merge from a behavior/correctness perspective until the three findings above are fixed or explicitly accepted.

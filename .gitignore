@@ -10,3 +10,4 @@ dist/
 .ruff_cache/
 .pytest_cache/
 .worktrees/
+SESSION_HANDOVER.md
