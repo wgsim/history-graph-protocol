@@ -17,6 +17,12 @@ def test_find_root_env_override(tmp_path, monkeypatch):
     assert find_project_root(Path("/some/random/path")) == tmp_path
 
 
+def test_find_root_env_invalid_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HGP_PROJECT_ROOT", str(tmp_path / "nonexistent"))
+    with pytest.raises(ProjectRootError):
+        find_project_root(Path("/any/path"))
+
+
 def test_find_root_not_found(tmp_path):
     with pytest.raises(ProjectRootError):
         find_project_root(tmp_path)

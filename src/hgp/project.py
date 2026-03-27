@@ -35,13 +35,16 @@ def find_project_root(start: Path) -> Path:
             return candidate
 
     raise ProjectRootError(
-        f"No .git directory found above {start}. "
+        f"No .git directory found above {current}. "
         "Set HGP_PROJECT_ROOT to specify the project root explicitly."
     )
 
 
 def assert_within_root(file_path: Path, root: Path) -> None:
-    """Raise PathOutsideRootError if file_path is not under root."""
+    """Raise PathOutsideRootError if file_path is not under root.
+
+    Both paths are resolved to absolute form before comparison (symlinks followed).
+    """
     resolved = file_path.resolve()
     try:
         resolved.relative_to(root.resolve())
