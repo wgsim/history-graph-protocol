@@ -44,6 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_operations_type      ON operations(op_type);
 CREATE INDEX IF NOT EXISTS idx_operations_status    ON operations(status);
 CREATE INDEX IF NOT EXISTS idx_operations_seq       ON operations(commit_seq);
 CREATE INDEX IF NOT EXISTS idx_operations_file_path ON operations(file_path);
+CREATE INDEX IF NOT EXISTS idx_operations_file_path_seq ON operations(file_path, commit_seq DESC);
 
 CREATE TABLE IF NOT EXISTS op_edges (
     child_op_id     TEXT NOT NULL,
@@ -119,6 +120,7 @@ CREATE INDEX IF NOT EXISTS idx_evidence_cited  ON op_evidence(cited_op_id);
 _MIGRATION_FILE_PATH = """
 ALTER TABLE operations ADD COLUMN file_path TEXT;
 CREATE INDEX IF NOT EXISTS idx_operations_file_path ON operations(file_path);
+CREATE INDEX IF NOT EXISTS idx_operations_file_path_seq ON operations(file_path, commit_seq DESC);
 """
 
 # Server-side cap on evidence result sets — prevents reverse fan-out DoS where
