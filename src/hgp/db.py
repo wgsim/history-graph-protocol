@@ -127,6 +127,12 @@ CREATE INDEX IF NOT EXISTS idx_operations_file_path_seq ON operations(file_path,
 # one widely-cited op triggers an unbounded JOIN over all citing ops.
 _MAX_EVIDENCE_RESULTS = 200
 
+_MIGRATION_FILE_PATH = """
+ALTER TABLE operations ADD COLUMN file_path TEXT;
+CREATE INDEX IF NOT EXISTS idx_operations_file_path ON operations(file_path);
+CREATE INDEX IF NOT EXISTS idx_operations_file_path_seq ON operations(file_path, commit_seq DESC);
+"""
+
 
 class Database:
     """Thread-safe SQLite wrapper for HGP."""
@@ -158,6 +164,32 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE operations ADD COLUMN memory_tier TEXT NOT NULL DEFAULT 'long_term'"
                 " CHECK (memory_tier IN ('short_term', 'long_term', 'inactive'))"
+            )
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        """Apply pending schema migrations. Safe to call on fresh and existing DBs."""
+        assert self._conn
+        self._conn.executescript(
+            "CREATE TABLE IF NOT EXISTS _hgp_migrations "
+            "(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);"
+        )
+        applied = {
+            r[0] for r in self._conn.execute(
+                "SELECT name FROM _hgp_migrations"
+            ).fetchall()
+        }
+        if "v4_file_path" not in applied:
+            cols = [
+                r[1] for r in self._conn.execute(
+                    "PRAGMA table_info(operations)"
+                ).fetchall()
+            ]
+            if "file_path" not in cols:
+                self._conn.executescript(_MIGRATION_FILE_PATH)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO _hgp_migrations (name) VALUES (?)",
+                ("v4_file_path",),
             )
 
     def _apply_migrations(self) -> None:

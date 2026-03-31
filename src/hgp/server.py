@@ -437,5 +437,129 @@ def hgp_get_citing_ops(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
         return {"error": "DB_ERROR", "message": "Internal database error"}
 
 
+def _record_file_op(
+    file_path: str,
+    content_bytes: bytes,
+    agent_id: str,
+    reason: str,
+    parent_op_ids: list[str] | None,
+    evidence_refs: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Store content in CAS and insert an artifact operation. Returns {op_id}."""
+    parsed_refs: list[EvidenceRef] = []
+    if evidence_refs:
+        try:
+            parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
+        except ValidationError as exc:
+            return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+
+    db, cas, _, _ = _get_components()
+
+    object_hash = cas.store(content_bytes)
+    op_id = str(uuid.uuid4())
+    metadata = json.dumps({"reason": reason})
+
+    db.begin_immediate()
+    try:
+        seq = db.next_commit_seq()
+        db.insert_operation(
+            op_id=op_id,
+            op_type="artifact",
+            agent_id=agent_id,
+            commit_seq=seq,
+            chain_hash="sha256:pending",
+            object_hash=object_hash,
+            metadata=metadata,
+            file_path=file_path,
+        )
+        for pid in (parent_op_ids or []):
+            db.insert_edge(op_id, pid, "causal")
+        if parsed_refs:
+            db.insert_evidence(op_id, parsed_refs)
+        final_hash = compute_chain_hash(db, op_id)
+        db.execute(
+            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
+            (final_hash, op_id),
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
+
+    return {"op_id": op_id}
+
+
+@mcp.tool()
+def hgp_write_file(
+    file_path: str,
+    content: str,
+    agent_id: str,
+    reason: str | None = None,
+    parent_op_ids: list[str] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write (create or overwrite) a file and record it as an artifact operation."""
+    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
+    try:
+        root = find_project_root(Path(file_path).parent)
+        assert_within_root(Path(file_path), root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+    effective_reason = reason or f"CREATE {file_path}"
+    return _record_file_op(
+        file_path=file_path,
+        content_bytes=content.encode("utf-8"),
+        agent_id=agent_id,
+        reason=effective_reason,
+        parent_op_ids=parent_op_ids,
+        evidence_refs=evidence_refs,
+    )
+
+
+@mcp.tool()
+def hgp_append_file(
+    file_path: str,
+    content: str,
+    agent_id: str,
+    reason: str | None = None,
+    parent_op_ids: list[str] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Append content to a file (creates it if absent) and record as artifact."""
+    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
+    try:
+        root = find_project_root(Path(file_path).parent)
+        assert_within_root(Path(file_path), root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(content)
+
+    effective_reason = reason or f"APPEND {file_path}"
+    return _record_file_op(
+        file_path=file_path,
+        content_bytes=path.read_bytes(),
+        agent_id=agent_id,
+        reason=effective_reason,
+        parent_op_ids=parent_op_ids,
+        evidence_refs=evidence_refs,
+    )
+
+
 if __name__ == "__main__":
     mcp.run()
