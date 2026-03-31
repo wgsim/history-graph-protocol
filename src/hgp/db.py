@@ -35,13 +35,15 @@ CREATE TABLE IF NOT EXISTS operations (
     last_accessed   TEXT,
     memory_tier     TEXT NOT NULL DEFAULT 'long_term'
                         CHECK (memory_tier IN ('short_term', 'long_term', 'inactive')),
+    file_path       TEXT,
     FOREIGN KEY (object_hash) REFERENCES objects(hash)
 );
 
-CREATE INDEX IF NOT EXISTS idx_operations_agent  ON operations(agent_id);
-CREATE INDEX IF NOT EXISTS idx_operations_type   ON operations(op_type);
-CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status);
-CREATE INDEX IF NOT EXISTS idx_operations_seq    ON operations(commit_seq);
+CREATE INDEX IF NOT EXISTS idx_operations_agent     ON operations(agent_id);
+CREATE INDEX IF NOT EXISTS idx_operations_type      ON operations(op_type);
+CREATE INDEX IF NOT EXISTS idx_operations_status    ON operations(status);
+CREATE INDEX IF NOT EXISTS idx_operations_seq       ON operations(commit_seq);
+CREATE INDEX IF NOT EXISTS idx_operations_file_path ON operations(file_path);
 
 CREATE TABLE IF NOT EXISTS op_edges (
     child_op_id     TEXT NOT NULL,
@@ -114,6 +116,11 @@ CREATE INDEX IF NOT EXISTS idx_evidence_citing ON op_evidence(citing_op_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_cited  ON op_evidence(cited_op_id);
 """
 
+_MIGRATION_FILE_PATH = """
+ALTER TABLE operations ADD COLUMN file_path TEXT;
+CREATE INDEX IF NOT EXISTS idx_operations_file_path ON operations(file_path);
+"""
+
 # Server-side cap on evidence result sets — prevents reverse fan-out DoS where
 # one widely-cited op triggers an unbounded JOIN over all citing ops.
 _MAX_EVIDENCE_RESULTS = 200
@@ -136,6 +143,7 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
+        self._apply_migrations()
         # executescript() issues an implicit COMMIT; re-assert per-connection PRAGMA.
         self._conn.execute("PRAGMA foreign_keys = ON")
         # V2 migration: add memory tier columns to existing DBs (each column guarded independently)
@@ -148,6 +156,31 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE operations ADD COLUMN memory_tier TEXT NOT NULL DEFAULT 'long_term'"
                 " CHECK (memory_tier IN ('short_term', 'long_term', 'inactive'))"
+            )
+
+    def _apply_migrations(self) -> None:
+        """Apply pending schema migrations. Safe to call on fresh and existing DBs."""
+        assert self._conn
+        self._conn.executescript(
+            "CREATE TABLE IF NOT EXISTS _hgp_migrations "
+            "(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);"
+        )
+        applied = {
+            r[0] for r in self._conn.execute(
+                "SELECT name FROM _hgp_migrations"
+            ).fetchall()
+        }
+        if "v4_file_path" not in applied:
+            cols = [
+                r[1] for r in self._conn.execute(
+                    "PRAGMA table_info(operations)"
+                ).fetchall()
+            ]
+            if "file_path" not in cols:
+                self._conn.executescript(_MIGRATION_FILE_PATH)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO _hgp_migrations (name) VALUES (?)",
+                ("v4_file_path",),
             )
 
     def close(self) -> None:
@@ -181,6 +214,7 @@ class Database:
         object_hash: str | None = None,
         metadata: str | None = None,
         mime_type: str | None = None,
+        file_path: str | None = None,
     ) -> None:
         assert self._conn
         # Insert into objects FIRST to satisfy the FK constraint on operations.object_hash
@@ -192,10 +226,10 @@ class Database:
         self._conn.execute(
             """
             INSERT INTO operations
-                (op_id, op_type, status, commit_seq, agent_id, object_hash, chain_hash, metadata, completed_at)
-            VALUES (?, ?, 'COMPLETED', ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                (op_id, op_type, status, commit_seq, agent_id, object_hash, chain_hash, metadata, completed_at, file_path)
+            VALUES (?, ?, 'COMPLETED', ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)
             """,
-            (op_id, op_type, commit_seq, agent_id, object_hash, chain_hash, metadata),
+            (op_id, op_type, commit_seq, agent_id, object_hash, chain_hash, metadata, file_path),
         )
 
     def get_operation(self, op_id: str) -> dict[str, Any] | None:
@@ -204,6 +238,19 @@ class Database:
             "SELECT * FROM operations WHERE op_id = ?", (op_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def get_ops_by_file_path(
+        self,
+        file_path: str,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        """Return operations for a given file_path, ordered by commit_seq DESC."""
+        assert self._conn
+        return self._conn.execute(
+            "SELECT * FROM operations WHERE file_path = ? "
+            "ORDER BY commit_seq DESC LIMIT ?",
+            (file_path, limit),
+        ).fetchall()
 
     def insert_edge(self, child_op_id: str, parent_op_id: str, edge_type: str = "causal") -> None:
         assert self._conn

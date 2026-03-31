@@ -597,3 +597,67 @@ def test_op_evidence_schema_check_inference_length(hgp_dirs: dict):
             ("citing", "cited", "supports", "y" * 4097),
         )
     db.rollback()
+
+
+# ── V4 File Tracking Tests ────────────────────────────────────
+
+def test_file_path_column_exists(tmp_path):
+    """file_path column must exist on operations table."""
+    from hgp.db import Database
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    # LIMIT 0 query succeeds only if column exists
+    db.execute("SELECT file_path FROM operations LIMIT 0").fetchone()
+    db.close()
+
+
+def test_insert_operation_with_file_path(tmp_path):
+    from hgp.db import Database
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    db.begin_immediate()
+    seq = db.next_commit_seq()
+    db.insert_operation(
+        op_id="op-fp-1",
+        op_type="artifact",
+        agent_id="agent-1",
+        commit_seq=seq,
+        chain_hash="sha256:abc",
+        file_path="src/main.py",
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT file_path FROM operations WHERE op_id = ?", ("op-fp-1",)
+    ).fetchone()
+    assert row["file_path"] == "src/main.py"
+    db.close()
+
+
+def test_get_ops_by_file_path(tmp_path):
+    from hgp.db import Database
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    db.begin_immediate()
+    for i, fp in enumerate(["a.py", "b.py", "a.py"]):
+        seq = db.next_commit_seq()
+        db.insert_operation(
+            op_id=f"op-{i}", op_type="artifact", agent_id="agent-1",
+            commit_seq=seq, chain_hash=f"sha256:{i}", file_path=fp,
+        )
+    db.commit()
+    rows = db.get_ops_by_file_path("a.py")
+    assert len(rows) == 2
+    assert all(r["file_path"] == "a.py" for r in rows)
+    db.close()
+
+
+def test_migration_idempotent(tmp_path):
+    """Calling initialize() twice must not error."""
+    from hgp.db import Database
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    db.close()
+    db2 = Database(tmp_path / "test.db")
+    db2.initialize()  # second open — migration already applied
+    db2.execute("SELECT file_path FROM operations LIMIT 0")
+    db2.close()

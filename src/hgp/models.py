@@ -52,6 +52,7 @@ class Operation(BaseModel):
     metadata: dict[str, Any] | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
+    file_path: str | None = None
 
 
 class OpEdge(BaseModel):
