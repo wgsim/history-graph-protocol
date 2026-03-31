@@ -13,7 +13,7 @@ from hgp.cas import CAS
 from hgp.lease import LeaseManager
 from hgp.reconciler import Reconciler
 
-from hgp.server import hgp_write_file, hgp_append_file, hgp_edit_file, hgp_delete_file, hgp_move_file
+from hgp.server import hgp_write_file, hgp_append_file, hgp_edit_file, hgp_delete_file, hgp_move_file, hgp_file_history
 
 
 @pytest.fixture
@@ -261,3 +261,28 @@ def test_delete_outside_root_rejected(project):
         agent_id="agent-1",
     )
     assert result.get("error") in ("PATH_OUTSIDE_ROOT", "PROJECT_ROOT_NOT_FOUND")
+
+
+# ── Task 6: hgp_file_history and file_path filter ────────────────────────────
+
+def test_file_history_returns_ops_in_order(project):
+    target = project / "tracked.py"
+    r1 = hgp_write_file(str(target), "v1", "agent-1")
+    r2 = hgp_edit_file(str(target), "v1", "v2", "agent-1")
+    result = hgp_file_history(file_path=str(target))
+    op_ids = [op["op_id"] for op in result["operations"]]
+    assert op_ids[0] == r2["op_id"]
+    assert op_ids[1] == r1["op_id"]
+
+
+def test_file_history_unknown_path_returns_empty(project):
+    result = hgp_file_history(file_path=str(project / "unknown.py"))
+    assert result["operations"] == []
+
+
+def test_query_operations_filter_by_file_path(project):
+    from hgp.server import hgp_query_operations
+    target = project / "q.py"
+    r = hgp_write_file(str(target), "x", "agent-1")
+    result = hgp_query_operations(file_path=str(target))
+    assert any(op["op_id"] == r["op_id"] for op in result["operations"])

@@ -149,16 +149,17 @@ def test_create_with_metadata(server_components):
     """Metadata dict is round-trippable via query_operations."""
     meta = {"model": "claude-sonnet-4-6", "version": 1}
     result = hgp_create_operation(op_type="artifact", agent_id="a", metadata=meta)
-    ops = hgp_query_operations(op_id=result["op_id"])
+    result2 = hgp_query_operations(op_id=result["op_id"])
     import json
-    assert json.loads(ops[0]["metadata"]) == meta
+    assert json.loads(result2["operations"][0]["metadata"]) == meta
 
 
 # ── Task 5: hgp_query_operations ────────────────────────────────────────────
 
 def test_query_by_op_id(server_components):
     r = hgp_create_operation(op_type="artifact", agent_id="a")
-    ops = hgp_query_operations(op_id=r["op_id"])
+    result = hgp_query_operations(op_id=r["op_id"])
+    ops = result["operations"]
     assert len(ops) == 1
     assert ops[0]["op_id"] == r["op_id"]
 
@@ -166,7 +167,7 @@ def test_query_by_op_id(server_components):
 def test_query_by_agent_id(server_components):
     hgp_create_operation(op_type="artifact", agent_id="agent-x")
     hgp_create_operation(op_type="artifact", agent_id="agent-y")
-    ops = hgp_query_operations(agent_id="agent-x")
+    ops = hgp_query_operations(agent_id="agent-x")["operations"]
     assert all(o["agent_id"] == "agent-x" for o in ops)
     assert len(ops) == 1
 
@@ -174,7 +175,7 @@ def test_query_by_agent_id(server_components):
 def test_query_by_status(server_components):
     r = hgp_create_operation(op_type="artifact", agent_id="a")
     hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=[r["op_id"]])
-    ops = hgp_query_operations(status="INVALIDATED")
+    ops = hgp_query_operations(status="INVALIDATED")["operations"]
     assert any(o["op_id"] == r["op_id"] for o in ops)
 
 
@@ -182,7 +183,7 @@ def test_query_by_op_type(server_components):
     """op_type filter must be forwarded to db.query_operations (Bug 2 fix)."""
     hgp_create_operation(op_type="artifact", agent_id="a")
     hgp_create_operation(op_type="hypothesis", agent_id="a")
-    ops = hgp_query_operations(op_type="hypothesis")
+    ops = hgp_query_operations(op_type="hypothesis")["operations"]
     assert len(ops) == 1
     assert ops[0]["op_type"] == "hypothesis"
 
@@ -193,7 +194,7 @@ def test_query_by_since_commit_seq(server_components):
     r2 = hgp_create_operation(op_type="artifact", agent_id="a")
     r3 = hgp_create_operation(op_type="artifact", agent_id="a")
     seq1 = r1["commit_seq"]
-    ops = hgp_query_operations(since_commit_seq=seq1)
+    ops = hgp_query_operations(since_commit_seq=seq1)["operations"]
     op_ids = {o["op_id"] for o in ops}
     assert r1["op_id"] not in op_ids
     assert r2["op_id"] in op_ids
@@ -456,7 +457,7 @@ def test_query_inactive_excluded_by_default(server_components):
     r = hgp_create_operation(op_type="artifact", agent_id="a")
     server_components["db"].set_memory_tier(r["op_id"], "inactive")
     server_components["db"].commit()
-    ops = hgp_query_operations()
+    ops = hgp_query_operations()["operations"]
     assert r["op_id"] not in {o["op_id"] for o in ops}
 
 
@@ -464,7 +465,7 @@ def test_query_inactive_included_when_requested(server_components):
     r = hgp_create_operation(op_type="artifact", agent_id="a")
     server_components["db"].set_memory_tier(r["op_id"], "inactive")
     server_components["db"].commit()
-    ops = hgp_query_operations(include_inactive=True)
+    ops = hgp_query_operations(include_inactive=True)["operations"]
     assert r["op_id"] in {o["op_id"] for o in ops}
 
 
@@ -526,7 +527,7 @@ def test_query_tier_ordering(server_components):
     b = hgp_create_operation(op_type="artifact", agent_id="a")
     server_components["db"].set_memory_tier(a["op_id"], "short_term")
     server_components["db"].commit()
-    ops = hgp_query_operations()
+    ops = hgp_query_operations()["operations"]
     ids = [o["op_id"] for o in ops]
     assert ids.index(a["op_id"]) < ids.index(b["op_id"])
 
@@ -750,7 +751,7 @@ def test_evidence_scope_and_inference_round_trip(server_components):
     )
     # Re-fetch citing op via query
     from hgp.server import hgp_query_operations
-    ops = hgp_query_operations(agent_id="a", op_type="hypothesis")
+    ops = hgp_query_operations(agent_id="a", op_type="hypothesis")["operations"]
     citing_id = ops[0]["op_id"]
     ev = hgp_get_evidence(citing_id)
     assert len(ev) == 1

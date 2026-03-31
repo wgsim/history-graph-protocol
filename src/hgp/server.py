@@ -258,11 +258,11 @@ def hgp_query_operations(
     since_commit_seq: int | None = None,
     include_inactive: bool = False,
     limit: int = 100,
-) -> list[dict[str, Any]]:
+    file_path: str | None = None,
+) -> dict[str, Any]:
     """Query operations with optional filters. By default excludes inactive-tier ops; pass include_inactive=True to include them."""
     if status is not None and status not in _VALID_STATUSES:
         return {"error": "INVALID_STATUS", "message": f"status must be one of {sorted(_VALID_STATUSES)}"}
-
 
     db, _, _, _ = _get_components()
     if op_id:
@@ -277,12 +277,33 @@ def hgp_query_operations(
                     db.rollback()
                 except Exception:
                     pass
-        return [op] if op else []
-    return db.query_operations(
+        return {"operations": [op] if op else []}
+    ops = db.query_operations(
         status=status, agent_id=agent_id, op_type=op_type,
         since_commit_seq=since_commit_seq,
         include_inactive=include_inactive, limit=limit,
+        file_path=file_path,
     )
+    return {"operations": ops}
+
+
+@mcp.tool()
+def hgp_file_history(
+    file_path: str,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Return operations recorded for a given file_path, most recent first."""
+    db, _, _, _ = _get_components()
+    rows = db.get_ops_by_file_path(file_path, limit=limit)
+    ops = [dict(r) for r in rows]
+    if ops:
+        for op in ops:
+            db.record_access(op["op_id"], 1.0)
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+    return {"file_path": file_path, "operations": ops}
 
 
 @mcp.tool()

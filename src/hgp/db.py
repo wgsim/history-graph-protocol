@@ -329,6 +329,7 @@ class Database:
         since_commit_seq: int | None = None,
         include_inactive: bool = False,
         limit: int = 1000,
+        file_path: str | None = None,
     ) -> list[dict[str, Any]]:
         assert self._conn
         clauses: list[str] = []
@@ -345,6 +346,9 @@ class Database:
         if since_commit_seq is not None:
             clauses.append("commit_seq > ?")
             params.append(since_commit_seq)
+        if file_path is not None:
+            clauses.append("file_path = ?")
+            params.append(file_path)
         if not include_inactive:
             clauses.append("memory_tier != 'inactive'")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
