@@ -13,7 +13,7 @@ from hgp.cas import CAS
 from hgp.lease import LeaseManager
 from hgp.reconciler import Reconciler
 
-from hgp.server import hgp_write_file, hgp_append_file
+from hgp.server import hgp_write_file, hgp_append_file, hgp_edit_file
 
 
 @pytest.fixture
@@ -116,3 +116,64 @@ def test_append_nonexistent_file_creates_it(project):
     target = project / "new.txt"
     hgp_append_file(file_path=str(target), content="hello", agent_id="agent-1")
     assert target.read_text() == "hello"
+
+
+def test_edit_replaces_string(project):
+    target = project / "main.py"
+    target.write_text("x = 1\ny = 2\n")
+    result = hgp_edit_file(
+        file_path=str(target),
+        old_string="x = 1",
+        new_string="x = 42",
+        agent_id="agent-1",
+    )
+    assert "op_id" in result
+    assert "x = 42" in target.read_text()
+    assert "x = 1" not in target.read_text()
+
+
+def test_edit_old_string_not_found(project):
+    target = project / "main.py"
+    target.write_text("hello world")
+    result = hgp_edit_file(
+        file_path=str(target),
+        old_string="NOT_PRESENT",
+        new_string="x",
+        agent_id="agent-1",
+    )
+    assert result.get("error") == "STRING_NOT_FOUND"
+
+
+def test_edit_ambiguous_match(project):
+    target = project / "main.py"
+    target.write_text("aa\naa\n")
+    result = hgp_edit_file(
+        file_path=str(target),
+        old_string="aa",
+        new_string="bb",
+        agent_id="agent-1",
+    )
+    assert result.get("error") == "AMBIGUOUS_MATCH"
+
+
+def test_edit_file_not_found(project):
+    result = hgp_edit_file(
+        file_path=str(project / "nonexistent.py"),
+        old_string="x",
+        new_string="y",
+        agent_id="agent-1",
+    )
+    assert result.get("error") == "FILE_NOT_FOUND"
+
+
+def test_edit_records_op_with_file_path(project):
+    target = project / "code.py"
+    target.write_text("a = 1")
+    result = hgp_edit_file(
+        file_path=str(target), old_string="a = 1",
+        new_string="a = 2", agent_id="agent-1"
+    )
+    from hgp.server import _get_components
+    db, _, _, _ = _get_components()
+    op = db.get_operation(result["op_id"])
+    assert op["file_path"] == str(target)

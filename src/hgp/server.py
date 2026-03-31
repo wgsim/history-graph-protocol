@@ -567,5 +567,50 @@ def hgp_append_file(
     )
 
 
+@mcp.tool()
+def hgp_edit_file(
+    file_path: str,
+    old_string: str,
+    new_string: str,
+    agent_id: str,
+    reason: str | None = None,
+    parent_op_ids: list[str] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Replace the first (and only) occurrence of old_string with new_string."""
+    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
+    try:
+        root = find_project_root(Path(file_path).parent)
+        assert_within_root(Path(file_path), root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    path = Path(file_path)
+    if not path.exists():
+        return {"error": "FILE_NOT_FOUND", "message": f"{file_path} does not exist"}
+
+    original = path.read_text(encoding="utf-8")
+    count = original.count(old_string)
+    if count == 0:
+        return {"error": "STRING_NOT_FOUND", "message": "old_string not found in file"}
+    if count > 1:
+        return {"error": "AMBIGUOUS_MATCH", "message": f"old_string found {count} times; must be unique"}
+
+    updated = original.replace(old_string, new_string, 1)
+    path.write_text(updated, encoding="utf-8")
+
+    effective_reason = reason or f"MODIFY {file_path}"
+    return _record_file_op(
+        file_path=file_path,
+        content_bytes=updated.encode("utf-8"),
+        agent_id=agent_id,
+        reason=effective_reason,
+        parent_op_ids=parent_op_ids,
+        evidence_refs=evidence_refs,
+    )
+
+
 if __name__ == "__main__":
     mcp.run()
