@@ -448,12 +448,18 @@ def _record_file_op(
     """Store content in CAS and insert an artifact operation. Returns {op_id}."""
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
+        if len(evidence_refs) > _MAX_EVIDENCE_REFS:
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
         try:
             parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
         except ValidationError as exc:
             return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
     db, cas, _, _ = _get_components()
+
+    for pid in (parent_op_ids or []):
+        if not db.get_operation(pid):
+            raise ParentNotFoundError(f"Parent operation not found: {pid}")
 
     object_hash = cas.store(content_bytes)
     op_id = str(uuid.uuid4())
@@ -485,8 +491,8 @@ def _record_file_op(
     except Exception:
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rb_exc:
+            _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
         raise
 
     return {"op_id": op_id}
