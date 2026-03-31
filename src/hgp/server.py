@@ -296,13 +296,8 @@ def hgp_file_history(
     db, _, _, _ = _get_components()
     rows = db.get_ops_by_file_path(file_path, limit=limit)
     ops = [dict(r) for r in rows]
-    if ops:
-        for op in ops:
-            db.record_access(op["op_id"], 1.0)
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
+    # Use depth-based decay: most recent op (index 0) gets full weight, older ops decay.
+    _record_access_with_decay(db, [dict(op, depth=i) for i, op in enumerate(ops)])
     return {"file_path": file_path, "operations": ops}
 
 
