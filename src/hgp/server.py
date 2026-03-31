@@ -448,18 +448,12 @@ def _record_file_op(
     """Store content in CAS and insert an artifact operation. Returns {op_id}."""
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
-        if len(evidence_refs) > _MAX_EVIDENCE_REFS:
-            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
         try:
             parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
         except ValidationError as exc:
             return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
     db, cas, _, _ = _get_components()
-
-    for pid in (parent_op_ids or []):
-        if not db.get_operation(pid):
-            raise ParentNotFoundError(f"Parent operation not found: {pid}")
 
     object_hash = cas.store(content_bytes)
     op_id = str(uuid.uuid4())
@@ -491,8 +485,8 @@ def _record_file_op(
     except Exception:
         try:
             db.rollback()
-        except Exception as rb_exc:
-            _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
+        except Exception:
+            pass
         raise
 
     return {"op_id": op_id}
@@ -615,8 +609,8 @@ def hgp_edit_file(
 @mcp.tool()
 def hgp_delete_file(
     file_path: str,
+    agent_id: str,
     previous_op_id: str | None = None,
-    agent_id: str = "unknown",
     reason: str | None = None,
 ) -> dict[str, Any]:
     """Delete a file and record an invalidation operation."""
@@ -671,8 +665,8 @@ def hgp_delete_file(
 def hgp_move_file(
     old_path: str,
     new_path: str,
+    agent_id: str,
     previous_op_id: str | None = None,
-    agent_id: str = "unknown",
     reason: str | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:

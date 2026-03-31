@@ -196,7 +196,7 @@ def test_delete_marks_previous_op_invalidated(project):
     target = project / "bye.txt"
     target.write_text("x")
     write_result = hgp_write_file(str(target), "x", "agent-1")
-    hgp_delete_file(str(target), write_result["op_id"], "agent-1")
+    hgp_delete_file(str(target), "agent-1", previous_op_id=write_result["op_id"])
     from hgp.server import _get_components
     db, _, _, _ = _get_components()
     prev_op = db.get_operation(write_result["op_id"])
@@ -233,7 +233,7 @@ def test_move_records_new_path_op(project):
     dst = project / "b.txt"
     src.write_text("hello")
     write_result = hgp_write_file(str(src), "hello", "agent-1")
-    result = hgp_move_file(str(src), str(dst), write_result["op_id"], "agent-1")
+    result = hgp_move_file(str(src), str(dst), "agent-1", previous_op_id=write_result["op_id"])
     from hgp.server import _get_components
     db, _, _, _ = _get_components()
     new_op = db.get_operation(result["op_id"])
