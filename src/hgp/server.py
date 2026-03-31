@@ -612,5 +612,134 @@ def hgp_edit_file(
     )
 
 
+@mcp.tool()
+def hgp_delete_file(
+    file_path: str,
+    previous_op_id: str | None = None,
+    agent_id: str = "unknown",
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Delete a file and record an invalidation operation."""
+    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
+    try:
+        root = find_project_root(Path(file_path).parent)
+        assert_within_root(Path(file_path), root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    path = Path(file_path)
+    if not path.exists():
+        return {"error": "FILE_NOT_FOUND", "message": f"{file_path} does not exist"}
+
+    path.unlink()
+
+    db, _, _, _ = _get_components()
+    op_id = str(uuid.uuid4())
+    effective_reason = reason or f"DELETE {file_path}"
+    metadata = json.dumps({"reason": effective_reason})
+
+    db.begin_immediate()
+    try:
+        seq = db.next_commit_seq()
+        db.insert_operation(
+            op_id=op_id, op_type="invalidation", agent_id=agent_id,
+            commit_seq=seq, chain_hash="sha256:pending",
+            metadata=metadata, file_path=file_path,
+        )
+        if previous_op_id:
+            db.insert_edge(op_id, previous_op_id, "invalidates")
+            db.update_operation_status(previous_op_id, "INVALIDATED")
+        final_hash = compute_chain_hash(db, op_id)
+        db.execute(
+            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
+            (final_hash, op_id),
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception as rb_exc:
+            _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
+        raise
+
+    return {"op_id": op_id}
+
+
+@mcp.tool()
+def hgp_move_file(
+    old_path: str,
+    new_path: str,
+    previous_op_id: str | None = None,
+    agent_id: str = "unknown",
+    reason: str | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Move/rename a file: invalidates old path op, creates new artifact op."""
+    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
+    try:
+        root = find_project_root(Path(old_path).parent)
+        assert_within_root(Path(old_path), root)
+        assert_within_root(Path(new_path), root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    src = Path(old_path)
+    if not src.exists():
+        return {"error": "FILE_NOT_FOUND", "message": f"{old_path} does not exist"}
+
+    dst = Path(new_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    content_bytes = src.read_bytes()
+    src.rename(dst)
+
+    effective_reason = reason or f"MOVE {old_path} → {new_path}"
+
+    parsed_refs: list[EvidenceRef] = []
+    if evidence_refs:
+        if len(evidence_refs) > _MAX_EVIDENCE_REFS:
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
+        try:
+            parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
+        except ValidationError as exc:
+            return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+
+    db, cas, _, _ = _get_components()
+    object_hash = cas.store(content_bytes)
+    op_id = str(uuid.uuid4())
+    metadata = json.dumps({"reason": effective_reason})
+
+    db.begin_immediate()
+    try:
+        seq = db.next_commit_seq()
+        db.insert_operation(
+            op_id=op_id, op_type="artifact", agent_id=agent_id,
+            commit_seq=seq, chain_hash="sha256:pending",
+            object_hash=object_hash, metadata=metadata, file_path=new_path,
+        )
+        if previous_op_id:
+            db.insert_edge(op_id, previous_op_id, "invalidates")
+            db.update_operation_status(previous_op_id, "INVALIDATED")
+        if parsed_refs:
+            db.insert_evidence(op_id, parsed_refs)
+        final_hash = compute_chain_hash(db, op_id)
+        db.execute(
+            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
+            (final_hash, op_id),
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception as rb_exc:
+            _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
+        raise
+
+    return {"op_id": op_id}
+
+
 if __name__ == "__main__":
     mcp.run()

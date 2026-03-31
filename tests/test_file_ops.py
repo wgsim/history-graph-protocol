@@ -13,7 +13,7 @@ from hgp.cas import CAS
 from hgp.lease import LeaseManager
 from hgp.reconciler import Reconciler
 
-from hgp.server import hgp_write_file, hgp_append_file, hgp_edit_file
+from hgp.server import hgp_write_file, hgp_append_file, hgp_edit_file, hgp_delete_file, hgp_move_file
 
 
 @pytest.fixture
@@ -177,3 +177,87 @@ def test_edit_records_op_with_file_path(project):
     db, _, _, _ = _get_components()
     op = db.get_operation(result["op_id"])
     assert op["file_path"] == str(target)
+
+
+def test_delete_removes_file(project):
+    target = project / "old.txt"
+    target.write_text("content")
+    write_result = hgp_write_file(str(target), "content", "agent-1")
+    result = hgp_delete_file(
+        file_path=str(target),
+        previous_op_id=write_result["op_id"],
+        agent_id="agent-1",
+    )
+    assert "op_id" in result
+    assert not target.exists()
+
+
+def test_delete_marks_previous_op_invalidated(project):
+    target = project / "bye.txt"
+    target.write_text("x")
+    write_result = hgp_write_file(str(target), "x", "agent-1")
+    hgp_delete_file(str(target), write_result["op_id"], "agent-1")
+    from hgp.server import _get_components
+    db, _, _, _ = _get_components()
+    prev_op = db.get_operation(write_result["op_id"])
+    assert prev_op["status"] == "INVALIDATED"
+
+
+def test_delete_nonexistent_file_rejected(project):
+    result = hgp_delete_file(
+        file_path=str(project / "ghost.txt"),
+        previous_op_id=None,
+        agent_id="agent-1",
+    )
+    assert result.get("error") == "FILE_NOT_FOUND"
+
+
+def test_move_file(project):
+    src = project / "old.py"
+    dst = project / "new.py"
+    src.write_text("code")
+    write_result = hgp_write_file(str(src), "code", "agent-1")
+    result = hgp_move_file(
+        old_path=str(src),
+        new_path=str(dst),
+        previous_op_id=write_result["op_id"],
+        agent_id="agent-1",
+    )
+    assert "op_id" in result
+    assert not src.exists()
+    assert dst.read_text() == "code"
+
+
+def test_move_records_new_path_op(project):
+    src = project / "a.txt"
+    dst = project / "b.txt"
+    src.write_text("hello")
+    write_result = hgp_write_file(str(src), "hello", "agent-1")
+    result = hgp_move_file(str(src), str(dst), write_result["op_id"], "agent-1")
+    from hgp.server import _get_components
+    db, _, _, _ = _get_components()
+    new_op = db.get_operation(result["op_id"])
+    assert new_op["file_path"] == str(dst)
+    assert new_op["op_type"] == "artifact"
+    prev_op = db.get_operation(write_result["op_id"])
+    assert prev_op["status"] == "INVALIDATED"
+
+
+def test_move_file_outside_root_rejected(project):
+    src = project / "a.txt"
+    src.write_text("x")
+    result = hgp_move_file(
+        old_path=str(src),
+        new_path="/etc/evil.txt",
+        agent_id="agent-1",
+    )
+    assert result.get("error") == "PATH_OUTSIDE_ROOT"
+
+
+def test_delete_outside_root_rejected(project):
+    result = hgp_delete_file(
+        file_path="/etc/passwd",
+        previous_op_id=None,
+        agent_id="agent-1",
+    )
+    assert result.get("error") in ("PATH_OUTSIDE_ROOT", "PROJECT_ROOT_NOT_FOUND")
