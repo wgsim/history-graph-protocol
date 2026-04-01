@@ -474,18 +474,19 @@ All file paths are validated with `Path.resolve().relative_to(root)` before any 
 
 ### Enforcement Model
 
-V4 uses a three-layer strategy to encourage agents to use `hgp_*` tools instead of native CLI tools:
+V4 uses a multi-layer strategy to encourage agents to use `hgp_*` tools instead of native CLI tools:
 
 | Layer | Mechanism | Scope | Hard-blocks? |
 |-------|-----------|-------|--------------|
 | 1 | Instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) | All CLI agents | No — advisory only |
-| 2 | Claude Code `PreToolUse` hook (`.claude/hooks/pre_tool_use_hgp.py`) | Claude Code only | No by default; yes with `HGP_HOOK_BLOCK=1` |
+| 2a | Claude Code `PreToolUse` hook (`.claude/hooks/pre_tool_use_hgp.py`) | Claude Code only | No by default; yes with `HGP_HOOK_BLOCK=1` |
+| 2b | Gemini CLI `BeforeTool` hook (`.gemini/hooks/pre_tool_use_hgp.py`) | Gemini CLI only | No by default; yes with `HGP_HOOK_BLOCK=1` |
 | 3 | Agent discipline | All agents | N/A |
 
 **Known limitations:**
 - Native tool bypass — agents using Write/Edit/Bash directly bypass V4 recording
 - External process changes (git, cp, mv, shell scripts) are not tracked
-- Non-Claude CLI agents have no hook equivalent; only instruction files apply
+- Codex CLI enforcement — `PreToolUse` in Codex only intercepts Bash (not file write tools) as of April 2026; only instruction files (`AGENTS.md`) apply for Codex
 - Binary files are out of scope (future work)
 
 ### Git + HGP Consistency
