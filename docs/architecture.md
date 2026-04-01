@@ -453,3 +453,49 @@ concurrent writes that modify the same subgraph:
 The subgraph is therefore linearised through the write lock + hash comparison, even
 though SQLite itself does not provide serialisable snapshot isolation at the
 application level.
+
+---
+
+## V4: File Tracking
+
+### Project Root Scoping
+
+All V4 file tools operate within a project root. The root is determined by:
+
+1. **`HGP_PROJECT_ROOT` environment variable** — If set to a valid directory path, this overrides automatic detection. Useful in test environments or when the project root cannot be inferred from the file path.
+
+2. **`.git` directory traversal** — Starting from the file path's parent directory, HGP walks up the directory tree until it finds a `.git` directory. The directory containing `.git` becomes the project root.
+
+If neither resolves, the tool returns `{"error": "PROJECT_ROOT_NOT_FOUND"}`.
+
+All file paths are validated with `Path.resolve().relative_to(root)` before any I/O. Paths outside the root return `{"error": "PATH_OUTSIDE_ROOT"}`.
+
+**New module:** `src/hgp/project.py` — `find_project_root()` and `assert_within_root()`.
+
+### Enforcement Model
+
+V4 uses a three-layer strategy to encourage agents to use `hgp_*` tools instead of native CLI tools:
+
+| Layer | Mechanism | Scope | Hard-blocks? |
+|-------|-----------|-------|--------------|
+| 1 | Instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) | All CLI agents | No — advisory only |
+| 2 | Claude Code `PreToolUse` hook (`.claude/hooks/pre_tool_use_hgp.py`) | Claude Code only | No by default; yes with `HGP_HOOK_BLOCK=1` |
+| 3 | Agent discipline | All agents | N/A |
+
+**Known limitations:**
+- Native tool bypass — agents using Write/Edit/Bash directly bypass V4 recording
+- External process changes (git, cp, mv, shell scripts) are not tracked
+- Non-Claude CLI agents have no hook equivalent; only instruction files apply
+- Binary files are out of scope (future work)
+
+### Git + HGP Consistency
+
+V4 removes `*.db` from `.gitignore`. The HGP database is committed to git alongside project files. This provides:
+
+- **Consistent restore** — `git restore` or `git checkout` on a previous commit restores both code and the HGP history that corresponds to that code
+- **Branch isolation** — Each git branch carries its own HGP history
+- **No orphaned history** — Deleting a branch removes its history too
+
+**WAL/SHM files** (`.db-wal`, `.db-shm`) remain in `.gitignore` because they are SQLite lock files that are meaningless outside an active connection.
+
+The `hgp_reconcile` tool handles crash-recovery for the case where the DB is in an inconsistent state after an unexpected shutdown.

@@ -1,6 +1,6 @@
 # HGP Tools Reference
 
-This document is the complete API reference for all 12 MCP tools exposed by the History Graph Protocol (HGP) server. Each tool is documented with its parameters, return values, error codes, and a minimal usage example. For setup and quick-start instructions, see the [README](../README.md).
+This document is the complete API reference for all 18 MCP tools exposed by the History Graph Protocol (HGP) server. Each tool is documented with its parameters, return values, error codes, and a minimal usage example. For setup and quick-start instructions, see the [README](../README.md).
 
 ---
 
@@ -18,7 +18,13 @@ This document is the complete API reference for all 12 MCP tools exposed by the 
 10. [hgp_reconcile](#hgp_reconcile)
 11. [hgp_get_evidence](#hgp_get_evidence)
 12. [hgp_get_citing_ops](#hgp_get_citing_ops)
-13. [Error Code Reference](#error-code-reference)
+13. [hgp_write_file](#hgp_write_file)
+14. [hgp_append_file](#hgp_append_file)
+15. [hgp_edit_file](#hgp_edit_file)
+16. [hgp_delete_file](#hgp_delete_file)
+17. [hgp_move_file](#hgp_move_file)
+18. [hgp_file_history](#hgp_file_history)
+19. [Error Code Reference](#error-code-reference)
 
 ---
 
@@ -734,6 +740,213 @@ Response:
   }
 ]
 ```
+
+---
+
+## File Tracking Tools (V4)
+
+> **Prerequisites:** A project root must be discoverable — either via a `.git` directory in the file's ancestor directories, or via the `HGP_PROJECT_ROOT` environment variable. All file paths must be within the project root.
+
+---
+
+## hgp_write_file
+
+### Description
+
+Creates or overwrites a file and records the result as an `artifact` operation in HGP. Atomically combines file I/O with history recording in a single MCP tool call.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file to write (must be within project root) |
+| `content` | string | ✓ | UTF-8 content to write |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `reason` | string | | Human-readable reason for the write (default: `"CREATE <file_path>"`) |
+| `parent_op_ids` | string[] | | Op IDs this operation causally depends on |
+| `evidence_refs` | object[] | | Evidence citations (same schema as `hgp_create_operation`) |
+
+### Returns
+
+```json
+{"op_id": "op-..."}
+```
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `PARENT_NOT_FOUND` | A `parent_op_ids` entry does not exist |
+| `INVALID_EVIDENCE_REF` | An `evidence_refs` entry failed validation |
+
+---
+
+## hgp_append_file
+
+### Description
+
+Appends content to a file (creates it if it does not exist) and records the result as an `artifact` operation in HGP.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file to append to |
+| `content` | string | ✓ | UTF-8 content to append |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `reason` | string | | Human-readable reason (default: `"APPEND <file_path>"`) |
+| `parent_op_ids` | string[] | | Causal parent op IDs |
+| `evidence_refs` | object[] | | Evidence citations |
+
+### Returns
+
+```json
+{"op_id": "op-..."}
+```
+
+### Error Codes
+
+Same as `hgp_write_file`.
+
+---
+
+## hgp_edit_file
+
+### Description
+
+Replaces the first (and only) occurrence of `old_string` with `new_string` in a file and records the result as an `artifact` operation.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file to edit |
+| `old_string` | string | ✓ | Exact string to replace (must appear exactly once) |
+| `new_string` | string | ✓ | Replacement string |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `reason` | string | | Human-readable reason (default: `"MODIFY <file_path>"`) |
+| `parent_op_ids` | string[] | | Causal parent op IDs |
+| `evidence_refs` | object[] | | Evidence citations |
+
+### Returns
+
+```json
+{"op_id": "op-..."}
+```
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `FILE_NOT_FOUND` | `file_path` does not exist |
+| `STRING_NOT_FOUND` | `old_string` not found in file |
+| `AMBIGUOUS_MATCH` | `old_string` found more than once |
+| `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+
+---
+
+## hgp_delete_file
+
+### Description
+
+Deletes a file and records an `invalidation` operation in HGP. Optionally marks a previous operation as `INVALIDATED`.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file to delete |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `previous_op_id` | string | | Op ID of the last write/edit op for this file; will be marked INVALIDATED |
+| `reason` | string | | Human-readable reason (default: `"DELETE <file_path>"`) |
+
+### Returns
+
+```json
+{"op_id": "op-..."}
+```
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `FILE_NOT_FOUND` | `file_path` does not exist |
+| `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+
+---
+
+## hgp_move_file
+
+### Description
+
+Moves or renames a file. Atomically (in a single DB transaction) invalidates the old path's operation and records a new `artifact` operation for the new path.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `old_path` | string | ✓ | Source file path (must exist) |
+| `new_path` | string | ✓ | Destination file path |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `previous_op_id` | string | | Op ID of the last op for `old_path`; will be marked INVALIDATED |
+| `reason` | string | | Human-readable reason (default: `"MOVE <old_path> → <new_path>"`) |
+| `evidence_refs` | object[] | | Evidence citations for the new artifact op |
+
+### Returns
+
+```json
+{"op_id": "op-..."}
+```
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `FILE_NOT_FOUND` | `old_path` does not exist |
+| `PATH_OUTSIDE_ROOT` | `old_path` or `new_path` is outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+
+---
+
+## hgp_file_history
+
+### Description
+
+Returns the operation history for a given file path, ordered most-recent-first. Accessing history also updates memory tier access weights for the returned operations.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file |
+| `limit` | integer | | Maximum number of operations to return (default: 50) |
+
+### Returns
+
+```json
+{
+  "file_path": "/absolute/path/to/file.py",
+  "operations": [
+    {
+      "op_id": "op-...",
+      "op_type": "artifact",
+      "agent_id": "agent-1",
+      "file_path": "/absolute/path/to/file.py",
+      ...
+    }
+  ]
+}
+```
+
+Returns `{"file_path": "...", "operations": []}` when no operations exist for the path.
+
+### Error Codes
+
+None (unknown paths return empty list).
 
 ---
 
