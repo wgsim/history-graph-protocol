@@ -464,6 +464,8 @@ def _record_file_op(
     """Store content in CAS and insert an artifact operation. Returns {op_id}."""
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
+        if len(evidence_refs) > _MAX_EVIDENCE_REFS:
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
         try:
             parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
         except ValidationError as exc:
@@ -491,7 +493,14 @@ def _record_file_op(
         for pid in (parent_op_ids or []):
             db.insert_edge(op_id, pid, "causal")
         if parsed_refs:
-            db.insert_evidence(op_id, parsed_refs)
+            try:
+                db.insert_evidence(op_id, parsed_refs)
+            except ValueError as exc:
+                db.rollback()
+                return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+            except sqlite3.IntegrityError:
+                db.rollback()
+                return {"error": "DUPLICATE_EVIDENCE_REF", "message": "Evidence link already exists"}
         final_hash = compute_chain_hash(db, op_id)
         db.execute(
             "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
@@ -746,6 +755,11 @@ def hgp_move_file(
             db.rollback()
         except Exception as rb_exc:
             _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
+        # Best-effort reverse the filesystem rename; log if it fails
+        try:
+            dst.rename(src)
+        except OSError as undo_exc:
+            _log.error("Failed to reverse rename %s -> %s after DB error: %s", dst, src, undo_exc)
         raise
 
     return {"op_id": op_id}
