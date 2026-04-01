@@ -11,6 +11,7 @@ import sys
 HGP_TOOLS = {
     "Write": "hgp_write_file",
     "Edit": "hgp_edit_file",
+    "MultiEdit": "hgp_edit_file",
 }
 
 BLOCK_MODE = os.environ.get("HGP_HOOK_BLOCK", "0") == "1"
@@ -35,8 +36,7 @@ def main() -> None:
     print(msg, file=sys.stderr)
 
     if BLOCK_MODE:
-        # Exit 2 = block the tool call with an error message
-        print(json.dumps({"error": msg}))
+        # Exit 2 = block; Claude Code reads stderr (already printed above), ignores stdout
         sys.exit(2)
 
     sys.exit(0)
