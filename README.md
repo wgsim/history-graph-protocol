@@ -89,6 +89,8 @@ python -m hgp.server
 |----------|---------|-------------|
 | `HGP_DB_PATH` | `~/.hgp/hgp.db` | SQLite database path |
 | `HGP_CAS_DIR` | `~/.hgp/.hgp_content/` | WORM content-addressable store directory |
+| `HGP_PROJECT_ROOT` | _(auto)_ | Override project root for file-scoped tools (default: nearest `.git`) |
+| `HGP_HOOK_BLOCK` | `0` | Set to `1` to block native file tool calls (Write/Edit) instead of warning |
 
 ### MCP Client Configuration
 
@@ -168,6 +170,12 @@ hgp_get_citing_ops(op_id="op-abc123")
 | `hgp_reconcile` | Run crash-recovery reconciler (use after unexpected shutdown) |
 | `hgp_get_evidence` | List all operations a given op cited as evidence |
 | `hgp_get_citing_ops` | Reverse lookup — list all ops that cited a given op as evidence |
+| `hgp_write_file` | Write (create or overwrite) a file and record it as an artifact |
+| `hgp_append_file` | Append content to a file and record as artifact |
+| `hgp_edit_file` | Replace a unique string in a file and record as artifact |
+| `hgp_delete_file` | Delete a file and record an invalidation operation |
+| `hgp_move_file` | Move/rename a file; records invalidation of old path + new artifact |
+| `hgp_file_history` | Return all HGP operations recorded for a given file path |
 
 → Full API reference: [docs/tools-reference.md](docs/tools-reference.md)
 → Usage patterns and examples: [docs/usage-patterns.md](docs/usage-patterns.md)

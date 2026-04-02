@@ -7,7 +7,7 @@
           {
             "name": "hgp-enforcement",
             "type": "command",
-            "command": "python .gemini/hooks/pre_tool_use_hgp.py"
+            "command": "python3 .gemini/hooks/pre_tool_use_hgp.py"
           }
         ]
       }

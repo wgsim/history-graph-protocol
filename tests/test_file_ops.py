@@ -72,10 +72,11 @@ def test_write_file_creates_file(project):
     assert target.read_text() == "print('hello')"
 
 
-def test_write_file_returns_only_op_id(project):
+def test_write_file_returns_enriched_fields(project):
     target = project / "file.txt"
     result = hgp_write_file(file_path=str(target), content="x", agent_id="agent-1")
-    assert set(result.keys()) == {"op_id"}
+    assert {"op_id", "status", "commit_seq", "object_hash", "chain_hash"}.issubset(result.keys())
+    assert result["status"] == "COMPLETED"
 
 
 def test_write_file_creates_parent_dirs(project):
@@ -96,7 +97,7 @@ def test_write_file_default_reason_in_metadata(project):
     result = hgp_write_file(
         file_path=str(target), content="# Title", agent_id="agent-1"
     )
-    db, _, _, _ = server_module._db, server_module._cas, server_module._lease_mgr, server_module._reconciler
+    db = server_module._db
     op = db.get_operation(result["op_id"])
     meta = json.loads(op["metadata"] or "{}")
     assert "CREATE" in meta.get("reason", "")
@@ -254,6 +255,22 @@ def test_move_file_outside_root_rejected(project):
     assert result.get("error") == "PATH_OUTSIDE_ROOT"
 
 
+def test_move_file_invalid_evidence_refs_rejected_before_rename(project):
+    src = project / "source.txt"
+    dst = project / "dest.txt"
+    src.write_text("content")
+    result = hgp_move_file(
+        old_path=str(src),
+        new_path=str(dst),
+        agent_id="agent-1",
+        evidence_refs=[{"op_id": "op-123", "relation": "INVALID_RELATION_VALUE"}],
+    )
+    assert result.get("error") == "INVALID_EVIDENCE_REF"
+    # Filesystem must NOT have been changed.
+    assert src.exists(), "source file must still exist after rejected move"
+    assert not dst.exists(), "destination file must not exist after rejected move"
+
+
 def test_delete_outside_root_rejected(project):
     result = hgp_delete_file(
         file_path="/etc/passwd",
@@ -286,3 +303,113 @@ def test_query_operations_filter_by_file_path(project):
     r = hgp_write_file(str(target), "x", "agent-1")
     result = hgp_query_operations(file_path=str(target))
     assert any(op["op_id"] == r["op_id"] for op in result["operations"])
+
+
+# ── Task 1: Rollback / atomicity failure tests ────────────────────────────────
+
+def test_write_file_invalid_evidence_does_not_leave_file_written(project):
+    """If evidence_refs references a nonexistent op_id, DB insert fails.
+    The file must NOT be left on disk (atomicity guarantee)."""
+    target = project / "should_not_exist.txt"
+    result = hgp_write_file(
+        file_path=str(target),
+        content="data",
+        agent_id="agent-1",
+        evidence_refs=[{"op_id": "nonexistent-uuid-aaaa", "relation": "supports"}],
+    )
+    assert "error" in result
+    assert not target.exists(), "file must not exist after failed write"
+
+
+def test_append_file_invalid_evidence_does_not_mutate_file(project):
+    """If evidence_refs is invalid, append must not modify the original file."""
+    target = project / "original.txt"
+    target.write_text("original")
+    result = hgp_append_file(
+        file_path=str(target),
+        content=" extra",
+        agent_id="agent-1",
+        evidence_refs=[{"op_id": "nonexistent-uuid-bbbb", "relation": "supports"}],
+    )
+    assert "error" in result
+    assert target.read_text() == "original", "file content must be unchanged"
+
+
+def test_edit_file_invalid_evidence_does_not_mutate_file(project):
+    """If evidence_refs is invalid, edit must not apply the replacement."""
+    target = project / "code.py"
+    target.write_text("old content")
+    result = hgp_edit_file(
+        file_path=str(target),
+        old_string="old content",
+        new_string="new content",
+        agent_id="agent-1",
+        evidence_refs=[{"op_id": "nonexistent-uuid-cccc", "relation": "supports"}],
+    )
+    assert "error" in result
+    assert target.read_text() == "old content", "file must still contain original content"
+
+
+def test_delete_file_invalid_previous_op_id_preserves_file(project):
+    """If previous_op_id references a nonexistent op, the file must NOT be deleted."""
+    target = project / "keep_me.txt"
+    target.write_text("precious data")
+    result = hgp_delete_file(
+        file_path=str(target),
+        agent_id="agent-1",
+        previous_op_id="nonexistent-uuid-dddd",
+    )
+    # Either return an error OR the file must still exist
+    if "error" not in result:
+        assert target.exists(), "file must still exist when previous_op_id is invalid"
+    else:
+        assert target.exists(), "file must still exist after rejected delete"
+
+
+def test_write_file_canonical_path_stored(project):
+    """Path with ./ component is stored and queried under the canonical absolute path."""
+    target = project / "src" / "file.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    r = hgp_write_file(str(target), "hello", "agent-1")
+    assert "op_id" in r
+    # Query with a path that has ./ in it — should find the same op
+    dotslash = str(project / "src" / "." / "file.py")
+    history = hgp_file_history(file_path=dotslash)
+    op_ids = [op["op_id"] for op in history["operations"]]
+    assert r["op_id"] in op_ids, "same op must appear in history regardless of ./ in path"
+
+
+def test_file_history_same_for_absolute_and_dotdot_path(project):
+    """Path with ../ component resolves to same canonical key."""
+    target = project / "a" / "b.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    r = hgp_write_file(str(target), "x", "agent-1")
+    assert "op_id" in r
+    # /project/a/../a/b.py should resolve to same file
+    dotdot = str(project / "a" / ".." / "a" / "b.py")
+    history = hgp_file_history(file_path=dotdot)
+    op_ids = [op["op_id"] for op in history["operations"]]
+    assert r["op_id"] in op_ids, "same op must appear for path with ../ component"
+
+
+def test_move_file_without_previous_op_id_shows_old_path_history(project):
+    """Moving without previous_op_id must still produce a history entry for the old path."""
+    src = project / "original_loc.py"
+    dst = project / "new_loc.py"
+    src.write_text("code here")
+    # Record the file via write so it has an op
+    hgp_write_file(str(src), "code here", "agent-1")
+    # Move without supplying previous_op_id
+    move_result = hgp_move_file(
+        old_path=str(src),
+        new_path=str(dst),
+        agent_id="agent-1",
+        previous_op_id=None,
+    )
+    assert "op_id" in move_result, f"move failed: {move_result}"
+    # Old path history must contain a move/invalidation event
+    old_history = hgp_file_history(file_path=str(src))
+    op_types = [op["op_type"] for op in old_history["operations"]]
+    assert "invalidation" in op_types, (
+        f"old path history must include an invalidation event after move; got {op_types}"
+    )

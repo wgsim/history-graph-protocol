@@ -52,3 +52,20 @@ def assert_within_root(file_path: Path, root: Path) -> None:
         raise PathOutsideRootError(
             f"{file_path} is outside project root {root}"
         )
+
+
+def canonical_file_path(file_path: str | Path, root: Path) -> str:
+    """Return the canonical absolute path string for storage and query.
+
+    Resolves symlinks and normalizes . / .. so that the same file
+    is always stored/queried under one key regardless of how the
+    caller expressed the path.
+
+    Raises PathOutsideRootError if the resolved path is outside root.
+    """
+    resolved = Path(file_path).resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError:
+        raise PathOutsideRootError(f"{file_path} is outside project root {root}")
+    return str(resolved)

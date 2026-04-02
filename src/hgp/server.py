@@ -29,6 +29,7 @@ from hgp.db import Database
 from hgp.errors import ChainStaleError, ParentNotFoundError
 from hgp.lease import LeaseManager
 from hgp.models import EvidenceRef
+from hgp.project import find_project_root, assert_within_root, canonical_file_path, ProjectRootError, PathOutsideRootError
 from hgp.reconciler import Reconciler
 
 # ── Server initialization ───────────────────────────────────
@@ -278,11 +279,19 @@ def hgp_query_operations(
                 except Exception:
                     pass
         return {"operations": [op] if op else []}
+    # Canonicalize file_path filter so it matches stored canonical paths
+    canonical_fp = file_path
+    if file_path is not None:
+        try:
+            root = find_project_root(Path(file_path).parent)
+            canonical_fp = canonical_file_path(file_path, root)
+        except (ProjectRootError, PathOutsideRootError):
+            pass  # use raw path; will return empty results for out-of-root queries
     ops = db.query_operations(
         status=status, agent_id=agent_id, op_type=op_type,
         since_commit_seq=since_commit_seq,
         include_inactive=include_inactive, limit=limit,
-        file_path=file_path,
+        file_path=canonical_fp,
     )
     return {"operations": ops}
 
@@ -294,11 +303,18 @@ def hgp_file_history(
 ) -> dict[str, Any]:
     """Return operations recorded for a given file_path, most recent first."""
     db, _, _, _ = _get_components()
-    rows = db.get_ops_by_file_path(file_path, limit=limit)
+    # Canonicalize query path so it matches stored canonical paths
+    try:
+        root = find_project_root(Path(file_path).parent)
+        query_path = canonical_file_path(file_path, root)
+    except (ProjectRootError, PathOutsideRootError):
+        # Fall back to raw path for queries outside a project root (returns empty)
+        query_path = file_path
+    rows = db.get_ops_by_file_path(query_path, limit=limit)
     ops = [dict(r) for r in rows]
     # Use depth-based decay: most recent op (index 0) gets full weight, older ops decay.
     _record_access_with_decay(db, [dict(op, depth=i) for i, op in enumerate(ops)])
-    return {"file_path": file_path, "operations": ops}
+    return {"file_path": query_path, "operations": ops}
 
 
 @mcp.tool()
@@ -514,7 +530,13 @@ def _record_file_op(
             pass
         raise
 
-    return {"op_id": op_id}
+    return {
+        "op_id": op_id,
+        "status": "COMPLETED",
+        "commit_seq": seq,
+        "object_hash": object_hash,
+        "chain_hash": final_hash,
+    }
 
 
 @mcp.tool()
@@ -527,10 +549,9 @@ def hgp_write_file(
     evidence_refs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Write (create or overwrite) a file and record it as an artifact operation."""
-    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
     try:
         root = find_project_root(Path(file_path).parent)
-        assert_within_root(Path(file_path), root)
+        canonical = canonical_file_path(file_path, root)
     except ProjectRootError as e:
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
@@ -538,17 +559,19 @@ def hgp_write_file(
 
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-    effective_reason = reason or f"CREATE {file_path}"
-    return _record_file_op(
-        file_path=file_path,
+    effective_reason = reason or f"CREATE {canonical}"
+    result = _record_file_op(
+        file_path=canonical,
         content_bytes=content.encode("utf-8"),
         agent_id=agent_id,
         reason=effective_reason,
         parent_op_ids=parent_op_ids,
         evidence_refs=evidence_refs,
     )
+    if "error" in result:
+        return result
+    path.write_text(content, encoding="utf-8")
+    return result
 
 
 @mcp.tool()
@@ -561,29 +584,33 @@ def hgp_append_file(
     evidence_refs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Append content to a file (creates it if absent) and record as artifact."""
-    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
     try:
         root = find_project_root(Path(file_path).parent)
-        assert_within_root(Path(file_path), root)
+        canonical = canonical_file_path(file_path, root)
     except ProjectRootError as e:
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
 
     path = Path(file_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(content)
-
-    effective_reason = reason or f"APPEND {file_path}"
-    return _record_file_op(
-        file_path=file_path,
-        content_bytes=path.read_bytes(),
+    # Compute post-append content in memory (no filesystem side effect yet)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    combined = existing + content
+    effective_reason = reason or f"APPEND {canonical}"
+    result = _record_file_op(
+        file_path=canonical,
+        content_bytes=combined.encode("utf-8"),
         agent_id=agent_id,
         reason=effective_reason,
         parent_op_ids=parent_op_ids,
         evidence_refs=evidence_refs,
     )
+    if "error" in result:
+        return result
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(content)
+    return result
 
 
 @mcp.tool()
@@ -597,10 +624,9 @@ def hgp_edit_file(
     evidence_refs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Replace the first (and only) occurrence of old_string with new_string."""
-    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
     try:
         root = find_project_root(Path(file_path).parent)
-        assert_within_root(Path(file_path), root)
+        canonical = canonical_file_path(file_path, root)
     except ProjectRootError as e:
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
@@ -618,17 +644,19 @@ def hgp_edit_file(
         return {"error": "AMBIGUOUS_MATCH", "message": f"old_string found {count} times; must be unique"}
 
     updated = original.replace(old_string, new_string, 1)
-    path.write_text(updated, encoding="utf-8")
-
-    effective_reason = reason or f"MODIFY {file_path}"
-    return _record_file_op(
-        file_path=file_path,
+    effective_reason = reason or f"MODIFY {canonical}"
+    result = _record_file_op(
+        file_path=canonical,
         content_bytes=updated.encode("utf-8"),
         agent_id=agent_id,
         reason=effective_reason,
         parent_op_ids=parent_op_ids,
         evidence_refs=evidence_refs,
     )
+    if "error" in result:
+        return result
+    path.write_text(updated, encoding="utf-8")
+    return result
 
 
 @mcp.tool()
@@ -639,10 +667,9 @@ def hgp_delete_file(
     reason: str | None = None,
 ) -> dict[str, Any]:
     """Delete a file and record an invalidation operation."""
-    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
     try:
         root = find_project_root(Path(file_path).parent)
-        assert_within_root(Path(file_path), root)
+        canonical = canonical_file_path(file_path, root)
     except ProjectRootError as e:
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
@@ -652,11 +679,14 @@ def hgp_delete_file(
     if not path.exists():
         return {"error": "FILE_NOT_FOUND", "message": f"{file_path} does not exist"}
 
-    path.unlink()
-
     db, _, _, _ = _get_components()
+
+    # Preflight: validate previous_op_id before any filesystem side effect
+    if previous_op_id and not db.get_operation(previous_op_id):
+        return {"error": "INVALID_PARENT_OP_ID", "message": f"previous_op_id not found: {previous_op_id}"}
+
     op_id = str(uuid.uuid4())
-    effective_reason = reason or f"DELETE {file_path}"
+    effective_reason = reason or f"DELETE {canonical}"
     metadata = json.dumps({"reason": effective_reason})
 
     db.begin_immediate()
@@ -665,7 +695,7 @@ def hgp_delete_file(
         db.insert_operation(
             op_id=op_id, op_type="invalidation", agent_id=agent_id,
             commit_seq=seq, chain_hash="sha256:pending",
-            metadata=metadata, file_path=file_path,
+            metadata=metadata, file_path=canonical,
         )
         if previous_op_id:
             db.insert_edge(op_id, previous_op_id, "invalidates")
@@ -683,7 +713,17 @@ def hgp_delete_file(
             _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
         raise
 
-    return {"op_id": op_id}
+    try:
+        path.unlink()
+    except OSError as exc:
+        _log.error("DB record committed but file delete failed for %s: %s", file_path, exc)
+
+    return {
+        "op_id": op_id,
+        "status": "COMPLETED",
+        "commit_seq": seq,
+        "chain_hash": final_hash,
+    }
 
 
 @mcp.tool()
@@ -696,11 +736,10 @@ def hgp_move_file(
     evidence_refs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Move/rename a file: invalidates old path op, creates new artifact op."""
-    from hgp.project import find_project_root, assert_within_root, ProjectRootError, PathOutsideRootError
     try:
         root = find_project_root(Path(old_path).parent)
-        assert_within_root(Path(old_path), root)
-        assert_within_root(Path(new_path), root)
+        canonical_old = canonical_file_path(old_path, root)
+        canonical_new = canonical_file_path(new_path, root)
     except ProjectRootError as e:
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
@@ -710,13 +749,9 @@ def hgp_move_file(
     if not src.exists():
         return {"error": "FILE_NOT_FOUND", "message": f"{old_path} does not exist"}
 
-    dst = Path(new_path)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    content_bytes = src.read_bytes()
-    src.rename(dst)
+    effective_reason = reason or f"MOVE {canonical_old} → {canonical_new}"
 
-    effective_reason = reason or f"MOVE {old_path} → {new_path}"
-
+    # Validate evidence_refs BEFORE any filesystem operation.
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
         if len(evidence_refs) > _MAX_EVIDENCE_REFS:
@@ -727,23 +762,58 @@ def hgp_move_file(
             return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
     db, cas, _, _ = _get_components()
+
+    # Preflight: validate previous_op_id before any filesystem side effect
+    if previous_op_id and not db.get_operation(previous_op_id):
+        return {"error": "INVALID_PARENT_OP_ID", "message": f"previous_op_id not found: {previous_op_id}"}
+
+    # Auto-resolve previous_op_id from DB if not supplied by caller
+    resolved_previous_op_id = previous_op_id
+    if resolved_previous_op_id is None:
+        latest = db.get_ops_by_file_path(canonical_old, limit=1)
+        if latest:
+            resolved_previous_op_id = dict(latest[0])["op_id"]
+
+    dst = Path(new_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    content_bytes = src.read_bytes()
     object_hash = cas.store(content_bytes)
-    op_id = str(uuid.uuid4())
-    metadata = json.dumps({"reason": effective_reason})
 
     db.begin_immediate()
     try:
+        # Insert invalidation op for old_path so hgp_file_history(old_path) records the move.
+        inv_op_id = str(uuid.uuid4())
+        inv_metadata = json.dumps({"reason": f"MOVE {canonical_old} → {canonical_new}"})
+        db.insert_operation(
+            op_id=inv_op_id, op_type="invalidation", agent_id=agent_id,
+            commit_seq=db.next_commit_seq(), chain_hash="sha256:pending",
+            metadata=inv_metadata, file_path=canonical_old,
+        )
+        if resolved_previous_op_id:
+            db.insert_edge(inv_op_id, resolved_previous_op_id, "invalidates")
+            db.update_operation_status(resolved_previous_op_id, "INVALIDATED")
+        inv_hash = compute_chain_hash(db, inv_op_id)
+        db.execute("UPDATE operations SET chain_hash = ? WHERE op_id = ?", (inv_hash, inv_op_id))
+
+        # Insert artifact op for new_path, causally linked to the invalidation op.
+        op_id = str(uuid.uuid4())
+        metadata = json.dumps({"reason": effective_reason})
         seq = db.next_commit_seq()
         db.insert_operation(
             op_id=op_id, op_type="artifact", agent_id=agent_id,
             commit_seq=seq, chain_hash="sha256:pending",
-            object_hash=object_hash, metadata=metadata, file_path=new_path,
+            object_hash=object_hash, metadata=metadata, file_path=canonical_new,
         )
-        if previous_op_id:
-            db.insert_edge(op_id, previous_op_id, "invalidates")
-            db.update_operation_status(previous_op_id, "INVALIDATED")
+        db.insert_edge(op_id, inv_op_id, "causal")
         if parsed_refs:
-            db.insert_evidence(op_id, parsed_refs)
+            try:
+                db.insert_evidence(op_id, parsed_refs)
+            except ValueError as exc:
+                db.rollback()
+                return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+            except sqlite3.IntegrityError:
+                db.rollback()
+                return {"error": "DUPLICATE_EVIDENCE_REF", "message": "Evidence link already exists"}
         final_hash = compute_chain_hash(db, op_id)
         db.execute(
             "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
@@ -755,14 +825,19 @@ def hgp_move_file(
             db.rollback()
         except Exception as rb_exc:
             _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
-        # Best-effort reverse the filesystem rename; log if it fails
-        try:
-            dst.rename(src)
-        except OSError as undo_exc:
-            _log.error("Failed to reverse rename %s -> %s after DB error: %s", dst, src, undo_exc)
         raise
 
-    return {"op_id": op_id}
+    # Filesystem rename happens AFTER DB commit
+    src.rename(dst)
+
+    return {
+        "invalidation_op_id": inv_op_id,
+        "op_id": op_id,
+        "status": "COMPLETED",
+        "commit_seq": seq,
+        "object_hash": object_hash,
+        "chain_hash": final_hash,
+    }
 
 
 if __name__ == "__main__":

@@ -897,3 +897,30 @@ def test_create_operation_integrity_error_returns_sanitized_message(server_compo
     assert result.get("error") == "DUPLICATE_EVIDENCE_REF"
     assert "op_evidence" not in result.get("message", "")
     assert "citing_op_id" not in result.get("message", "")
+
+
+# ── Task 5: Contract lock tests ───────────────────────────────────────────────
+
+def test_query_operations_response_shape(server_components):
+    """hgp_query_operations must always return {"operations": list}, never a bare list."""
+    result = hgp_query_operations()
+    assert isinstance(result, dict), "response must be a dict"
+    assert "operations" in result, "response must have 'operations' key"
+    assert isinstance(result["operations"], list), "'operations' value must be a list"
+
+
+def test_query_operations_op_id_response_shape(server_components):
+    """hgp_query_operations with op_id filter must also return {"operations": list}."""
+    result = hgp_query_operations(op_id="nonexistent-op-id")
+    assert isinstance(result, dict)
+    assert "operations" in result
+    assert result["operations"] == []
+
+
+def test_query_operations_with_op_id_found(server_components):
+    """hgp_query_operations with op_id for existing op returns {"operations": [op]}."""
+    created = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_query_operations(op_id=created["op_id"])
+    assert isinstance(result, dict)
+    assert len(result["operations"]) == 1
+    assert result["operations"][0]["op_id"] == created["op_id"]

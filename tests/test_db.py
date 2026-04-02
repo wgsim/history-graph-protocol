@@ -661,3 +661,112 @@ def test_migration_idempotent(tmp_path):
     db2.initialize()  # second open — migration already applied
     db2.execute("SELECT file_path FROM operations LIMIT 0")
     db2.close()
+
+
+def test_migration_from_pre_v4_schema(tmp_path):
+    """Database() must add file_path column (and its indexes) when opening a pre-V4 DB
+    that has an operations table without that column. Existing rows must remain queryable."""
+    import sqlite3
+    db_path = tmp_path / "pre_v4.db"
+
+    # Build a minimal pre-V4 schema by hand — operations table without file_path.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("""
+        CREATE TABLE objects (
+            hash TEXT PRIMARY KEY, size INTEGER NOT NULL,
+            mime_type TEXT, status TEXT NOT NULL DEFAULT 'VALID',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            gc_marked_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE operations (
+            op_id        TEXT PRIMARY KEY,
+            op_type      TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'COMPLETED',
+            commit_seq   INTEGER UNIQUE,
+            agent_id     TEXT NOT NULL,
+            object_hash  TEXT,
+            chain_hash   TEXT,
+            metadata     TEXT,
+            created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            completed_at TEXT,
+            access_count REAL NOT NULL DEFAULT 0.0,
+            last_accessed TEXT,
+            memory_tier  TEXT NOT NULL DEFAULT 'long_term'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE op_edges (
+            child_op_id TEXT NOT NULL, parent_op_id TEXT NOT NULL,
+            edge_type TEXT NOT NULL DEFAULT 'causal',
+            PRIMARY KEY (child_op_id, parent_op_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE leases (
+            lease_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+            subgraph_root_op_id TEXT NOT NULL, chain_hash TEXT NOT NULL,
+            issued_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE commit_counter (
+            id INTEGER PRIMARY KEY CHECK (id = 1), next_seq INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    conn.execute("INSERT OR IGNORE INTO commit_counter (id, next_seq) VALUES (1, 1)")
+    conn.execute("""
+        CREATE TABLE git_anchors (
+            op_id TEXT NOT NULL, git_commit_sha TEXT NOT NULL,
+            repository TEXT, created_at TEXT NOT NULL,
+            PRIMARY KEY (op_id, git_commit_sha)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE op_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            citing_op_id TEXT NOT NULL, cited_op_id TEXT NOT NULL,
+            relation TEXT NOT NULL, scope TEXT, inference TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            UNIQUE (citing_op_id, cited_op_id)
+        )
+    """)
+    conn.execute(
+        "INSERT INTO operations (op_id, op_type, agent_id, commit_seq, chain_hash) "
+        "VALUES ('legacy-op-1', 'artifact', 'agent-old', 1, 'sha256:legacy')"
+    )
+    conn.commit()
+    conn.close()
+
+    # Verify file_path is absent before migration
+    conn2 = sqlite3.connect(str(db_path))
+    pre_cols = {row[1] for row in conn2.execute("PRAGMA table_info(operations)").fetchall()}
+    assert "file_path" not in pre_cols, "sanity: file_path should not exist before migration"
+    conn2.close()
+
+    # Now open via Database — migration must run automatically
+    from hgp.db import Database
+    db = Database(db_path)
+    db.initialize()
+
+    # file_path column must now exist
+    cols = {row[1] for row in db.execute("PRAGMA table_info(operations)").fetchall()}
+    assert "file_path" in cols, "file_path column must exist after migration"
+
+    # Both indexes must exist
+    indexes = {row[1] for row in db.execute(
+        "SELECT * FROM sqlite_master WHERE type='index'"
+    ).fetchall()}
+    assert "idx_operations_file_path" in indexes
+    assert "idx_operations_file_path_seq" in indexes
+
+    # Old row must still be queryable
+    row = db.get_operation("legacy-op-1")
+    assert row is not None
+    assert row["agent_id"] == "agent-old"
+    assert row["file_path"] is None  # NULL for migrated rows
+
+    db.close()

@@ -43,8 +43,6 @@ CREATE INDEX IF NOT EXISTS idx_operations_agent     ON operations(agent_id);
 CREATE INDEX IF NOT EXISTS idx_operations_type      ON operations(op_type);
 CREATE INDEX IF NOT EXISTS idx_operations_status    ON operations(status);
 CREATE INDEX IF NOT EXISTS idx_operations_seq       ON operations(commit_seq);
-CREATE INDEX IF NOT EXISTS idx_operations_file_path ON operations(file_path);
-CREATE INDEX IF NOT EXISTS idx_operations_file_path_seq ON operations(file_path, commit_seq DESC);
 
 CREATE TABLE IF NOT EXISTS op_edges (
     child_op_id     TEXT NOT NULL,
@@ -145,7 +143,6 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
-        self._apply_migrations()
         # executescript() issues an implicit COMMIT; re-assert per-connection PRAGMA.
         self._conn.execute("PRAGMA foreign_keys = ON")
         # V2 migration: add memory tier columns to existing DBs (each column guarded independently)

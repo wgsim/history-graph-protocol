@@ -136,10 +136,17 @@ Queries operation records by one or more filter criteria. When `op_id` is suppli
 | `since_commit_seq` | `integer` | No | `null` | Return only operations with `commit_seq` greater than this value |
 | `include_inactive` | `boolean` | No | `false` | Whether to include operations in the `inactive` memory tier |
 | `limit` | `integer` | No | `100` | Maximum number of results to return |
+| `file_path` | `string` | No | `null` | Filter to operations recorded for this file path (canonicalized before matching) |
 
 ### Returns
 
-A list of operation dicts. Detail level varies by `memory_tier`:
+**V4 breaking change:** the response is now a wrapper object `{"operations": [...]}`, not a bare list.
+
+```json
+{"operations": [...]}
+```
+
+Detail level of each operation dict varies by `memory_tier`:
 
 | Memory Tier | Fields Returned |
 |---|---|
@@ -166,16 +173,18 @@ Request:
 
 Response:
 ```json
-[
-  {
-    "op_id": "01HZ1234ABCD",
-    "op_type": "hypothesis",
-    "status": "COMPLETED",
-    "memory_tier": "short_term",
-    "agent_id": "analyst-1",
-    "commit_seq": 42
-  }
-]
+{
+  "operations": [
+    {
+      "op_id": "01HZ1234ABCD",
+      "op_type": "hypothesis",
+      "status": "COMPLETED",
+      "memory_tier": "short_term",
+      "agent_id": "analyst-1",
+      "commit_seq": 42
+    }
+  ]
+}
 ```
 
 ---
@@ -753,7 +762,7 @@ Response:
 
 ### Description
 
-Creates or overwrites a file and records the result as an `artifact` operation in HGP. Atomically combines file I/O with history recording in a single MCP tool call.
+Creates or overwrites a file and records the result as an `artifact` operation in HGP. HGP recording (CAS store + DB insert) is committed **before** the filesystem write, so the on-disk file is only created/overwritten if the HGP insert succeeds. File paths are canonicalized (symlinks resolved, `.`/`..` normalized) before storage, so the same file always maps to one history entry regardless of how the path was expressed.
 
 ### Parameters
 
@@ -787,7 +796,7 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 
 ### Description
 
-Appends content to a file (creates it if it does not exist) and records the result as an `artifact` operation in HGP.
+Appends content to a file (creates it if it does not exist) and records the result as an `artifact` operation in HGP. The combined content (existing + appended) is committed to CAS and DB before the filesystem write, providing the same atomicity guarantee as `hgp_write_file`.
 
 ### Parameters
 
@@ -816,7 +825,7 @@ Same as `hgp_write_file`.
 
 ### Description
 
-Replaces the first (and only) occurrence of `old_string` with `new_string` in a file and records the result as an `artifact` operation.
+Replaces the first (and only) occurrence of `old_string` with `new_string` in a file and records the result as an `artifact` operation. The replacement is computed in memory, committed to CAS and DB, and only then written to disk. If HGP recording fails, the original file content is preserved.
 
 ### Parameters
 
@@ -852,7 +861,7 @@ Replaces the first (and only) occurrence of `old_string` with `new_string` in a 
 
 ### Description
 
-Deletes a file and records an `invalidation` operation in HGP. Optionally marks a previous operation as `INVALIDATED`.
+Deletes a file and records an `invalidation` operation in HGP. Optionally marks a previous operation as `INVALIDATED`. The DB record is committed before the filesystem unlink. If `previous_op_id` is supplied and does not exist in HGP, the tool returns an error and the file is not deleted.
 
 ### Parameters
 
@@ -876,6 +885,7 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 | `FILE_NOT_FOUND` | `file_path` does not exist |
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
 
 ---
 
@@ -883,7 +893,11 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 
 ### Description
 
-Moves or renames a file. Atomically (in a single DB transaction) invalidates the old path's operation and records a new `artifact` operation for the new path.
+Moves or renames a file. In a single DB transaction:
+1. Inserts an `invalidation` op for `old_path` (recording the move event in old-path history).
+2. Inserts an `artifact` op for `new_path` causally linked to the invalidation op.
+
+The filesystem rename happens **after** the DB transaction commits. If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked op for `old_path` and uses it as the invalidation target. Calling `hgp_file_history(old_path)` after a successful move will always show the move event.
 
 ### Parameters
 
@@ -892,15 +906,24 @@ Moves or renames a file. Atomically (in a single DB transaction) invalidates the
 | `old_path` | string | ✓ | Source file path (must exist) |
 | `new_path` | string | ✓ | Destination file path |
 | `agent_id` | string | ✓ | Identifier of the calling agent |
-| `previous_op_id` | string | | Op ID of the last op for `old_path`; will be marked INVALIDATED |
+| `previous_op_id` | string | | Op ID of the last op for `old_path`; will be marked INVALIDATED. When omitted the tool auto-resolves the most recent tracked op for `old_path`. |
 | `reason` | string | | Human-readable reason (default: `"MOVE <old_path> → <new_path>"`) |
 | `evidence_refs` | object[] | | Evidence citations for the new artifact op |
 
 ### Returns
 
 ```json
-{"op_id": "op-..."}
+{
+  "invalidation_op_id": "op-...",
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42,
+  "object_hash": "sha256:...",
+  "chain_hash": "sha256:..."
+}
 ```
+
+`invalidation_op_id` is the op recorded for `old_path`; `op_id` is the new artifact op for `new_path`.
 
 ### Error Codes
 
@@ -909,6 +932,7 @@ Moves or renames a file. Atomically (in a single DB transaction) invalidates the
 | `FILE_NOT_FOUND` | `old_path` does not exist |
 | `PATH_OUTSIDE_ROOT` | `old_path` or `new_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
 
 ---
 
@@ -967,3 +991,9 @@ The following table consolidates all error codes across all tools.
 | `NOT_FOUND` | `hgp_get_artifact` | No artifact exists for the given `object_hash` |
 | `INVALID_SHA` | `hgp_anchor_git` | `git_commit_sha` is not exactly 40 lowercase hex characters |
 | `DB_ERROR` | `hgp_get_evidence`, `hgp_get_citing_ops` | An internal database error occurred |
+| `FILE_NOT_FOUND` | `hgp_edit_file`, `hgp_delete_file`, `hgp_move_file` | The target file does not exist on disk |
+| `STRING_NOT_FOUND` | `hgp_edit_file` | `old_string` not found in file |
+| `AMBIGUOUS_MATCH` | `hgp_edit_file` | `old_string` appears more than once |
+| `PATH_OUTSIDE_ROOT` | V4 file tools | File path resolves outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | V4 file tools | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `INVALID_PARENT_OP_ID` | `hgp_delete_file`, `hgp_move_file` | `previous_op_id` supplied but does not exist in HGP |
