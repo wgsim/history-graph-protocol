@@ -746,10 +746,19 @@ def hgp_delete_file(
     except OSError as exc:
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": op_id}
 
-    # Filesystem unlink succeeded — safe to mark the prior op as invalidated.
-    if previous_op_id:
-        db.update_operation_status(previous_op_id, "INVALIDATED")
-    db.finalize_operation(op_id)
+    # Filesystem unlink succeeded — finalize all DB state in one atomic transaction.
+    db.begin_immediate()
+    try:
+        if previous_op_id:
+            db.update_operation_status(previous_op_id, "INVALIDATED")
+        db.finalize_operation(op_id)
+        db.commit()
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": op_id}
     return {
         "op_id": op_id,
         "status": "COMPLETED",
@@ -867,11 +876,20 @@ def hgp_move_file(
     except OSError as exc:
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": op_id}
 
-    # Rename succeeded — safe to mark the prior old-path artifact as invalidated.
-    if resolved_previous_op_id:
-        db.update_operation_status(resolved_previous_op_id, "INVALIDATED")
-    db.finalize_operation(inv_op_id)
-    db.finalize_operation(op_id)
+    # Rename succeeded — finalize all DB state in one atomic transaction.
+    db.begin_immediate()
+    try:
+        if resolved_previous_op_id:
+            db.update_operation_status(resolved_previous_op_id, "INVALIDATED")
+        db.finalize_operation(inv_op_id)
+        db.finalize_operation(op_id)
+        db.commit()
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": op_id}
     return {
         "invalidation_op_id": inv_op_id,
         "op_id": op_id,

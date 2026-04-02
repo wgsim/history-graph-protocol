@@ -542,6 +542,51 @@ def test_move_file_fs_failure_preserves_prior_op_status(project, monkeypatch):
     )
 
 
+def test_delete_file_finalize_failure_no_partial_state(project, monkeypatch):
+    """If post-unlink DB finalization fails, prior artifact must not be left INVALIDATED."""
+    target = project / "finalize_fail_delete.txt"
+    target.write_text("data")
+    write_result = hgp_write_file(str(target), "data", "agent-1")
+    prior_op_id = write_result["op_id"]
+
+    db = server_module._db
+
+    def failing_finalize(op_id):
+        raise RuntimeError("simulated finalize failure")
+    monkeypatch.setattr(db, "finalize_operation", failing_finalize)
+
+    result = hgp_delete_file(str(target), "agent-1", previous_op_id=prior_op_id)
+    assert "error" in result, f"expected error dict, got: {result}"
+
+    prior_op = db.get_operation(prior_op_id)
+    assert prior_op["status"] == "COMPLETED", (
+        f"prior artifact must remain COMPLETED after failed finalize, got: {prior_op['status']}"
+    )
+
+
+def test_move_file_finalize_failure_no_partial_state(project, monkeypatch):
+    """If post-rename DB finalization fails, prior old-path artifact must not be left INVALIDATED."""
+    src = project / "finalize_fail_src.py"
+    dst = project / "finalize_fail_dst.py"
+    src.write_text("content")
+    write_result = hgp_write_file(str(src), "content", "agent-1")
+    prior_op_id = write_result["op_id"]
+
+    db = server_module._db
+
+    def failing_finalize(op_id):
+        raise RuntimeError("simulated finalize failure")
+    monkeypatch.setattr(db, "finalize_operation", failing_finalize)
+
+    result = hgp_move_file(str(src), str(dst), "agent-1")
+    assert "error" in result, f"expected error dict, got: {result}"
+
+    prior_op = db.get_operation(prior_op_id)
+    assert prior_op["status"] == "COMPLETED", (
+        f"prior artifact must remain COMPLETED after failed finalize, got: {prior_op['status']}"
+    )
+
+
 # ── Schema lock tests for file-tool response shapes ───────────────────────────
 
 def test_write_file_response_schema(project):

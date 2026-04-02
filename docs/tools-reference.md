@@ -911,6 +911,7 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
 | `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem unlink failed (op remains PENDING, file preserved) |
+| `DB_FINALIZE_ERROR` | Unlink succeeded but post-unlink DB finalization failed atomically; op remains PENDING, prior artifact remains COMPLETED |
 
 ---
 
@@ -960,6 +961,8 @@ If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked o
 | `PATH_OUTSIDE_ROOT` | `old_path` or `new_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
+| `FILESYSTEM_ERROR` | Both ops committed as PENDING but the filesystem rename failed (ops remain PENDING, prior artifact preserved as COMPLETED) |
+| `DB_FINALIZE_ERROR` | Rename succeeded but post-rename DB finalization failed atomically; ops remain PENDING, prior artifact remains COMPLETED |
 
 ---
 
