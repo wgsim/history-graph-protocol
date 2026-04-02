@@ -873,7 +873,7 @@ Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, 
 
 ### Description
 
-Deletes a file and records an `invalidation` operation in HGP. Optionally marks a previous operation as `INVALIDATED`. The DB record is committed as `PENDING` before the filesystem unlink; the op is finalized to `COMPLETED` only after the unlink succeeds. If `previous_op_id` is supplied and does not exist in HGP, the tool returns an error and the file is not deleted. If the unlink fails, `FILESYSTEM_ERROR` is returned (op remains `PENDING`, file is untouched).
+Deletes a file and records an `invalidation` operation in HGP. Optionally marks a previous operation as `INVALIDATED`. Two-phase model: the invalidation op is committed to DB as `PENDING` (with an edge to `previous_op_id` if supplied, but **without** yet changing its status) before the filesystem unlink; only after a successful unlink is the op finalized to `COMPLETED` and `previous_op_id` marked `INVALIDATED`. If the unlink fails, `FILESYSTEM_ERROR` is returned, the op remains `PENDING`, the file is untouched, and the prior artifact is preserved as `COMPLETED`.
 
 ### Parameters
 
@@ -918,11 +918,13 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 
 ### Description
 
-Moves or renames a file. In a single DB transaction:
-1. Inserts an `invalidation` op for `old_path` (recording the move event in old-path history).
-2. Inserts an `artifact` op for `new_path` causally linked to the invalidation op.
+Moves or renames a file using a three-phase model:
 
-The filesystem rename happens **after** the DB transaction commits. If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked op for `old_path` and uses it as the invalidation target. Calling `hgp_file_history(old_path)` after a successful move will always show the move event.
+1. **DB transaction (PENDING):** inserts an invalidation op for `old_path` with an edge to the prior artifact (but does **not** yet change the prior artifact's status), then inserts an artifact op for `new_path` causally linked to the invalidation op. Both ops are committed as `PENDING`.
+2. **Filesystem rename:** `old_path` is renamed to `new_path`. If this fails, `FILESYSTEM_ERROR` is returned, both ops remain `PENDING`, and the prior old-path artifact is preserved as `COMPLETED`.
+3. **Finalize:** on rename success, the prior old-path artifact is marked `INVALIDATED` and both new ops are finalized to `COMPLETED`.
+
+If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked op for `old_path`. Calling `hgp_file_history(old_path)` after a successful move will always show the invalidation event.
 
 ### Parameters
 

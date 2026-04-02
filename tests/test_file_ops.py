@@ -497,6 +497,51 @@ def test_move_file_fs_failure_returns_error(project, monkeypatch):
     assert not dst.exists(), "destination must not exist after failed move"
 
 
+def test_delete_file_fs_failure_preserves_prior_op_status(project, monkeypatch):
+    """Failed delete must not leave the prior successful artifact as INVALIDATED."""
+    target = project / "prior_op_delete.txt"
+    target.write_text("data")
+    write_result = hgp_write_file(str(target), "data", "agent-1")
+    prior_op_id = write_result["op_id"]
+
+    def failing_unlink(self, *args, **kwargs):
+        raise OSError("permission denied")
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    result = hgp_delete_file(
+        str(target), "agent-1", previous_op_id=prior_op_id
+    )
+    assert "error" in result, f"expected error dict, got: {result}"
+
+    db = server_module._db
+    prior_op = db.get_operation(prior_op_id)
+    assert prior_op["status"] == "COMPLETED", (
+        f"prior artifact must remain COMPLETED after failed delete, got: {prior_op['status']}"
+    )
+
+
+def test_move_file_fs_failure_preserves_prior_op_status(project, monkeypatch):
+    """Failed move must not leave the prior old-path artifact as INVALIDATED."""
+    src = project / "prior_op_src.py"
+    dst = project / "prior_op_dst.py"
+    src.write_text("content")
+    write_result = hgp_write_file(str(src), "content", "agent-1")
+    prior_op_id = write_result["op_id"]
+
+    def failing_rename(self, *args, **kwargs):
+        raise OSError("cross-device link")
+    monkeypatch.setattr(Path, "rename", failing_rename)
+
+    result = hgp_move_file(str(src), str(dst), "agent-1")
+    assert "error" in result, f"expected error dict, got: {result}"
+
+    db = server_module._db
+    prior_op = db.get_operation(prior_op_id)
+    assert prior_op["status"] == "COMPLETED", (
+        f"prior artifact must remain COMPLETED after failed move, got: {prior_op['status']}"
+    )
+
+
 # ── Schema lock tests for file-tool response shapes ───────────────────────────
 
 def test_write_file_response_schema(project):

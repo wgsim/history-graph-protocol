@@ -726,8 +726,8 @@ def hgp_delete_file(
             status="PENDING",
         )
         if previous_op_id:
+            # Edge records intent; status update deferred until after unlink() succeeds.
             db.insert_edge(op_id, previous_op_id, "invalidates")
-            db.update_operation_status(previous_op_id, "INVALIDATED")
         final_hash = compute_chain_hash(db, op_id)
         db.execute(
             "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
@@ -746,6 +746,9 @@ def hgp_delete_file(
     except OSError as exc:
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": op_id}
 
+    # Filesystem unlink succeeded — safe to mark the prior op as invalidated.
+    if previous_op_id:
+        db.update_operation_status(previous_op_id, "INVALIDATED")
     db.finalize_operation(op_id)
     return {
         "op_id": op_id,
@@ -820,8 +823,8 @@ def hgp_move_file(
             status="PENDING",
         )
         if resolved_previous_op_id:
+            # Edge records intent; status update deferred until after rename() succeeds.
             db.insert_edge(inv_op_id, resolved_previous_op_id, "invalidates")
-            db.update_operation_status(resolved_previous_op_id, "INVALIDATED")
         inv_hash = compute_chain_hash(db, inv_op_id)
         db.execute("UPDATE operations SET chain_hash = ? WHERE op_id = ?", (inv_hash, inv_op_id))
 
@@ -864,6 +867,9 @@ def hgp_move_file(
     except OSError as exc:
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": op_id}
 
+    # Rename succeeded — safe to mark the prior old-path artifact as invalidated.
+    if resolved_previous_op_id:
+        db.update_operation_status(resolved_previous_op_id, "INVALIDATED")
     db.finalize_operation(inv_op_id)
     db.finalize_operation(op_id)
     return {
