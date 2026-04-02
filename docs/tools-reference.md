@@ -762,7 +762,7 @@ Response:
 
 ### Description
 
-Creates or overwrites a file and records the result as an `artifact` operation in HGP. HGP recording (CAS store + DB insert) is committed **before** the filesystem write, so the on-disk file is only created/overwritten if the HGP insert succeeds. File paths are canonicalized (symlinks resolved, `.`/`..` normalized) before storage, so the same file always maps to one history entry regardless of how the path was expressed.
+Creates or overwrites a file and records the result as an `artifact` operation in HGP. Two-phase commit model: the HGP op is first committed to DB as `PENDING` (CAS store + DB insert), then the filesystem write is attempted, and only on success is the op finalized to `COMPLETED`. If the filesystem write fails, the tool returns a `FILESYSTEM_ERROR` and the op remains `PENDING` (visible but not complete). File paths are canonicalized (symlinks resolved, `.`/`..` normalized) before storage, so the same file always maps to one history entry regardless of how the path was expressed.
 
 ### Parameters
 
@@ -778,8 +778,22 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 ### Returns
 
 ```json
-{"op_id": "op-..."}
+{
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42,
+  "object_hash": "sha256:...",
+  "chain_hash": "sha256:..."
+}
 ```
+
+| Field | Description |
+|-------|-------------|
+| `op_id` | Unique identifier assigned to the new artifact operation |
+| `status` | `"COMPLETED"` when the filesystem write succeeded |
+| `commit_seq` | Monotonically increasing sequence number of this commit |
+| `object_hash` | SHA-256 hash of the stored content blob |
+| `chain_hash` | Chain hash of the subgraph after this operation |
 
 ### Error Codes
 
@@ -789,6 +803,7 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `PARENT_NOT_FOUND` | A `parent_op_ids` entry does not exist |
 | `INVALID_EVIDENCE_REF` | An `evidence_refs` entry failed validation |
+| `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem write failed (op remains PENDING) |
 
 ---
 
@@ -796,7 +811,7 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 
 ### Description
 
-Appends content to a file (creates it if it does not exist) and records the result as an `artifact` operation in HGP. The combined content (existing + appended) is committed to CAS and DB before the filesystem write, providing the same atomicity guarantee as `hgp_write_file`.
+Appends content to a file (creates it if it does not exist) and records the result as an `artifact` operation in HGP. The combined content (existing + appended) is computed in memory and committed to CAS and DB as `PENDING` before the filesystem write. The op is finalized to `COMPLETED` only after the append succeeds. Uses the same two-phase commit model as `hgp_write_file`.
 
 ### Parameters
 
@@ -811,13 +826,11 @@ Appends content to a file (creates it if it does not exist) and records the resu
 
 ### Returns
 
-```json
-{"op_id": "op-..."}
-```
+Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, `chain_hash`.
 
 ### Error Codes
 
-Same as `hgp_write_file`.
+Same as `hgp_write_file` (including `FILESYSTEM_ERROR`).
 
 ---
 
@@ -825,7 +838,7 @@ Same as `hgp_write_file`.
 
 ### Description
 
-Replaces the first (and only) occurrence of `old_string` with `new_string` in a file and records the result as an `artifact` operation. The replacement is computed in memory, committed to CAS and DB, and only then written to disk. If HGP recording fails, the original file content is preserved.
+Replaces the first (and only) occurrence of `old_string` with `new_string` in a file and records the result as an `artifact` operation. The replacement is computed in memory, committed to CAS and DB as `PENDING`, and only then written to disk. The op is finalized to `COMPLETED` only after the disk write succeeds. If the disk write fails, the original file content is preserved and a `FILESYSTEM_ERROR` is returned. Uses the same two-phase commit model as `hgp_write_file`.
 
 ### Parameters
 
@@ -841,9 +854,7 @@ Replaces the first (and only) occurrence of `old_string` with `new_string` in a 
 
 ### Returns
 
-```json
-{"op_id": "op-..."}
-```
+Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, `chain_hash`.
 
 ### Error Codes
 
@@ -854,6 +865,7 @@ Replaces the first (and only) occurrence of `old_string` with `new_string` in a 
 | `AMBIGUOUS_MATCH` | `old_string` found more than once |
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem write failed (op remains PENDING) |
 
 ---
 
@@ -861,7 +873,7 @@ Replaces the first (and only) occurrence of `old_string` with `new_string` in a 
 
 ### Description
 
-Deletes a file and records an `invalidation` operation in HGP. Optionally marks a previous operation as `INVALIDATED`. The DB record is committed before the filesystem unlink. If `previous_op_id` is supplied and does not exist in HGP, the tool returns an error and the file is not deleted.
+Deletes a file and records an `invalidation` operation in HGP. Optionally marks a previous operation as `INVALIDATED`. The DB record is committed as `PENDING` before the filesystem unlink; the op is finalized to `COMPLETED` only after the unlink succeeds. If `previous_op_id` is supplied and does not exist in HGP, the tool returns an error and the file is not deleted. If the unlink fails, `FILESYSTEM_ERROR` is returned (op remains `PENDING`, file is untouched).
 
 ### Parameters
 
@@ -875,8 +887,20 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 ### Returns
 
 ```json
-{"op_id": "op-..."}
+{
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42,
+  "chain_hash": "sha256:..."
+}
 ```
+
+| Field | Description |
+|-------|-------------|
+| `op_id` | Unique identifier assigned to the invalidation operation |
+| `status` | `"COMPLETED"` when the filesystem unlink succeeded |
+| `commit_seq` | Monotonically increasing sequence number of this commit |
+| `chain_hash` | Chain hash of the subgraph after this operation |
 
 ### Error Codes
 
@@ -886,6 +910,7 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
+| `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem unlink failed (op remains PENDING, file preserved) |
 
 ---
 

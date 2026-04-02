@@ -476,8 +476,13 @@ def _record_file_op(
     reason: str,
     parent_op_ids: list[str] | None,
     evidence_refs: list[dict[str, Any]] | None,
+    initial_status: str = "PENDING",
 ) -> dict[str, Any]:
-    """Store content in CAS and insert an artifact operation. Returns {op_id}."""
+    """Store content in CAS and insert an artifact operation. Returns {op_id}.
+
+    When initial_status='PENDING' the caller is responsible for calling
+    db.finalize_operation(op_id) after the filesystem side effect succeeds.
+    """
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
         if len(evidence_refs) > _MAX_EVIDENCE_REFS:
@@ -505,6 +510,7 @@ def _record_file_op(
             object_hash=object_hash,
             metadata=metadata,
             file_path=file_path,
+            status=initial_status,
         )
         for pid in (parent_op_ids or []):
             db.insert_edge(op_id, pid, "causal")
@@ -532,7 +538,7 @@ def _record_file_op(
 
     return {
         "op_id": op_id,
-        "status": "COMPLETED",
+        "status": initial_status,
         "commit_seq": seq,
         "object_hash": object_hash,
         "chain_hash": final_hash,
@@ -567,10 +573,17 @@ def hgp_write_file(
         reason=effective_reason,
         parent_op_ids=parent_op_ids,
         evidence_refs=evidence_refs,
+        initial_status="PENDING",
     )
     if "error" in result:
         return result
-    path.write_text(content, encoding="utf-8")
+    try:
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    db, _, _, _ = _get_components()
+    db.finalize_operation(result["op_id"])
+    result["status"] = "COMPLETED"
     return result
 
 
@@ -604,12 +617,19 @@ def hgp_append_file(
         reason=effective_reason,
         parent_op_ids=parent_op_ids,
         evidence_refs=evidence_refs,
+        initial_status="PENDING",
     )
     if "error" in result:
         return result
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(content)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(content)
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    db, _, _, _ = _get_components()
+    db.finalize_operation(result["op_id"])
+    result["status"] = "COMPLETED"
     return result
 
 
@@ -652,10 +672,17 @@ def hgp_edit_file(
         reason=effective_reason,
         parent_op_ids=parent_op_ids,
         evidence_refs=evidence_refs,
+        initial_status="PENDING",
     )
     if "error" in result:
         return result
-    path.write_text(updated, encoding="utf-8")
+    try:
+        path.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    db, _, _, _ = _get_components()
+    db.finalize_operation(result["op_id"])
+    result["status"] = "COMPLETED"
     return result
 
 
@@ -696,6 +723,7 @@ def hgp_delete_file(
             op_id=op_id, op_type="invalidation", agent_id=agent_id,
             commit_seq=seq, chain_hash="sha256:pending",
             metadata=metadata, file_path=canonical,
+            status="PENDING",
         )
         if previous_op_id:
             db.insert_edge(op_id, previous_op_id, "invalidates")
@@ -716,8 +744,9 @@ def hgp_delete_file(
     try:
         path.unlink()
     except OSError as exc:
-        _log.error("DB record committed but file delete failed for %s: %s", file_path, exc)
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": op_id}
 
+    db.finalize_operation(op_id)
     return {
         "op_id": op_id,
         "status": "COMPLETED",
@@ -788,6 +817,7 @@ def hgp_move_file(
             op_id=inv_op_id, op_type="invalidation", agent_id=agent_id,
             commit_seq=db.next_commit_seq(), chain_hash="sha256:pending",
             metadata=inv_metadata, file_path=canonical_old,
+            status="PENDING",
         )
         if resolved_previous_op_id:
             db.insert_edge(inv_op_id, resolved_previous_op_id, "invalidates")
@@ -803,6 +833,7 @@ def hgp_move_file(
             op_id=op_id, op_type="artifact", agent_id=agent_id,
             commit_seq=seq, chain_hash="sha256:pending",
             object_hash=object_hash, metadata=metadata, file_path=canonical_new,
+            status="PENDING",
         )
         db.insert_edge(op_id, inv_op_id, "causal")
         if parsed_refs:
@@ -827,9 +858,14 @@ def hgp_move_file(
             _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
         raise
 
-    # Filesystem rename happens AFTER DB commit
-    src.rename(dst)
+    # Filesystem rename happens AFTER DB commit; finalize both ops only on success.
+    try:
+        src.rename(dst)
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": op_id}
 
+    db.finalize_operation(inv_op_id)
+    db.finalize_operation(op_id)
     return {
         "invalidation_op_id": inv_op_id,
         "op_id": op_id,

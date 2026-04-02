@@ -413,3 +413,126 @@ def test_move_file_without_previous_op_id_shows_old_path_history(project):
     assert "invalidation" in op_types, (
         f"old path history must include an invalidation event after move; got {op_types}"
     )
+
+
+# ── Follow-up review: Post-commit filesystem failure regression tests ─────────
+
+def test_write_file_fs_failure_returns_error(project, monkeypatch):
+    """If write_text raises after HGP commit, tool must return an error dict, not COMPLETED."""
+    target = project / "write_fail.txt"
+
+    def failing_write_text(self, *args, **kwargs):
+        raise OSError("disk full")
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    result = hgp_write_file(str(target), "content", "agent-1")
+    assert "error" in result, f"expected error dict, got: {result}"
+    assert result.get("status") != "COMPLETED"
+    assert not target.exists()
+
+
+def test_append_file_fs_failure_returns_error(project, monkeypatch):
+    """If the append write raises after HGP commit, tool must return an error dict."""
+    target = project / "append_fail.txt"
+    target.write_text("original")
+
+    original_open = Path.open
+    def failing_open(self, mode="r", **kwargs):
+        if "a" in str(mode):
+            raise OSError("disk full")
+        return original_open(self, mode, **kwargs)
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    result = hgp_append_file(str(target), " extra", "agent-1")
+    assert "error" in result, f"expected error dict, got: {result}"
+    assert result.get("status") != "COMPLETED"
+    assert target.read_text() == "original"
+
+
+def test_edit_file_fs_failure_returns_error(project, monkeypatch):
+    """If write_text raises after HGP commit for edit, tool must return an error dict."""
+    target = project / "edit_fail.txt"
+    target.write_text("old content")
+
+    def failing_write_text(self, data, *args, **kwargs):
+        raise OSError("disk full")
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    result = hgp_edit_file(str(target), "old content", "new content", "agent-1")
+    assert "error" in result, f"expected error dict, got: {result}"
+    assert result.get("status") != "COMPLETED"
+    assert target.read_text("utf-8") == "old content"
+
+
+def test_delete_file_fs_failure_returns_error(project, monkeypatch):
+    """If unlink raises after HGP commit, tool must return error, not silent COMPLETED."""
+    target = project / "delete_fail.txt"
+    target.write_text("keep me")
+
+    def failing_unlink(self, *args, **kwargs):
+        raise OSError("permission denied")
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    result = hgp_delete_file(str(target), "agent-1")
+    assert "error" in result, f"expected error dict, got: {result}"
+    assert result.get("status") != "COMPLETED"
+    assert target.exists(), "file must still exist after failed delete"
+
+
+def test_move_file_fs_failure_returns_error(project, monkeypatch):
+    """If rename raises after HGP commit, tool must return error, not silent COMPLETED."""
+    src = project / "move_fail_src.py"
+    dst = project / "move_fail_dst.py"
+    src.write_text("content")
+    hgp_write_file(str(src), "content", "agent-1")
+
+    def failing_rename(self, *args, **kwargs):
+        raise OSError("cross-device link")
+    monkeypatch.setattr(Path, "rename", failing_rename)
+
+    result = hgp_move_file(str(src), str(dst), "agent-1")
+    assert "error" in result, f"expected error dict, got: {result}"
+    assert result.get("status") != "COMPLETED"
+    assert src.exists(), "source must still exist after failed move"
+    assert not dst.exists(), "destination must not exist after failed move"
+
+
+# ── Schema lock tests for file-tool response shapes ───────────────────────────
+
+def test_write_file_response_schema(project):
+    """hgp_write_file must return the full enriched schema on success."""
+    target = project / "schema_write.txt"
+    result = hgp_write_file(str(target), "content", "agent-1")
+    assert {"op_id", "status", "commit_seq", "object_hash", "chain_hash"}.issubset(result.keys())
+    assert result["status"] == "COMPLETED"
+    assert isinstance(result["commit_seq"], int)
+    assert result["object_hash"].startswith("sha256:")
+    assert result["chain_hash"].startswith("sha256:")
+
+
+def test_append_file_response_schema(project):
+    """hgp_append_file must return the full enriched schema on success."""
+    target = project / "schema_append.txt"
+    result = hgp_append_file(str(target), "line\n", "agent-1")
+    assert {"op_id", "status", "commit_seq", "object_hash", "chain_hash"}.issubset(result.keys())
+    assert result["status"] == "COMPLETED"
+
+
+def test_edit_file_response_schema(project):
+    """hgp_edit_file must return the full enriched schema on success."""
+    target = project / "schema_edit.txt"
+    target.write_text("old")
+    hgp_write_file(str(target), "old", "agent-1")
+    result = hgp_edit_file(str(target), "old", "new", "agent-1")
+    assert {"op_id", "status", "commit_seq", "object_hash", "chain_hash"}.issubset(result.keys())
+    assert result["status"] == "COMPLETED"
+
+
+def test_delete_file_response_schema(project):
+    """hgp_delete_file must return op_id, status, commit_seq, chain_hash on success."""
+    target = project / "schema_delete.txt"
+    target.write_text("bye")
+    result = hgp_delete_file(str(target), "agent-1")
+    assert {"op_id", "status", "commit_seq", "chain_hash"}.issubset(result.keys())
+    assert result["status"] == "COMPLETED"
+    assert "object_hash" not in result  # invalidation ops have no content blob

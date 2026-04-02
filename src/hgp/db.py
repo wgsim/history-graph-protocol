@@ -215,6 +215,7 @@ class Database:
         metadata: str | None = None,
         mime_type: str | None = None,
         file_path: str | None = None,
+        status: str = "COMPLETED",
     ) -> None:
         assert self._conn
         # Insert into objects FIRST to satisfy the FK constraint on operations.object_hash
@@ -226,10 +227,29 @@ class Database:
         self._conn.execute(
             """
             INSERT INTO operations
-                (op_id, op_type, status, commit_seq, agent_id, object_hash, chain_hash, metadata, completed_at, file_path)
-            VALUES (?, ?, 'COMPLETED', ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)
+                (op_id, op_type, status, commit_seq, agent_id,
+                 object_hash, chain_hash, metadata, completed_at, file_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                CASE WHEN ? = 'COMPLETED'
+                     THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     ELSE NULL END,
+                ?)
             """,
-            (op_id, op_type, commit_seq, agent_id, object_hash, chain_hash, metadata, file_path),
+            (
+                op_id, op_type, status, commit_seq, agent_id,
+                object_hash, chain_hash, metadata, status, file_path,
+            ),
+        )
+
+    def finalize_operation(self, op_id: str) -> None:
+        """Set status to COMPLETED and record completed_at (auto-committed in autocommit mode)."""
+        assert self._conn
+        self._conn.execute(
+            "UPDATE operations"
+            " SET status = 'COMPLETED',"
+            "     completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+            " WHERE op_id = ?",
+            (op_id,),
         )
 
     def get_operation(self, op_id: str) -> dict[str, Any] | None:
