@@ -804,6 +804,7 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 | `PARENT_NOT_FOUND` | A `parent_op_ids` entry does not exist |
 | `INVALID_EVIDENCE_REF` | An `evidence_refs` entry failed validation |
 | `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem write failed (op remains PENDING) |
+| `DB_FINALIZE_ERROR` | Filesystem write succeeded but post-write DB finalization failed; op remains PENDING, file has new content |
 
 ---
 
@@ -830,7 +831,7 @@ Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, 
 
 ### Error Codes
 
-Same as `hgp_write_file` (including `FILESYSTEM_ERROR`).
+Same as `hgp_write_file` (including `FILESYSTEM_ERROR` and `DB_FINALIZE_ERROR`).
 
 ---
 
@@ -866,6 +867,7 @@ Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, 
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem write failed (op remains PENDING) |
+| `DB_FINALIZE_ERROR` | Filesystem write succeeded but post-write DB finalization failed; op remains PENDING, file has new content |
 
 ---
 

@@ -582,7 +582,10 @@ def hgp_write_file(
     except OSError as exc:
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
     db, _, _, _ = _get_components()
-    db.finalize_operation(result["op_id"])
+    try:
+        db.finalize_operation(result["op_id"])
+    except Exception as exc:
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
     return result
 
@@ -628,7 +631,10 @@ def hgp_append_file(
     except OSError as exc:
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
     db, _, _, _ = _get_components()
-    db.finalize_operation(result["op_id"])
+    try:
+        db.finalize_operation(result["op_id"])
+    except Exception as exc:
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
     return result
 
@@ -681,7 +687,10 @@ def hgp_edit_file(
     except OSError as exc:
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
     db, _, _, _ = _get_components()
-    db.finalize_operation(result["op_id"])
+    try:
+        db.finalize_operation(result["op_id"])
+    except Exception as exc:
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
     return result
 

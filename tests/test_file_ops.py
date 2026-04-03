@@ -626,3 +626,83 @@ def test_delete_file_response_schema(project):
     assert {"op_id", "status", "commit_seq", "chain_hash"}.issubset(result.keys())
     assert result["status"] == "COMPLETED"
     assert "object_hash" not in result  # invalidation ops have no content blob
+
+
+# ── Post-filesystem finalization failure tests (write/append/edit) ─────────────
+
+def test_write_file_finalize_failure_returns_structured_error(project, monkeypatch):
+    """If post-write DB finalization fails, tool returns structured error (not exception)."""
+    target = project / "write_finalize_fail.txt"
+
+    db = server_module._db
+
+    def failing_finalize(op_id):
+        raise RuntimeError("simulated finalize failure")
+    monkeypatch.setattr(db, "finalize_operation", failing_finalize)
+
+    result = hgp_write_file(str(target), "hello", "agent-1")
+
+    # Tool must return a structured error dict, not raise
+    assert "error" in result, f"expected error dict, got: {result}"
+    assert result["error"] == "DB_FINALIZE_ERROR"
+    assert "op_id" in result
+
+    # Filesystem write already happened
+    assert target.exists() and target.read_text() == "hello"
+
+    # New op must remain PENDING (not finalized)
+    op = db.get_operation(result["op_id"])
+    assert op["status"] == "PENDING"
+
+
+def test_append_file_finalize_failure_returns_structured_error(project, monkeypatch):
+    """If post-append DB finalization fails, tool returns structured error (not exception)."""
+    target = project / "append_finalize_fail.txt"
+    target.write_text("orig")
+    # Establish a COMPLETED prior op so the file is tracked
+    hgp_write_file(str(target), "orig", "agent-1")
+
+    db = server_module._db
+
+    def failing_finalize(op_id):
+        raise RuntimeError("simulated finalize failure")
+    monkeypatch.setattr(db, "finalize_operation", failing_finalize)
+
+    result = hgp_append_file(str(target), " plus", "agent-1")
+
+    assert "error" in result, f"expected error dict, got: {result}"
+    assert result["error"] == "DB_FINALIZE_ERROR"
+    assert "op_id" in result
+
+    # Filesystem append already happened
+    assert target.read_text() == "orig plus"
+
+    # New op must remain PENDING
+    op = db.get_operation(result["op_id"])
+    assert op["status"] == "PENDING"
+
+
+def test_edit_file_finalize_failure_returns_structured_error(project, monkeypatch):
+    """If post-edit DB finalization fails, tool returns structured error (not exception)."""
+    target = project / "edit_finalize_fail.txt"
+    target.write_text("old")
+    hgp_write_file(str(target), "old", "agent-1")
+
+    db = server_module._db
+
+    def failing_finalize(op_id):
+        raise RuntimeError("simulated finalize failure")
+    monkeypatch.setattr(db, "finalize_operation", failing_finalize)
+
+    result = hgp_edit_file(str(target), "old", "new", "agent-1")
+
+    assert "error" in result, f"expected error dict, got: {result}"
+    assert result["error"] == "DB_FINALIZE_ERROR"
+    assert "op_id" in result
+
+    # Filesystem edit already happened
+    assert target.read_text() == "new"
+
+    # New op must remain PENDING
+    op = db.get_operation(result["op_id"])
+    assert op["status"] == "PENDING"
