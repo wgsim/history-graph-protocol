@@ -321,6 +321,15 @@ class Database:
             (child_op_id, parent_op_id, edge_type),
         )
 
+    def get_invalidated_targets(self, op_id: str) -> list[str]:
+        """Return op_ids that op_id invalidates (parent_op_ids on invalidates edges)."""
+        assert self._conn
+        rows = self._conn.execute(
+            "SELECT parent_op_id FROM op_edges WHERE child_op_id = ? AND edge_type = 'invalidates'",
+            (op_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
+
     def commit(self) -> None:
         assert self._conn
         try:

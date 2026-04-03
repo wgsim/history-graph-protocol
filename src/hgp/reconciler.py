@@ -115,6 +115,8 @@ class Reconciler:
                 if file_gone:
                     if not dry_run:
                         self._db.finalize_operation(op_id)
+                        for target_id in self._db.get_invalidated_targets(op_id):
+                            self._db.update_operation_status(target_id, "INVALIDATED")
                     report.pending_recovered += 1
                 else:
                     if not dry_run:

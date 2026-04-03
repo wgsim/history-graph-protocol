@@ -336,6 +336,85 @@ def test_rule5_pending_move_pair_both_recovered(hgp_dirs: dict):
     assert db.get_operation(art_id)["status"] == "COMPLETED"
 
 
+def _insert_completed_artifact(db, cas, file_path: str, content: bytes) -> str:
+    """Helper: insert a COMPLETED artifact op (simulates a prior successful write)."""
+    obj_hash = cas.store(content)
+    db.begin_immediate()
+    seq = db.next_commit_seq()
+    op_id = f"completed-artifact-{seq}"
+    db.insert_operation(
+        op_id=op_id, op_type="artifact", agent_id="agent-test",
+        commit_seq=seq, chain_hash="sha256:" + "e" * 64,
+        object_hash=obj_hash, file_path=file_path,
+    )
+    db.commit()
+    return op_id
+
+
+def _insert_stale_pending_invalidation_linked(db, file_path: str, prior_op_id: str) -> str:
+    """Helper: insert a PENDING invalidation with an invalidates edge to prior_op_id."""
+    db.begin_immediate()
+    seq = db.next_commit_seq()
+    op_id = f"pending-inv-linked-{seq}"
+    db.insert_operation(
+        op_id=op_id, op_type="invalidation", agent_id="agent-test",
+        commit_seq=seq, chain_hash="sha256:" + "f" * 64,
+        file_path=file_path, status="PENDING",
+    )
+    db.insert_edge(op_id, prior_op_id, "invalidates")
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    db.execute("UPDATE operations SET created_at = ? WHERE op_id = ?", (old_ts, op_id))
+    db.commit()
+    return op_id
+
+
+# ── Rule 5: invalidation recovery propagates INVALIDATED to prior artifact ────
+
+
+def test_rule5_delete_recovery_invalidates_prior_artifact(hgp_dirs: dict):
+    """Recovered PENDING invalidation (delete) must also mark the prior artifact INVALIDATED."""
+    db, cas, rec = _setup(hgp_dirs)
+    content = b"to be deleted"
+    target = hgp_dirs["root"] / "victim.txt"
+    target.write_bytes(content)
+
+    prior_id = _insert_completed_artifact(db, cas, str(target), content)
+    # Simulate delete having succeeded on disk but DB_FINALIZE_ERROR on the invalidation
+    target.unlink()
+    inv_id = _insert_stale_pending_invalidation_linked(db, str(target), prior_id)
+
+    report = rec.reconcile()
+
+    assert report.pending_recovered == 1
+    assert db.get_operation(inv_id)["status"] == "COMPLETED"
+    assert db.get_operation(prior_id)["status"] == "INVALIDATED", (
+        "Prior artifact must be INVALIDATED when its delete invalidation is recovered"
+    )
+
+
+def test_rule5_move_recovery_invalidates_prior_artifact(hgp_dirs: dict):
+    """Recovered PENDING move (invalidation+artifact pair) must mark the prior old-path artifact INVALIDATED."""
+    db, cas, rec = _setup(hgp_dirs)
+    content = b"moving content"
+    old_path = hgp_dirs["root"] / "move_src.txt"
+    new_path = hgp_dirs["root"] / "move_dst.txt"
+    new_path.write_bytes(content)  # move succeeded on disk
+    # old_path does not exist
+
+    prior_id = _insert_completed_artifact(db, cas, str(old_path), content)
+    inv_id = _insert_stale_pending_invalidation_linked(db, str(old_path), prior_id)
+    art_id = _insert_stale_pending_artifact(db, cas, str(new_path), content)
+
+    report = rec.reconcile()
+
+    assert report.pending_recovered == 2
+    assert db.get_operation(inv_id)["status"] == "COMPLETED"
+    assert db.get_operation(art_id)["status"] == "COMPLETED"
+    assert db.get_operation(prior_id)["status"] == "INVALIDATED", (
+        "Prior old-path artifact must be INVALIDATED after move recovery"
+    )
+
+
 def test_rule5_pending_move_pair_both_stale(hgp_dirs: dict):
     """Move failed: file still at old path, nothing at new path → both STALE_PENDING."""
     db, cas, rec = _setup(hgp_dirs)
