@@ -158,6 +158,41 @@ def test_gemini_pre_bash_silent_on_readonly():
     assert result.stdout.strip() == ""
 
 
+def test_pre_bash_detects_git_checkout():
+    """git checkout (branch switch) triggers a warning — rewrites working tree."""
+    result = _run_hook(_PRE_HOOK, _bash_event("git checkout some-branch"))
+    assert result.returncode == 0
+    assert "[HGP]" in result.stderr
+
+
+def test_pre_bash_detects_git_restore():
+    """git restore (file restore) triggers a warning — overwrites tracked files."""
+    result = _run_hook(_PRE_HOOK, _bash_event("git restore src/hgp/server.py"))
+    assert result.returncode == 0
+    assert "[HGP]" in result.stderr
+
+
+def test_pre_bash_detects_patch():
+    """patch command triggers a warning — applies diffs that modify files."""
+    result = _run_hook(_PRE_HOOK, _bash_event("patch -p1 < fix.diff"))
+    assert result.returncode == 0
+    assert "[HGP]" in result.stderr
+
+
+def test_pre_bash_git_status_still_silent():
+    """git status must remain silent even after adding new git mutating patterns."""
+    result = _run_hook(_PRE_HOOK, _bash_event("git status --porcelain"))
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_pre_bash_git_log_still_silent():
+    """git log must remain silent."""
+    result = _run_hook(_PRE_HOOK, _bash_event("git log --oneline -10"))
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
 def test_gemini_pre_bash_wrong_tool_name_ignored():
     """Gemini pre hook ignores events with tool_name != 'shell'."""
     result = _run_hook(_GEMINI_PRE_HOOK, {"tool_name": "Bash", "tool_input": {"command": "rm x"}})

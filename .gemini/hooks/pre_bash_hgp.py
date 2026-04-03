@@ -60,6 +60,17 @@ _HIGH_PATTERNS = [
     re.compile(r"\bchown\b"),
     re.compile(r"\bln\b"),
     re.compile(r"\btruncate\b"),
+    # git commands that rewrite working-tree files
+    re.compile(r"\bgit\s+checkout\b"),
+    re.compile(r"\bgit\s+restore\b"),
+    re.compile(r"\bgit\s+switch\b"),
+    re.compile(r"\bgit\s+apply\b"),
+    re.compile(r"\bgit\s+revert\b"),
+    re.compile(r"\bgit\s+merge\b"),
+    re.compile(r"\bgit\s+rebase\b"),
+    re.compile(r"\bgit\s+reset\b"),
+    # patch tools
+    re.compile(r"\bpatch\b"),
 ]
 
 _MEDIUM_PATTERNS = [

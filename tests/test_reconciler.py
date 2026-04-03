@@ -415,6 +415,41 @@ def test_rule5_move_recovery_invalidates_prior_artifact(hgp_dirs: dict):
     )
 
 
+# ── Rule 5: atomicity — partial DB failure must not leave contradictory state ─
+
+
+def test_rule5_invalidation_recovery_atomic_on_target_update_failure(hgp_dirs: dict, monkeypatch):
+    """If target INVALIDATED update fails after invalidation is finalized, the whole
+    recovery must be rolled back so no COMPLETED/COMPLETED contradiction remains."""
+    db, cas, rec = _setup(hgp_dirs)
+    content = b"atomic test"
+    target = hgp_dirs["root"] / "atomic_victim.txt"
+    target.write_bytes(content)
+
+    prior_id = _insert_completed_artifact(db, cas, str(target), content)
+    target.unlink()  # file gone — would normally recover
+    inv_id = _insert_stale_pending_invalidation_linked(db, str(target), prior_id)
+
+    original_update = db.update_operation_status
+
+    def _fail_on_invalidated(op_id: str, status: str) -> None:
+        if status == "INVALIDATED":
+            raise RuntimeError("simulated target-invalidation failure")
+        original_update(op_id, status)
+
+    monkeypatch.setattr(db, "update_operation_status", _fail_on_invalidated)
+
+    # reconcile must not crash, but must not leave contradictory state
+    rec.reconcile()
+
+    inv_status = db.get_operation(inv_id)["status"]
+    prior_status = db.get_operation(prior_id)["status"]
+    assert not (inv_status == "COMPLETED" and prior_status == "COMPLETED"), (
+        f"Contradiction: invalidation={inv_status}, prior={prior_status}; "
+        "recovery must be atomic — either both succeed or both remain unchanged"
+    )
+
+
 def test_rule5_pending_move_pair_both_stale(hgp_dirs: dict):
     """Move failed: file still at old path, nothing at new path → both STALE_PENDING."""
     db, cas, rec = _setup(hgp_dirs)
