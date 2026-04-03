@@ -1,6 +1,6 @@
 # HGP Tools Reference
 
-This document is the complete API reference for all 12 MCP tools exposed by the History Graph Protocol (HGP) server. Each tool is documented with its parameters, return values, error codes, and a minimal usage example. For setup and quick-start instructions, see the [README](../README.md).
+This document is the complete API reference for all 18 MCP tools exposed by the History Graph Protocol (HGP) server. Each tool is documented with its parameters, return values, error codes, and a minimal usage example. For setup and quick-start instructions, see the [README](../README.md).
 
 ---
 
@@ -18,7 +18,13 @@ This document is the complete API reference for all 12 MCP tools exposed by the 
 10. [hgp_reconcile](#hgp_reconcile)
 11. [hgp_get_evidence](#hgp_get_evidence)
 12. [hgp_get_citing_ops](#hgp_get_citing_ops)
-13. [Error Code Reference](#error-code-reference)
+13. [hgp_write_file](#hgp_write_file)
+14. [hgp_append_file](#hgp_append_file)
+15. [hgp_edit_file](#hgp_edit_file)
+16. [hgp_delete_file](#hgp_delete_file)
+17. [hgp_move_file](#hgp_move_file)
+18. [hgp_file_history](#hgp_file_history)
+19. [Error Code Reference](#error-code-reference)
 
 ---
 
@@ -130,10 +136,17 @@ Queries operation records by one or more filter criteria. When `op_id` is suppli
 | `since_commit_seq` | `integer` | No | `null` | Return only operations with `commit_seq` greater than this value |
 | `include_inactive` | `boolean` | No | `false` | Whether to include operations in the `inactive` memory tier |
 | `limit` | `integer` | No | `100` | Maximum number of results to return |
+| `file_path` | `string` | No | `null` | Filter to operations recorded for this file path (canonicalized before matching) |
 
 ### Returns
 
-A list of operation dicts. Detail level varies by `memory_tier`:
+**V4 breaking change:** the response is now a wrapper object `{"operations": [...]}`, not a bare list.
+
+```json
+{"operations": [...]}
+```
+
+Detail level of each operation dict varies by `memory_tier`:
 
 | Memory Tier | Fields Returned |
 |---|---|
@@ -160,16 +173,18 @@ Request:
 
 Response:
 ```json
-[
-  {
-    "op_id": "01HZ1234ABCD",
-    "op_type": "hypothesis",
-    "status": "COMPLETED",
-    "memory_tier": "short_term",
-    "agent_id": "analyst-1",
-    "commit_seq": 42
-  }
-]
+{
+  "operations": [
+    {
+      "op_id": "01HZ1234ABCD",
+      "op_type": "hypothesis",
+      "status": "COMPLETED",
+      "memory_tier": "short_term",
+      "agent_id": "analyst-1",
+      "commit_seq": 42
+    }
+  ]
+}
 ```
 
 ---
@@ -737,6 +752,260 @@ Response:
 
 ---
 
+## File Tracking Tools (V4)
+
+> **Prerequisites:** A project root must be discoverable — either via a `.git` directory in the file's ancestor directories, or via the `HGP_PROJECT_ROOT` environment variable. All file paths must be within the project root.
+
+---
+
+## hgp_write_file
+
+### Description
+
+Creates or overwrites a file and records the result as an `artifact` operation in HGP. Two-phase commit model: the HGP op is first committed to DB as `PENDING` (CAS store + DB insert), then the filesystem write is attempted, and only on success is the op finalized to `COMPLETED`. If the filesystem write fails, the tool returns a `FILESYSTEM_ERROR` and the op remains `PENDING` (visible but not complete). File paths are canonicalized (symlinks resolved, `.`/`..` normalized) before storage, so the same file always maps to one history entry regardless of how the path was expressed.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file to write (must be within project root) |
+| `content` | string | ✓ | UTF-8 content to write |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `reason` | string | | Human-readable reason for the write (default: `"CREATE <file_path>"`) |
+| `parent_op_ids` | string[] | | Op IDs this operation causally depends on |
+| `evidence_refs` | object[] | | Evidence citations (same schema as `hgp_create_operation`) |
+
+### Returns
+
+```json
+{
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42,
+  "object_hash": "sha256:...",
+  "chain_hash": "sha256:..."
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `op_id` | Unique identifier assigned to the new artifact operation |
+| `status` | `"COMPLETED"` when the filesystem write succeeded |
+| `commit_seq` | Monotonically increasing sequence number of this commit |
+| `object_hash` | SHA-256 hash of the stored content blob |
+| `chain_hash` | Chain hash of the subgraph after this operation |
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `PARENT_NOT_FOUND` | A `parent_op_ids` entry does not exist |
+| `INVALID_EVIDENCE_REF` | An `evidence_refs` entry failed validation |
+| `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem write failed (op remains PENDING) |
+| `DB_FINALIZE_ERROR` | Filesystem write succeeded but post-write DB finalization failed; op remains PENDING, file has new content |
+
+---
+
+## hgp_append_file
+
+### Description
+
+Appends content to a file (creates it if it does not exist) and records the result as an `artifact` operation in HGP. The combined content (existing + appended) is computed in memory and committed to CAS and DB as `PENDING` before the filesystem write. The op is finalized to `COMPLETED` only after the append succeeds. Uses the same two-phase commit model as `hgp_write_file`.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file to append to |
+| `content` | string | ✓ | UTF-8 content to append |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `reason` | string | | Human-readable reason (default: `"APPEND <file_path>"`) |
+| `parent_op_ids` | string[] | | Causal parent op IDs |
+| `evidence_refs` | object[] | | Evidence citations |
+
+### Returns
+
+Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, `chain_hash`.
+
+### Error Codes
+
+Same as `hgp_write_file` (including `FILESYSTEM_ERROR` and `DB_FINALIZE_ERROR`).
+
+---
+
+## hgp_edit_file
+
+### Description
+
+Replaces the first (and only) occurrence of `old_string` with `new_string` in a file and records the result as an `artifact` operation. The replacement is computed in memory, committed to CAS and DB as `PENDING`, and only then written to disk. The op is finalized to `COMPLETED` only after the disk write succeeds. If the disk write fails, the original file content is preserved and a `FILESYSTEM_ERROR` is returned. Uses the same two-phase commit model as `hgp_write_file`.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file to edit |
+| `old_string` | string | ✓ | Exact string to replace (must appear exactly once) |
+| `new_string` | string | ✓ | Replacement string |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `reason` | string | | Human-readable reason (default: `"MODIFY <file_path>"`) |
+| `parent_op_ids` | string[] | | Causal parent op IDs |
+| `evidence_refs` | object[] | | Evidence citations |
+
+### Returns
+
+Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, `chain_hash`.
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `FILE_NOT_FOUND` | `file_path` does not exist |
+| `STRING_NOT_FOUND` | `old_string` not found in file |
+| `AMBIGUOUS_MATCH` | `old_string` found more than once |
+| `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem write failed (op remains PENDING) |
+| `DB_FINALIZE_ERROR` | Filesystem write succeeded but post-write DB finalization failed; op remains PENDING, file has new content |
+
+---
+
+## hgp_delete_file
+
+### Description
+
+Deletes a file and records an `invalidation` operation in HGP. Optionally marks a previous operation as `INVALIDATED`. Two-phase model: the invalidation op is committed to DB as `PENDING` (with an edge to `previous_op_id` if supplied, but **without** yet changing its status) before the filesystem unlink; only after a successful unlink is the op finalized to `COMPLETED` and `previous_op_id` marked `INVALIDATED`. If the unlink fails, `FILESYSTEM_ERROR` is returned, the op remains `PENDING`, the file is untouched, and the prior artifact is preserved as `COMPLETED`.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file to delete |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `previous_op_id` | string | | Op ID of the last write/edit op for this file; will be marked INVALIDATED |
+| `reason` | string | | Human-readable reason (default: `"DELETE <file_path>"`) |
+
+### Returns
+
+```json
+{
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42,
+  "chain_hash": "sha256:..."
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `op_id` | Unique identifier assigned to the invalidation operation |
+| `status` | `"COMPLETED"` when the filesystem unlink succeeded |
+| `commit_seq` | Monotonically increasing sequence number of this commit |
+| `chain_hash` | Chain hash of the subgraph after this operation |
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `FILE_NOT_FOUND` | `file_path` does not exist |
+| `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
+| `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem unlink failed (op remains PENDING, file preserved) |
+| `DB_FINALIZE_ERROR` | Unlink succeeded but post-unlink DB finalization failed atomically; op remains PENDING, prior artifact remains COMPLETED |
+
+---
+
+## hgp_move_file
+
+### Description
+
+Moves or renames a file using a three-phase model:
+
+1. **DB transaction (PENDING):** inserts an invalidation op for `old_path` with an edge to the prior artifact (but does **not** yet change the prior artifact's status), then inserts an artifact op for `new_path` causally linked to the invalidation op. Both ops are committed as `PENDING`.
+2. **Filesystem rename:** `old_path` is renamed to `new_path`. If this fails, `FILESYSTEM_ERROR` is returned, both ops remain `PENDING`, and the prior old-path artifact is preserved as `COMPLETED`.
+3. **Finalize:** on rename success, the prior old-path artifact is marked `INVALIDATED` and both new ops are finalized to `COMPLETED`.
+
+If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked op for `old_path`. Calling `hgp_file_history(old_path)` after a successful move will always show the invalidation event.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `old_path` | string | ✓ | Source file path (must exist) |
+| `new_path` | string | ✓ | Destination file path |
+| `agent_id` | string | ✓ | Identifier of the calling agent |
+| `previous_op_id` | string | | Op ID of the last op for `old_path`; will be marked INVALIDATED. When omitted the tool auto-resolves the most recent tracked op for `old_path`. |
+| `reason` | string | | Human-readable reason (default: `"MOVE <old_path> → <new_path>"`) |
+| `evidence_refs` | object[] | | Evidence citations for the new artifact op |
+
+### Returns
+
+```json
+{
+  "invalidation_op_id": "op-...",
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42,
+  "object_hash": "sha256:...",
+  "chain_hash": "sha256:..."
+}
+```
+
+`invalidation_op_id` is the op recorded for `old_path`; `op_id` is the new artifact op for `new_path`.
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `FILE_NOT_FOUND` | `old_path` does not exist |
+| `PATH_OUTSIDE_ROOT` | `old_path` or `new_path` is outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
+| `FILESYSTEM_ERROR` | Both ops committed as PENDING but the filesystem rename failed (ops remain PENDING, prior artifact preserved as COMPLETED) |
+| `DB_FINALIZE_ERROR` | Rename succeeded but post-rename DB finalization failed atomically; ops remain PENDING, prior artifact remains COMPLETED |
+
+---
+
+## hgp_file_history
+
+### Description
+
+Returns the operation history for a given file path, ordered most-recent-first. Accessing history also updates memory tier access weights for the returned operations.
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file_path` | string | ✓ | Absolute path of the file |
+| `limit` | integer | | Maximum number of operations to return (default: 50) |
+
+### Returns
+
+```json
+{
+  "file_path": "/absolute/path/to/file.py",
+  "operations": [
+    {
+      "op_id": "op-...",
+      "op_type": "artifact",
+      "agent_id": "agent-1",
+      "file_path": "/absolute/path/to/file.py",
+      ...
+    }
+  ]
+}
+```
+
+Returns `{"file_path": "...", "operations": []}` when no operations exist for the path.
+
+### Error Codes
+
+None (unknown paths return empty list).
+
+---
+
 ## Error Code Reference
 
 The following table consolidates all error codes across all tools.
@@ -754,3 +1023,9 @@ The following table consolidates all error codes across all tools.
 | `NOT_FOUND` | `hgp_get_artifact` | No artifact exists for the given `object_hash` |
 | `INVALID_SHA` | `hgp_anchor_git` | `git_commit_sha` is not exactly 40 lowercase hex characters |
 | `DB_ERROR` | `hgp_get_evidence`, `hgp_get_citing_ops` | An internal database error occurred |
+| `FILE_NOT_FOUND` | `hgp_edit_file`, `hgp_delete_file`, `hgp_move_file` | The target file does not exist on disk |
+| `STRING_NOT_FOUND` | `hgp_edit_file` | `old_string` not found in file |
+| `AMBIGUOUS_MATCH` | `hgp_edit_file` | `old_string` appears more than once |
+| `PATH_OUTSIDE_ROOT` | V4 file tools | File path resolves outside the project root |
+| `PROJECT_ROOT_NOT_FOUND` | V4 file tools | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `INVALID_PARENT_OP_ID` | `hgp_delete_file`, `hgp_move_file` | `previous_op_id` supplied but does not exist in HGP |

@@ -29,6 +29,7 @@ from hgp.db import Database
 from hgp.errors import ChainStaleError, ParentNotFoundError
 from hgp.lease import LeaseManager
 from hgp.models import EvidenceRef
+from hgp.project import find_project_root, assert_within_root, canonical_file_path, ProjectRootError, PathOutsideRootError
 from hgp.reconciler import Reconciler
 
 # ── Server initialization ───────────────────────────────────
@@ -258,11 +259,11 @@ def hgp_query_operations(
     since_commit_seq: int | None = None,
     include_inactive: bool = False,
     limit: int = 100,
-) -> list[dict[str, Any]]:
+    file_path: str | None = None,
+) -> dict[str, Any]:
     """Query operations with optional filters. By default excludes inactive-tier ops; pass include_inactive=True to include them."""
     if status is not None and status not in _VALID_STATUSES:
         return {"error": "INVALID_STATUS", "message": f"status must be one of {sorted(_VALID_STATUSES)}"}
-
 
     db, _, _, _ = _get_components()
     if op_id:
@@ -277,12 +278,43 @@ def hgp_query_operations(
                     db.rollback()
                 except Exception:
                     pass
-        return [op] if op else []
-    return db.query_operations(
+        return {"operations": [op] if op else []}
+    # Canonicalize file_path filter so it matches stored canonical paths
+    canonical_fp = file_path
+    if file_path is not None:
+        try:
+            root = find_project_root(Path(file_path).parent)
+            canonical_fp = canonical_file_path(file_path, root)
+        except (ProjectRootError, PathOutsideRootError):
+            pass  # use raw path; will return empty results for out-of-root queries
+    ops = db.query_operations(
         status=status, agent_id=agent_id, op_type=op_type,
         since_commit_seq=since_commit_seq,
         include_inactive=include_inactive, limit=limit,
+        file_path=canonical_fp,
     )
+    return {"operations": ops}
+
+
+@mcp.tool()
+def hgp_file_history(
+    file_path: str,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Return operations recorded for a given file_path, most recent first."""
+    db, _, _, _ = _get_components()
+    # Canonicalize query path so it matches stored canonical paths
+    try:
+        root = find_project_root(Path(file_path).parent)
+        query_path = canonical_file_path(file_path, root)
+    except (ProjectRootError, PathOutsideRootError):
+        # Fall back to raw path for queries outside a project root (returns empty)
+        query_path = file_path
+    rows = db.get_ops_by_file_path(query_path, limit=limit)
+    ops = [dict(r) for r in rows]
+    # Use depth-based decay: most recent op (index 0) gets full weight, older ops decay.
+    _record_access_with_decay(db, [dict(op, depth=i) for i, op in enumerate(ops)])
+    return {"file_path": query_path, "operations": ops}
 
 
 @mcp.tool()
@@ -435,6 +467,446 @@ def hgp_get_citing_ops(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
     except sqlite3.Error as exc:
         _log.error("DB error in hgp_get_citing_ops op_id=%r: %s", op_id, exc, exc_info=True)
         return {"error": "DB_ERROR", "message": "Internal database error"}
+
+
+def _record_file_op(
+    file_path: str,
+    content_bytes: bytes,
+    agent_id: str,
+    reason: str,
+    parent_op_ids: list[str] | None,
+    evidence_refs: list[dict[str, Any]] | None,
+    initial_status: str = "PENDING",
+) -> dict[str, Any]:
+    """Store content in CAS and insert an artifact operation. Returns {op_id}.
+
+    When initial_status='PENDING' the caller is responsible for calling
+    db.finalize_operation(op_id) after the filesystem side effect succeeds.
+    """
+    parsed_refs: list[EvidenceRef] = []
+    if evidence_refs:
+        if len(evidence_refs) > _MAX_EVIDENCE_REFS:
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
+        try:
+            parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
+        except ValidationError as exc:
+            return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+
+    db, cas, _, _ = _get_components()
+
+    object_hash = cas.store(content_bytes)
+    op_id = str(uuid.uuid4())
+    metadata = json.dumps({"reason": reason})
+
+    db.begin_immediate()
+    try:
+        seq = db.next_commit_seq()
+        db.insert_operation(
+            op_id=op_id,
+            op_type="artifact",
+            agent_id=agent_id,
+            commit_seq=seq,
+            chain_hash="sha256:pending",
+            object_hash=object_hash,
+            metadata=metadata,
+            file_path=file_path,
+            status=initial_status,
+        )
+        for pid in (parent_op_ids or []):
+            db.insert_edge(op_id, pid, "causal")
+        if parsed_refs:
+            try:
+                db.insert_evidence(op_id, parsed_refs)
+            except ValueError as exc:
+                db.rollback()
+                return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+            except sqlite3.IntegrityError:
+                db.rollback()
+                return {"error": "DUPLICATE_EVIDENCE_REF", "message": "Evidence link already exists"}
+        final_hash = compute_chain_hash(db, op_id)
+        db.execute(
+            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
+            (final_hash, op_id),
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
+
+    return {
+        "op_id": op_id,
+        "status": initial_status,
+        "commit_seq": seq,
+        "object_hash": object_hash,
+        "chain_hash": final_hash,
+    }
+
+
+@mcp.tool()
+def hgp_write_file(
+    file_path: str,
+    content: str,
+    agent_id: str,
+    reason: str | None = None,
+    parent_op_ids: list[str] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write (create or overwrite) a file and record it as an artifact operation."""
+    try:
+        root = find_project_root(Path(file_path).parent)
+        canonical = canonical_file_path(file_path, root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    effective_reason = reason or f"CREATE {canonical}"
+    result = _record_file_op(
+        file_path=canonical,
+        content_bytes=content.encode("utf-8"),
+        agent_id=agent_id,
+        reason=effective_reason,
+        parent_op_ids=parent_op_ids,
+        evidence_refs=evidence_refs,
+        initial_status="PENDING",
+    )
+    if "error" in result:
+        return result
+    try:
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    db, _, _, _ = _get_components()
+    try:
+        db.finalize_operation(result["op_id"])
+    except Exception as exc:
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    result["status"] = "COMPLETED"
+    return result
+
+
+@mcp.tool()
+def hgp_append_file(
+    file_path: str,
+    content: str,
+    agent_id: str,
+    reason: str | None = None,
+    parent_op_ids: list[str] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Append content to a file (creates it if absent) and record as artifact."""
+    try:
+        root = find_project_root(Path(file_path).parent)
+        canonical = canonical_file_path(file_path, root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    path = Path(file_path)
+    # Compute post-append content in memory (no filesystem side effect yet)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    combined = existing + content
+    effective_reason = reason or f"APPEND {canonical}"
+    result = _record_file_op(
+        file_path=canonical,
+        content_bytes=combined.encode("utf-8"),
+        agent_id=agent_id,
+        reason=effective_reason,
+        parent_op_ids=parent_op_ids,
+        evidence_refs=evidence_refs,
+        initial_status="PENDING",
+    )
+    if "error" in result:
+        return result
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(content)
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    db, _, _, _ = _get_components()
+    try:
+        db.finalize_operation(result["op_id"])
+    except Exception as exc:
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    result["status"] = "COMPLETED"
+    return result
+
+
+@mcp.tool()
+def hgp_edit_file(
+    file_path: str,
+    old_string: str,
+    new_string: str,
+    agent_id: str,
+    reason: str | None = None,
+    parent_op_ids: list[str] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Replace the first (and only) occurrence of old_string with new_string."""
+    try:
+        root = find_project_root(Path(file_path).parent)
+        canonical = canonical_file_path(file_path, root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    path = Path(file_path)
+    if not path.exists():
+        return {"error": "FILE_NOT_FOUND", "message": f"{file_path} does not exist"}
+
+    original = path.read_text(encoding="utf-8")
+    count = original.count(old_string)
+    if count == 0:
+        return {"error": "STRING_NOT_FOUND", "message": "old_string not found in file"}
+    if count > 1:
+        return {"error": "AMBIGUOUS_MATCH", "message": f"old_string found {count} times; must be unique"}
+
+    updated = original.replace(old_string, new_string, 1)
+    effective_reason = reason or f"MODIFY {canonical}"
+    result = _record_file_op(
+        file_path=canonical,
+        content_bytes=updated.encode("utf-8"),
+        agent_id=agent_id,
+        reason=effective_reason,
+        parent_op_ids=parent_op_ids,
+        evidence_refs=evidence_refs,
+        initial_status="PENDING",
+    )
+    if "error" in result:
+        return result
+    try:
+        path.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    db, _, _, _ = _get_components()
+    try:
+        db.finalize_operation(result["op_id"])
+    except Exception as exc:
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
+    result["status"] = "COMPLETED"
+    return result
+
+
+@mcp.tool()
+def hgp_delete_file(
+    file_path: str,
+    agent_id: str,
+    previous_op_id: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Delete a file and record an invalidation operation."""
+    try:
+        root = find_project_root(Path(file_path).parent)
+        canonical = canonical_file_path(file_path, root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    path = Path(file_path)
+    if not path.exists():
+        return {"error": "FILE_NOT_FOUND", "message": f"{file_path} does not exist"}
+
+    db, _, _, _ = _get_components()
+
+    # Preflight: validate previous_op_id before any filesystem side effect
+    if previous_op_id and not db.get_operation(previous_op_id):
+        return {"error": "INVALID_PARENT_OP_ID", "message": f"previous_op_id not found: {previous_op_id}"}
+
+    op_id = str(uuid.uuid4())
+    effective_reason = reason or f"DELETE {canonical}"
+    metadata = json.dumps({"reason": effective_reason})
+
+    db.begin_immediate()
+    try:
+        seq = db.next_commit_seq()
+        db.insert_operation(
+            op_id=op_id, op_type="invalidation", agent_id=agent_id,
+            commit_seq=seq, chain_hash="sha256:pending",
+            metadata=metadata, file_path=canonical,
+            status="PENDING",
+        )
+        if previous_op_id:
+            # Edge records intent; status update deferred until after unlink() succeeds.
+            db.insert_edge(op_id, previous_op_id, "invalidates")
+        final_hash = compute_chain_hash(db, op_id)
+        db.execute(
+            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
+            (final_hash, op_id),
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception as rb_exc:
+            _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
+        raise
+
+    try:
+        path.unlink()
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": op_id}
+
+    # Filesystem unlink succeeded — finalize all DB state in one atomic transaction.
+    db.begin_immediate()
+    try:
+        if previous_op_id:
+            db.update_operation_status(previous_op_id, "INVALIDATED")
+        db.finalize_operation(op_id)
+        db.commit()
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": op_id}
+    return {
+        "op_id": op_id,
+        "status": "COMPLETED",
+        "commit_seq": seq,
+        "chain_hash": final_hash,
+    }
+
+
+@mcp.tool()
+def hgp_move_file(
+    old_path: str,
+    new_path: str,
+    agent_id: str,
+    previous_op_id: str | None = None,
+    reason: str | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Move/rename a file: invalidates old path op, creates new artifact op."""
+    try:
+        root = find_project_root(Path(old_path).parent)
+        canonical_old = canonical_file_path(old_path, root)
+        canonical_new = canonical_file_path(new_path, root)
+    except ProjectRootError as e:
+        return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
+    except PathOutsideRootError as e:
+        return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+
+    src = Path(old_path)
+    if not src.exists():
+        return {"error": "FILE_NOT_FOUND", "message": f"{old_path} does not exist"}
+
+    effective_reason = reason or f"MOVE {canonical_old} → {canonical_new}"
+
+    # Validate evidence_refs BEFORE any filesystem operation.
+    parsed_refs: list[EvidenceRef] = []
+    if evidence_refs:
+        if len(evidence_refs) > _MAX_EVIDENCE_REFS:
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
+        try:
+            parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
+        except ValidationError as exc:
+            return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+
+    db, cas, _, _ = _get_components()
+
+    # Preflight: validate previous_op_id before any filesystem side effect
+    if previous_op_id and not db.get_operation(previous_op_id):
+        return {"error": "INVALID_PARENT_OP_ID", "message": f"previous_op_id not found: {previous_op_id}"}
+
+    # Auto-resolve previous_op_id from DB if not supplied by caller
+    resolved_previous_op_id = previous_op_id
+    if resolved_previous_op_id is None:
+        latest = db.get_ops_by_file_path(canonical_old, limit=1)
+        if latest:
+            resolved_previous_op_id = dict(latest[0])["op_id"]
+
+    dst = Path(new_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    content_bytes = src.read_bytes()
+    object_hash = cas.store(content_bytes)
+
+    db.begin_immediate()
+    try:
+        # Insert invalidation op for old_path so hgp_file_history(old_path) records the move.
+        inv_op_id = str(uuid.uuid4())
+        inv_metadata = json.dumps({"reason": f"MOVE {canonical_old} → {canonical_new}"})
+        db.insert_operation(
+            op_id=inv_op_id, op_type="invalidation", agent_id=agent_id,
+            commit_seq=db.next_commit_seq(), chain_hash="sha256:pending",
+            metadata=inv_metadata, file_path=canonical_old,
+            status="PENDING",
+        )
+        if resolved_previous_op_id:
+            # Edge records intent; status update deferred until after rename() succeeds.
+            db.insert_edge(inv_op_id, resolved_previous_op_id, "invalidates")
+        inv_hash = compute_chain_hash(db, inv_op_id)
+        db.execute("UPDATE operations SET chain_hash = ? WHERE op_id = ?", (inv_hash, inv_op_id))
+
+        # Insert artifact op for new_path, causally linked to the invalidation op.
+        op_id = str(uuid.uuid4())
+        metadata = json.dumps({"reason": effective_reason})
+        seq = db.next_commit_seq()
+        db.insert_operation(
+            op_id=op_id, op_type="artifact", agent_id=agent_id,
+            commit_seq=seq, chain_hash="sha256:pending",
+            object_hash=object_hash, metadata=metadata, file_path=canonical_new,
+            status="PENDING",
+        )
+        db.insert_edge(op_id, inv_op_id, "causal")
+        if parsed_refs:
+            try:
+                db.insert_evidence(op_id, parsed_refs)
+            except ValueError as exc:
+                db.rollback()
+                return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
+            except sqlite3.IntegrityError:
+                db.rollback()
+                return {"error": "DUPLICATE_EVIDENCE_REF", "message": "Evidence link already exists"}
+        final_hash = compute_chain_hash(db, op_id)
+        db.execute(
+            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
+            (final_hash, op_id),
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception as rb_exc:
+            _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
+        raise
+
+    # Filesystem rename happens AFTER DB commit; finalize both ops only on success.
+    try:
+        src.rename(dst)
+    except OSError as exc:
+        return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": op_id}
+
+    # Rename succeeded — finalize all DB state in one atomic transaction.
+    db.begin_immediate()
+    try:
+        if resolved_previous_op_id:
+            db.update_operation_status(resolved_previous_op_id, "INVALIDATED")
+        db.finalize_operation(inv_op_id)
+        db.finalize_operation(op_id)
+        db.commit()
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": op_id}
+    return {
+        "invalidation_op_id": inv_op_id,
+        "op_id": op_id,
+        "status": "COMPLETED",
+        "commit_seq": seq,
+        "object_hash": object_hash,
+        "chain_hash": final_hash,
+    }
 
 
 if __name__ == "__main__":
