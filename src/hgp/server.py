@@ -26,7 +26,7 @@ _MAX_EVIDENCE_REFS = 50
 from hgp.cas import CAS
 from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
 from hgp.db import Database
-from hgp.errors import ChainStaleError, ParentNotFoundError
+from hgp.errors import ChainStaleError, InvalidationTargetNotFoundError, ParentNotFoundError
 from hgp.lease import LeaseManager
 from hgp.models import EvidenceRef
 from hgp.project import find_project_root, assert_within_root, canonical_file_path, ProjectRootError, PathOutsideRootError
@@ -108,6 +108,11 @@ def hgp_create_operation(
     for pid in (parent_op_ids or []):
         if not db.get_operation(pid):
             raise ParentNotFoundError(f"Parent operation not found: {pid}")
+
+    # Validate invalidation targets exist
+    for inv_id in (invalidates_op_ids or []):
+        if not db.get_operation(inv_id):
+            raise InvalidationTargetNotFoundError(f"Invalidation target not found: {inv_id}")
 
     root_op_id = subgraph_root_op_id or (parent_op_ids[0] if parent_op_ids else None)
 

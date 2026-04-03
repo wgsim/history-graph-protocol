@@ -450,6 +450,30 @@ def test_rule5_invalidation_recovery_atomic_on_target_update_failure(hgp_dirs: d
     )
 
 
+def test_rule5_artifact_finalize_failure_does_not_abort_reconcile(hgp_dirs: dict, monkeypatch):
+    """If finalize_operation raises during artifact recovery, reconcile() must not raise.
+    The failure must be recorded in report.errors and the op must remain PENDING."""
+    db, cas, rec = _setup(hgp_dirs)
+    content = b"finalize-fail test"
+    target = hgp_dirs["root"] / "finalize_fail.txt"
+    target.write_bytes(content)
+    op_id = _insert_stale_pending_artifact(db, cas, str(target), content)
+
+    def _raise(_op_id):
+        raise RuntimeError("simulated finalize failure")
+
+    monkeypatch.setattr(db, "finalize_operation", _raise)
+
+    # Must not raise — reconcile is best-effort
+    report = rec.reconcile()
+
+    assert any("finalize" in e or op_id in e for e in report.errors), (
+        f"Expected finalize failure in report.errors, got: {report.errors}"
+    )
+    assert report.pending_recovered == 0
+    assert db.get_operation(op_id)["status"] == "PENDING"
+
+
 def test_rule5_pending_move_pair_both_stale(hgp_dirs: dict):
     """Move failed: file still at old path, nothing at new path → both STALE_PENDING."""
     db, cas, rec = _setup(hgp_dirs)

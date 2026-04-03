@@ -27,7 +27,7 @@ from hgp.db import Database
 from hgp.cas import CAS
 from hgp.lease import LeaseManager
 from hgp.reconciler import Reconciler
-from hgp.errors import ChainStaleError, ParentNotFoundError, PayloadTooLargeError
+from hgp.errors import ChainStaleError, InvalidationTargetNotFoundError, ParentNotFoundError, PayloadTooLargeError
 
 
 @pytest.fixture
@@ -97,6 +97,20 @@ def test_create_with_parents(server_components):
 def test_create_parent_not_found(server_components):
     with pytest.raises(ParentNotFoundError):
         hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=["nonexistent-id"])
+
+
+def test_create_invalidates_target_not_found(server_components):
+    """invalidates_op_ids referencing a missing op raises a domain error, not a raw SQLite IntegrityError."""
+    import sqlite3
+    with pytest.raises(InvalidationTargetNotFoundError):
+        hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=["missing-op"])
+    # Confirm raw IntegrityError is NOT raised (redundant guard)
+    try:
+        hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=["missing-op-2"])
+    except InvalidationTargetNotFoundError:
+        pass
+    except sqlite3.IntegrityError as exc:
+        raise AssertionError(f"Raw SQLite IntegrityError leaked: {exc}") from exc
 
 
 def test_create_chain_stale(server_components):

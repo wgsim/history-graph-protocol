@@ -104,7 +104,13 @@ class Reconciler:
                 )
                 if recovered:
                     if not dry_run:
-                        self._db.finalize_operation(op_id)
+                        try:
+                            self._db.finalize_operation(op_id)
+                        except Exception as exc:
+                            report.errors.append(
+                                f"artifact finalize failed for {op_id}: {exc}"
+                            )
+                            continue
                     report.pending_recovered += 1
                 else:
                     if not dry_run:

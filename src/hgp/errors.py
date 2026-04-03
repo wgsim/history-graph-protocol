@@ -23,6 +23,11 @@ class ParentNotFoundError(HGPError):
     code = "PARENT_NOT_FOUND"
 
 
+class InvalidationTargetNotFoundError(HGPError):
+    """Referenced invalidation target operation does not exist."""
+    code = "INVALIDATION_TARGET_NOT_FOUND"
+
+
 class BlobWriteError(HGPError):
     """CAS blob write failed (fsync/rename)."""
     code = "BLOB_WRITE_FAILED"

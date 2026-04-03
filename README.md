@@ -121,8 +121,10 @@ python -m hgp.server
 hgp_create_operation(
     op_type="artifact",
     agent_id="agent-1",
-    summary="Analyzed error rate spike in service logs",
-    payload={"findings": "p99 latency exceeded 2s between 03:00-04:00 UTC"},
+    metadata={
+        "description": "Analyzed error rate spike in service logs",
+        "findings": "p99 latency exceeded 2s between 03:00-04:00 UTC",
+    },
 )
 # → returns op_id: "op-abc123"
 
@@ -130,7 +132,7 @@ hgp_create_operation(
 hgp_create_operation(
     op_type="hypothesis",
     agent_id="agent-1",
-    summary="Root cause is database connection pool exhaustion",
+    metadata={"description": "Root cause is database connection pool exhaustion"},
     parent_op_ids=["op-abc123"],
     evidence_refs=[
         {
