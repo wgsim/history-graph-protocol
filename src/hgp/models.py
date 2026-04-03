@@ -22,6 +22,7 @@ class OpStatus(StrEnum):
     COMPLETED = "COMPLETED"
     INVALIDATED = "INVALIDATED"
     MISSING_BLOB = "MISSING_BLOB"
+    STALE_PENDING = "STALE_PENDING"
 
 
 class EdgeType(StrEnum):
@@ -100,6 +101,9 @@ class ReconcileReport(BaseModel):
     skipped_young_blobs: int = 0
     demoted_to_inactive: int = 0
     errors: list[str] = Field(default_factory=list)
+    pending_recovered: int = 0
+    pending_stale: int = 0
+    pending_skipped_young: int = 0
 
 
 # ── V3 Evidence Trail ─────────────────────────────────────────

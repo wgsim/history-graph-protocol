@@ -56,10 +56,11 @@ to a specific subgraph's `chain_hash` at the moment of acquisition. `validate()`
 a double-check pattern: a fast pre-read outside the write lock followed by a
 re-validation inside `BEGIN IMMEDIATE`, closing the TOCTOU window.
 
-**`reconciler.py`** — `Reconciler`. Runs four deterministic consistency rules on
+**`reconciler.py`** — `Reconciler`. Runs five deterministic consistency rules on
 demand or at startup: marks operations with missing CAS blobs as `MISSING_BLOB`,
-marks unreferenced CAS blobs as `ORPHAN_CANDIDATE`, cleans stale staging files, and
-demotes unaccessed operations to the `inactive` tier.
+marks unreferenced CAS blobs as `ORPHAN_CANDIDATE`, cleans stale staging files,
+demotes unaccessed operations to the `inactive` tier, and recovers or triages
+stuck `PENDING` operations (Rule 5).
 
 **`server.py`** — MCP/HTTP entry point. Orchestrates all other modules: validates
 incoming requests, opens `BEGIN IMMEDIATE` transactions for writes, delegates
@@ -282,6 +283,35 @@ project-activity-aware: a project that has been idle for months will not demote
 everything the moment reconcile runs.
 
 `ReconcileReport.demoted_to_inactive` records the count of demoted rows.
+
+### Rule 5: PENDING op recovery
+
+File-tracking tools (`hgp_write_file`, `hgp_edit_file`, etc.) commit a `PENDING`
+operation *before* the filesystem mutation and finalize it to `COMPLETED` after
+success. A crash between these two steps leaves the op permanently stuck at
+`PENDING`.
+
+The reconciler resolves stuck PENDING ops after a `PENDING_GRACE_PERIOD` (5
+minutes), which prevents interference with in-flight writes:
+
+- **`artifact` ops** (write/append/edit/move destination): The CAS blob must exist
+  *and* the file on disk must match its hash. If both hold, the op is finalized to
+  `COMPLETED` (`pending_recovered += 1`). Otherwise it becomes `STALE_PENDING`
+  (`pending_stale += 1`).
+- **`invalidation` ops** (delete/move source): The file must no longer exist at the
+  tracked path. If so, the op is finalized to `COMPLETED`. If the file is still
+  present, the op becomes `STALE_PENDING`.
+- **Ops with `file_path = NULL`** (non-file-tracking ops created via
+  `hgp_create_operation`): skipped — they have no recoverable filesystem evidence.
+- **Ops within grace period**: skipped (`pending_skipped_young += 1`).
+
+`STALE_PENDING` is a terminal status — the reconciler never reprocesses an op that
+has already been triage to this state. Manual intervention or a future cleanup
+tool is required to clear them.
+
+`hgp_move_file` creates two PENDING ops (an invalidation for the old path and an
+artifact for the new path). They are processed independently. If the move
+succeeded both recover; if it failed both become `STALE_PENDING`.
 
 Lease expiry also triggers tier adjustment: `Database.expire_leases()` moves
 `short_term` operations back to `long_term` when they have no remaining `ACTIVE` lease

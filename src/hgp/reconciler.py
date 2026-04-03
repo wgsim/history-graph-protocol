@@ -1,7 +1,8 @@
-"""Crash recovery reconciler — 3-rule deterministic consistency check."""
+"""Crash recovery reconciler — 5-rule deterministic consistency check."""
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +16,17 @@ from hgp.db import Database
 from hgp.models import ReconcileReport
 
 ORPHAN_GRACE_PERIOD = timedelta(minutes=15)
+PENDING_GRACE_PERIOD = timedelta(minutes=5)
+
+
+def _file_matches_hash(file_path: str, expected_hash: str) -> bool:
+    """Return True if file_path exists and its SHA-256 matches expected_hash."""
+    try:
+        data = Path(file_path).read_bytes()
+        computed = f"sha256:{hashlib.sha256(data).hexdigest()}"
+        return computed == expected_hash
+    except OSError:
+        return False
 
 
 class Reconciler:
@@ -62,6 +74,52 @@ class Reconciler:
                     pass  # Concurrent cleanup — expected, ignore
                 except OSError as exc:
                     report.errors.append(f"staging cleanup error for {tmp_file.name}: {exc}")
+
+        # Rule 5: PENDING op recovery — finalize or triage stuck PENDING ops
+        pending_ops = self._db.query_operations(status="PENDING")
+        for op in pending_ops:
+            created_at_str = op.get("created_at", "")
+            try:
+                created_at = datetime.fromisoformat(
+                    created_at_str.replace("Z", "+00:00")
+                )
+            except (ValueError, AttributeError):
+                continue
+            age = now - created_at
+            if age <= PENDING_GRACE_PERIOD:
+                report.pending_skipped_young += 1
+                continue
+            file_path = op.get("file_path")
+            if not file_path:
+                # Not a file-tracking op — skip
+                continue
+            op_type = op.get("op_type")
+            op_id = op["op_id"]
+            if op_type == "artifact":
+                obj_hash = op.get("object_hash") or ""
+                recovered = (
+                    bool(obj_hash)
+                    and self._cas.exists(obj_hash)
+                    and _file_matches_hash(file_path, obj_hash)
+                )
+                if recovered:
+                    if not dry_run:
+                        self._db.finalize_operation(op_id)
+                    report.pending_recovered += 1
+                else:
+                    if not dry_run:
+                        self._db.update_operation_status(op_id, "STALE_PENDING")
+                    report.pending_stale += 1
+            elif op_type == "invalidation":
+                file_gone = not Path(file_path).exists()
+                if file_gone:
+                    if not dry_run:
+                        self._db.finalize_operation(op_id)
+                    report.pending_recovered += 1
+                else:
+                    if not dry_run:
+                        self._db.update_operation_status(op_id, "STALE_PENDING")
+                    report.pending_stale += 1
 
         # Rule 4: Tier demotion — ops not accessed within threshold become inactive
         if not dry_run:

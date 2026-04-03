@@ -547,7 +547,7 @@ Response:
 
 ### Description
 
-Runs a reconciliation pass over the operation store to detect and repair inconsistencies such as missing blobs, orphaned staging files, and operations eligible for demotion to `inactive` tier. Supports a dry-run mode that reports findings without applying changes.
+Runs a reconciliation pass over the operation store to detect and repair inconsistencies. Covers five rules: (1–2) completed ops with missing blobs, (3) orphaned staging files, (4) tier demotion, (5) stale `PENDING` op recovery. Supports a dry-run mode that reports findings without applying changes.
 
 ### Parameters
 
@@ -566,7 +566,10 @@ A ReconcileReport dict:
   "staging_cleaned": "integer",
   "skipped_young_blobs": "integer",
   "demoted_to_inactive": "integer",
-  "errors": [ "...list of error strings..." ]
+  "errors": [ "...list of error strings..." ],
+  "pending_recovered": "integer",
+  "pending_stale": "integer",
+  "pending_skipped_young": "integer"
 }
 ```
 
@@ -578,6 +581,9 @@ A ReconcileReport dict:
 | `skipped_young_blobs` | Blobs skipped because they are below the age threshold |
 | `demoted_to_inactive` | Number of operations demoted to `inactive` tier (0 in dry-run) |
 | `errors` | Non-fatal errors encountered during reconciliation |
+| `pending_recovered` | PENDING ops finalized to COMPLETED (filesystem state matched CAS blob) |
+| `pending_stale` | PENDING ops transitioned to STALE_PENDING (unrecoverable; requires manual intervention) |
+| `pending_skipped_young` | PENDING ops skipped because they are within the 5-minute grace period |
 
 ### Error Codes
 
