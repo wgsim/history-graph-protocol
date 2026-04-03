@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS operations (
     op_type         TEXT NOT NULL CHECK (op_type IN (
                         'artifact', 'hypothesis', 'merge', 'invalidation')),
     status          TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN (
-                        'PENDING', 'COMPLETED', 'INVALIDATED', 'MISSING_BLOB')),
+                        'PENDING', 'COMPLETED', 'INVALIDATED', 'MISSING_BLOB', 'STALE_PENDING')),
     commit_seq      INTEGER UNIQUE,
     agent_id        TEXT NOT NULL,
     object_hash     TEXT,
@@ -121,6 +121,42 @@ CREATE INDEX IF NOT EXISTS idx_operations_file_path ON operations(file_path);
 CREATE INDEX IF NOT EXISTS idx_operations_file_path_seq ON operations(file_path, commit_seq DESC);
 """
 
+_MIGRATION_STALE_PENDING = """
+PRAGMA foreign_keys = OFF;
+BEGIN;
+CREATE TABLE operations_new (
+    op_id           TEXT PRIMARY KEY,
+    op_type         TEXT NOT NULL CHECK (op_type IN (
+                        'artifact', 'hypothesis', 'merge', 'invalidation')),
+    status          TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN (
+                        'PENDING', 'COMPLETED', 'INVALIDATED', 'MISSING_BLOB', 'STALE_PENDING')),
+    commit_seq      INTEGER UNIQUE,
+    agent_id        TEXT NOT NULL,
+    object_hash     TEXT,
+    chain_hash      TEXT,
+    metadata        TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    completed_at    TEXT,
+    access_count    REAL NOT NULL DEFAULT 0.0,
+    last_accessed   TEXT,
+    memory_tier     TEXT NOT NULL DEFAULT 'long_term'
+                        CHECK (memory_tier IN ('short_term', 'long_term', 'inactive')),
+    file_path       TEXT,
+    FOREIGN KEY (object_hash) REFERENCES objects(hash)
+);
+INSERT INTO operations_new SELECT * FROM operations;
+DROP TABLE operations;
+ALTER TABLE operations_new RENAME TO operations;
+CREATE INDEX idx_operations_agent         ON operations(agent_id);
+CREATE INDEX idx_operations_type          ON operations(op_type);
+CREATE INDEX idx_operations_status        ON operations(status);
+CREATE INDEX idx_operations_seq           ON operations(commit_seq);
+CREATE INDEX idx_operations_file_path     ON operations(file_path);
+CREATE INDEX idx_operations_file_path_seq ON operations(file_path, commit_seq DESC);
+COMMIT;
+PRAGMA foreign_keys = ON;
+"""
+
 # Server-side cap on evidence result sets — prevents reverse fan-out DoS where
 # one widely-cited op triggers an unbounded JOIN over all citing ops.
 _MAX_EVIDENCE_RESULTS = 200
@@ -181,6 +217,12 @@ class Database:
             self._conn.execute(
                 "INSERT OR IGNORE INTO _hgp_migrations (name) VALUES (?)",
                 ("v4_file_path",),
+            )
+        if "v5_stale_pending_status" not in applied:
+            self._conn.executescript(_MIGRATION_STALE_PENDING)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO _hgp_migrations (name) VALUES (?)",
+                ("v5_stale_pending_status",),
             )
 
     def close(self) -> None:
@@ -278,6 +320,15 @@ class Database:
             "INSERT OR IGNORE INTO op_edges (child_op_id, parent_op_id, edge_type) VALUES (?, ?, ?)",
             (child_op_id, parent_op_id, edge_type),
         )
+
+    def get_invalidated_targets(self, op_id: str) -> list[str]:
+        """Return op_ids that op_id invalidates (parent_op_ids on invalidates edges)."""
+        assert self._conn
+        rows = self._conn.execute(
+            "SELECT parent_op_id FROM op_edges WHERE child_op_id = ? AND edge_type = 'invalidates'",
+            (op_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
 
     def commit(self) -> None:
         assert self._conn

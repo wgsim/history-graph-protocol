@@ -770,3 +770,102 @@ def test_migration_from_pre_v4_schema(tmp_path):
     assert row["file_path"] is None  # NULL for migrated rows
 
     db.close()
+
+
+def test_migration_from_pre_v5_schema(tmp_path):
+    """Database() must allow STALE_PENDING status after V5 migration on a pre-V5 DB.
+    Existing rows and all indexes must survive the table recreation."""
+    import sqlite3
+    db_path = tmp_path / "pre_v5.db"
+
+    # Build a pre-V5 DB using the V4 schema (status CHECK without STALE_PENDING).
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE objects (
+            hash TEXT PRIMARY KEY, size INTEGER NOT NULL,
+            mime_type TEXT, status TEXT NOT NULL DEFAULT 'VALID',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            gc_marked_at TEXT
+        );
+        CREATE TABLE operations (
+            op_id        TEXT PRIMARY KEY,
+            op_type      TEXT NOT NULL CHECK (op_type IN (
+                             'artifact', 'hypothesis', 'merge', 'invalidation')),
+            status       TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN (
+                             'PENDING', 'COMPLETED', 'INVALIDATED', 'MISSING_BLOB')),
+            commit_seq   INTEGER UNIQUE,
+            agent_id     TEXT NOT NULL,
+            object_hash  TEXT,
+            chain_hash   TEXT,
+            metadata     TEXT,
+            created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            completed_at TEXT,
+            access_count REAL NOT NULL DEFAULT 0.0,
+            last_accessed TEXT,
+            memory_tier  TEXT NOT NULL DEFAULT 'long_term'
+                             CHECK (memory_tier IN ('short_term', 'long_term', 'inactive')),
+            file_path    TEXT,
+            FOREIGN KEY (object_hash) REFERENCES objects(hash)
+        );
+        CREATE TABLE op_edges (
+            child_op_id TEXT NOT NULL, parent_op_id TEXT NOT NULL,
+            edge_type TEXT NOT NULL DEFAULT 'causal',
+            PRIMARY KEY (child_op_id, parent_op_id),
+            FOREIGN KEY (child_op_id) REFERENCES operations(op_id),
+            FOREIGN KEY (parent_op_id) REFERENCES operations(op_id)
+        );
+        CREATE TABLE leases (
+            lease_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+            subgraph_root_op_id TEXT NOT NULL, chain_hash TEXT NOT NULL,
+            issued_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE'
+        );
+        CREATE TABLE commit_counter (
+            id INTEGER PRIMARY KEY CHECK (id = 1), next_seq INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT OR IGNORE INTO commit_counter (id, next_seq) VALUES (1, 1);
+        CREATE TABLE git_anchors (
+            op_id TEXT NOT NULL, git_commit_sha TEXT NOT NULL,
+            repository TEXT, created_at TEXT NOT NULL,
+            PRIMARY KEY (op_id, git_commit_sha),
+            FOREIGN KEY (op_id) REFERENCES operations(op_id)
+        );
+        CREATE TABLE op_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            citing_op_id TEXT NOT NULL, cited_op_id TEXT NOT NULL,
+            relation TEXT NOT NULL, scope TEXT, inference TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            UNIQUE (citing_op_id, cited_op_id),
+            FOREIGN KEY (citing_op_id) REFERENCES operations(op_id),
+            FOREIGN KEY (cited_op_id) REFERENCES operations(op_id)
+        );
+        CREATE TABLE _hgp_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+        INSERT INTO _hgp_migrations (name) VALUES ('v4_file_path');
+        INSERT INTO operations (op_id, op_type, agent_id, commit_seq, chain_hash, file_path)
+            VALUES ('v4-op-1', 'artifact', 'agent-v4', 1, 'sha256:v4', '/some/file.py');
+    """)
+    conn.close()
+
+    # Open via Database — V5 migration must run automatically
+    from hgp.db import Database
+    db = Database(db_path)
+    db.initialize()
+
+    # STALE_PENDING must now be an accepted status value
+    db.begin_immediate()
+    db.execute(
+        "UPDATE operations SET status = 'STALE_PENDING' WHERE op_id = 'v4-op-1'"
+    )
+    db.commit()
+
+    row = db.get_operation("v4-op-1")
+    assert row is not None
+    assert row["status"] == "STALE_PENDING"
+    assert row["file_path"] == "/some/file.py"  # data survived table recreation
+
+    # Migration must be idempotent — second initialize must not error
+    db.close()
+    db2 = Database(db_path)
+    db2.initialize()
+    db2.close()

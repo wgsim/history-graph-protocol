@@ -376,6 +376,21 @@ def test_query_operations_invalid_status_returns_error(server_components):
     assert result.get("error") == "INVALID_STATUS"
 
 
+def test_query_operations_stale_pending_is_queryable(server_components):
+    """STALE_PENDING must be accepted by hgp_query_operations (not INVALID_STATUS)."""
+    db = server_components["db"]
+    # Insert an op then manually set it to STALE_PENDING
+    op = hgp_create_operation(op_type="artifact", agent_id="agent-sp")
+    op_id = op["op_id"]
+    db.execute("UPDATE operations SET status = 'STALE_PENDING' WHERE op_id = ?", (op_id,))
+    db.commit()
+
+    result = hgp_query_operations(status="STALE_PENDING")
+    assert "error" not in result, f"Expected queryable status, got: {result}"
+    op_ids = [o["op_id"] for o in result.get("operations", [])]
+    assert op_id in op_ids
+
+
 # ── Security: H-4 git_commit_sha hex validation ──────────────────────────────
 
 def test_git_anchor_non_hex_sha_rejected(server_components):

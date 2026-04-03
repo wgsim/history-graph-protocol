@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from mcp.server.fastmcp import FastMCP
 
 _VALID_OP_TYPES = frozenset({"artifact", "hypothesis", "merge", "invalidation"})
-_VALID_STATUSES = frozenset({"PENDING", "COMPLETED", "INVALIDATED", "MISSING_BLOB"})
+_VALID_STATUSES = frozenset({"PENDING", "COMPLETED", "INVALIDATED", "MISSING_BLOB", "STALE_PENDING"})
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MAX_TTL_SECONDS = 86400
 # Limits evidence refs per operation to cap O(N) existence checks inside BEGIN IMMEDIATE.
