@@ -10,6 +10,28 @@
             "command": "python3 .gemini/hooks/pre_tool_use_hgp.py"
           }
         ]
+      },
+      {
+        "matcher": "^shell$",
+        "hooks": [
+          {
+            "name": "hgp-bash-pre",
+            "type": "command",
+            "command": "python3 .gemini/hooks/pre_bash_hgp.py"
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": "^shell$",
+        "hooks": [
+          {
+            "name": "hgp-bash-post",
+            "type": "command",
+            "command": "python3 .gemini/hooks/post_bash_hgp.py"
+          }
+        ]
       }
     ]
   }

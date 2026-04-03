@@ -9,6 +9,26 @@
             "command": "python3 .claude/hooks/pre_tool_use_hgp.py"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/pre_bash_hgp.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/post_bash_hgp.py"
+          }
+        ]
       }
     ]
   }
