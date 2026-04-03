@@ -17,6 +17,7 @@ _GEMINI_HOOKS_DIR = Path(__file__).parent.parent / ".gemini" / "hooks"
 _PRE_HOOK = str(_HOOKS_DIR / "pre_bash_hgp.py")
 _POST_HOOK = str(_HOOKS_DIR / "post_bash_hgp.py")
 _GEMINI_PRE_HOOK = str(_GEMINI_HOOKS_DIR / "pre_bash_hgp.py")
+_GEMINI_POST_HOOK = str(_GEMINI_HOOKS_DIR / "post_bash_hgp.py")
 
 
 def _run_hook(hook_path: str, payload: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -198,3 +199,78 @@ def test_gemini_pre_bash_wrong_tool_name_ignored():
     result = _run_hook(_GEMINI_PRE_HOOK, {"tool_name": "Bash", "tool_input": {"command": "rm x"}})
     assert result.returncode == 0
     assert result.stdout.strip() == ""
+
+
+def test_gemini_pre_bash_detects_git_checkout():
+    """Gemini pre hook emits JSON systemMessage for git checkout."""
+    result = _run_hook(_GEMINI_PRE_HOOK, _gemini_shell_event("git checkout some-branch"))
+    assert result.returncode == 0
+    data = json.loads(result.stdout.strip())
+    assert "[HGP]" in data["systemMessage"]
+
+
+def test_gemini_pre_bash_detects_git_restore():
+    """Gemini pre hook emits JSON systemMessage for git restore."""
+    result = _run_hook(_GEMINI_PRE_HOOK, _gemini_shell_event("git restore src/hgp/server.py"))
+    assert result.returncode == 0
+    data = json.loads(result.stdout.strip())
+    assert "[HGP]" in data["systemMessage"]
+
+
+def test_gemini_pre_bash_detects_patch():
+    """Gemini pre hook emits JSON systemMessage for patch command."""
+    result = _run_hook(_GEMINI_PRE_HOOK, _gemini_shell_event("patch -p1 < fix.diff"))
+    assert result.returncode == 0
+    data = json.loads(result.stdout.strip())
+    assert "[HGP]" in data["systemMessage"]
+
+
+def test_gemini_pre_bash_git_status_silent():
+    """Gemini pre hook is silent for git status after adding new patterns."""
+    result = _run_hook(_GEMINI_PRE_HOOK, _gemini_shell_event("git status --porcelain"))
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+# ── Gemini Post-Bash hook ─────────────────────────────────────────────────────
+
+
+def test_gemini_post_bash_no_marker_silent():
+    """No marker → Gemini post hook runs silently."""
+    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
+    marker.unlink(missing_ok=True)
+
+    result = _run_hook(_GEMINI_POST_HOOK, _gemini_shell_event("echo done"))
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+def test_gemini_post_bash_reports_changes_as_json(tmp_path):
+    """Gemini post hook emits JSON systemMessage when marker exists and files changed."""
+    # Init a minimal git repo with a tracked file
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t.com"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "T"],
+                   check=True, capture_output=True)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("original")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "init"],
+                   check=True, capture_output=True)
+    # Modify so git status --porcelain reports it
+    tracked.write_text("modified")
+
+    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
+    marker.write_text("")
+    try:
+        result = _run_hook(_GEMINI_POST_HOOK, _gemini_shell_event("echo done"), cwd=str(tmp_path))
+        assert result.returncode == 0
+        assert result.stdout.strip(), "Expected JSON output"
+        data = json.loads(result.stdout.strip())
+        assert "systemMessage" in data
+        assert "[HGP]" in data["systemMessage"]
+        assert "tracked.txt" in data["systemMessage"]
+    finally:
+        marker.unlink(missing_ok=True)
