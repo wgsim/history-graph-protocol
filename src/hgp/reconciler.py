@@ -94,7 +94,11 @@ class Reconciler:
                 created_at = datetime.fromisoformat(
                     created_at_str.replace("Z", "+00:00")
                 )
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError) as exc:
+                report.errors.append(
+                    f"PENDING op {op.get('op_id')!r} has unparseable "
+                    f"created_at={created_at_str!r}: {exc}"
+                )
                 continue
             age = now - created_at
             if age <= PENDING_GRACE_PERIOD:

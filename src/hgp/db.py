@@ -538,8 +538,10 @@ class Database:
             self.record_access(op_id, weight=1.0)
             for row in rows:
                 self.record_access(row["cited_op_id"], weight=0.7)
-        except sqlite3.OperationalError:
-            pass  # expected: write-lock contention when another writer holds BEGIN IMMEDIATE
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                _log.warning("record_access non-lock OperationalError in get_evidence op_id=%r: %s", op_id, exc)
+            # always pass — access recording is best-effort
         except sqlite3.Error as exc:
             _log.warning("record_access failed unexpectedly in get_evidence op_id=%r: %s", op_id, exc)
         return [dict(r) for r in rows]
@@ -559,8 +561,10 @@ class Database:
         ).fetchall()
         try:
             self.record_access(op_id, weight=1.0)
-        except sqlite3.OperationalError:
-            pass  # expected: write-lock contention when another writer holds BEGIN IMMEDIATE
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                _log.warning("record_access non-lock OperationalError in get_citing_ops op_id=%r: %s", op_id, exc)
+            # always pass — access recording is best-effort
         except sqlite3.Error as exc:
             _log.warning("record_access failed unexpectedly in get_citing_ops op_id=%r: %s", op_id, exc)
         return [dict(r) for r in rows]

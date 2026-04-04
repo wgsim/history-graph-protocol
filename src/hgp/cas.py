@@ -90,7 +90,10 @@ class CAS:
             for blob_file in subdir.iterdir():
                 if blob_file.is_file():
                     hex_hash = subdir.name + blob_file.name
-                    mtime = datetime.fromtimestamp(blob_file.stat().st_mtime, tz=timezone.utc)
+                    try:
+                        mtime = datetime.fromtimestamp(blob_file.stat().st_mtime, tz=timezone.utc)
+                    except FileNotFoundError:
+                        continue  # raced with concurrent deletion/rename — expected
                     yield f"sha256:{hex_hash}", mtime
 
     def _hash_to_path(self, object_hash: str) -> Path:

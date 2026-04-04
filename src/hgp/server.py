@@ -26,7 +26,7 @@ _MAX_EVIDENCE_REFS = 50
 from hgp.cas import CAS
 from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
 from hgp.db import Database
-from hgp.errors import ChainStaleError, InvalidationTargetNotFoundError, ParentNotFoundError
+from hgp.errors import BlobWriteError, ChainStaleError, InvalidationTargetNotFoundError, ParentNotFoundError, PayloadTooLargeError
 from hgp.lease import LeaseManager
 from hgp.models import EvidenceRef
 from hgp.project import find_project_root, assert_within_root, canonical_file_path, ProjectRootError, PathOutsideRootError
@@ -290,8 +290,9 @@ def hgp_query_operations(
         try:
             root = find_project_root(Path(file_path).parent)
             canonical_fp = canonical_file_path(file_path, root)
-        except (ProjectRootError, PathOutsideRootError):
-            pass  # use raw path; will return empty results for out-of-root queries
+        except (ProjectRootError, PathOutsideRootError) as exc:
+            _log.debug("hgp_query_operations: file_path canonicalization failed, using raw path: %s", exc)
+            # Results may be empty or incomplete if raw path doesn't match stored canonical paths
     ops = db.query_operations(
         status=status, agent_id=agent_id, op_type=op_type,
         since_commit_seq=since_commit_seq,
@@ -359,13 +360,21 @@ def hgp_acquire_lease(
     """Acquire a lease on a subgraph for optimistic concurrency."""
     db, _, lease_mgr, _ = _get_components()
     lease = lease_mgr.acquire(agent_id, subgraph_root_op_id, min(ttl_seconds, _MAX_TTL_SECONDS))
-    db.set_memory_tier(subgraph_root_op_id, "short_term")
-    db.commit()
-    return {
+    response: dict[str, Any] = {
         "lease_id": lease.lease_id,
         "chain_hash": lease.chain_hash,
         "expires_at": lease.expires_at.isoformat(),
     }
+    try:
+        db.set_memory_tier(subgraph_root_op_id, "short_term")
+        db.commit()
+    except sqlite3.Error as exc:
+        _log.error(
+            "hgp_acquire_lease: memory tier update failed for lease %s: %s",
+            lease.lease_id, exc,
+        )
+        response["warning"] = "memory tier could not be updated to short_term"
+    return response
 
 
 @mcp.tool()
@@ -505,7 +514,12 @@ def _record_file_op(
 
     db, cas, _, _ = _get_components()
 
-    object_hash = cas.store(content_bytes)
+    try:
+        object_hash = cas.store(content_bytes)
+    except PayloadTooLargeError as exc:
+        return {"error": "PAYLOAD_TOO_LARGE", "message": str(exc)}
+    except BlobWriteError as exc:
+        return {"error": "BLOB_WRITE_ERROR", "message": str(exc)}
     op_id = str(uuid.uuid4())
     metadata = json.dumps({"reason": reason})
 
@@ -543,8 +557,8 @@ def _record_file_op(
     except Exception:
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rb_exc:
+            _log.error("_record_file_op: ROLLBACK failed op_id=%s: %s", op_id, rb_exc)
         raise
 
     return {
@@ -591,6 +605,11 @@ def hgp_write_file(
     try:
         path.write_text(content, encoding="utf-8")
     except OSError as exc:
+        _log.warning(
+            "hgp_write_file filesystem write failed op_id=%s path=%r; "
+            "PENDING op will be triaged by reconciler: %s",
+            result["op_id"], file_path, exc,
+        )
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
     db, _, _, _ = _get_components()
     try:
@@ -640,6 +659,11 @@ def hgp_append_file(
         with path.open("a", encoding="utf-8") as f:
             f.write(content)
     except OSError as exc:
+        _log.warning(
+            "hgp_append_file filesystem write failed op_id=%s path=%r; "
+            "PENDING op will be triaged by reconciler: %s",
+            result["op_id"], file_path, exc,
+        )
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
     db, _, _, _ = _get_components()
     try:
@@ -696,6 +720,11 @@ def hgp_edit_file(
     try:
         path.write_text(updated, encoding="utf-8")
     except OSError as exc:
+        _log.warning(
+            "hgp_edit_file filesystem write failed op_id=%s path=%r; "
+            "PENDING op will be triaged by reconciler: %s",
+            result["op_id"], file_path, exc,
+        )
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
     db, _, _, _ = _get_components()
     try:
@@ -778,8 +807,8 @@ def hgp_delete_file(
     except Exception as exc:
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rb_exc:
+            _log.error("hgp_delete_file: ROLLBACK failed after finalize error op_id=%s: %s", op_id, rb_exc)
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": op_id}
     return {
         "op_id": op_id,
@@ -842,7 +871,12 @@ def hgp_move_file(
     dst = Path(new_path)
     dst.parent.mkdir(parents=True, exist_ok=True)
     content_bytes = src.read_bytes()
-    object_hash = cas.store(content_bytes)
+    try:
+        object_hash = cas.store(content_bytes)
+    except PayloadTooLargeError as exc:
+        return {"error": "PAYLOAD_TOO_LARGE", "message": str(exc)}
+    except BlobWriteError as exc:
+        return {"error": "BLOB_WRITE_ERROR", "message": str(exc)}
 
     db.begin_immediate()
     try:
@@ -911,8 +945,8 @@ def hgp_move_file(
     except Exception as exc:
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rb_exc:
+            _log.error("hgp_move_file: ROLLBACK failed after finalize error op_id=%s: %s", op_id, rb_exc)
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": op_id}
     return {
         "invalidation_op_id": inv_op_id,
