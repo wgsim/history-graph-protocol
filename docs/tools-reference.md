@@ -93,6 +93,8 @@ Each item in `evidence_refs` must conform to:
 
 Raises `ParentNotFoundError` if any `op_id` in `parent_op_ids` does not exist.
 
+Raises `InvalidationTargetNotFoundError` (code `INVALIDATION_TARGET_NOT_FOUND`) if any `op_id` in `invalidates_op_ids` does not exist.
+
 ### Example
 
 Request:
@@ -1023,6 +1025,7 @@ The following table consolidates all error codes across all tools.
 | `INVALID_EVIDENCE_REF` | `hgp_create_operation` | One or more `evidence_refs` entries fail schema validation |
 | `TOO_MANY_EVIDENCE_REFS` | `hgp_create_operation` | More than 50 `evidence_refs` provided |
 | `DUPLICATE_EVIDENCE_REF` | `hgp_create_operation` | Two or more `evidence_refs` reference the same `op_id` |
+| `INVALIDATION_TARGET_NOT_FOUND` | `hgp_create_operation` | An `invalidates_op_ids` entry does not exist |
 | `INVALID_STATUS` | `hgp_query_operations` | `status` value is not one of `PENDING`, `COMPLETED`, `INVALIDATED`, `MISSING_BLOB`, `STALE_PENDING` |
 | `INVALID_TIER` | `hgp_set_memory_tier` | `tier` is not one of `short_term`, `long_term`, `inactive` |
 | `OP_NOT_FOUND` | `hgp_set_memory_tier`, `hgp_get_evidence`, `hgp_get_citing_ops` | No operation exists with the given `op_id` |
