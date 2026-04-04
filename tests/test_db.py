@@ -869,3 +869,65 @@ def test_migration_from_pre_v5_schema(tmp_path):
     db2 = Database(db_path)
     db2.initialize()
     db2.close()
+
+
+# ── Phase 2: Task 2.6 — non-lock OperationalError in record_access is logged ─
+
+
+def test_get_evidence_non_lock_operational_error_logged(hgp_dirs: dict, monkeypatch, caplog):
+    """get_evidence must log a WARNING when record_access raises a non-lock OperationalError.
+
+    Lock/busy errors are suppressed silently (best-effort).  Any other
+    OperationalError (e.g. schema corruption) should produce a visible warning
+    so operators can investigate.
+    """
+    import logging
+    import sqlite3
+
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("ev-op", "artifact", "a", 1, "sha256:" + "a" * 64)
+    db.commit()
+
+    def _raise_non_lock(*args, **kwargs):
+        raise sqlite3.OperationalError("no such table: operations")
+
+    monkeypatch.setattr(db, "record_access", _raise_non_lock)
+
+    with caplog.at_level(logging.WARNING, logger="hgp.db"):
+        db.get_evidence("ev-op")
+
+    assert any(
+        "non-lock" in r.message or "record_access" in r.message
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ), f"Expected non-lock warning, got: {[r.message for r in caplog.records]}"
+
+
+def test_get_evidence_lock_error_not_logged(hgp_dirs: dict, monkeypatch, caplog):
+    """get_evidence must NOT log when record_access raises a lock/busy OperationalError."""
+    import logging
+    import sqlite3
+
+    db = Database(hgp_dirs["db_path"])
+    db.initialize()
+    db.begin_immediate()
+    db.insert_operation("ev-op-lock", "artifact", "a", 1, "sha256:" + "b" * 64)
+    db.commit()
+
+    def _raise_lock(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "record_access", _raise_lock)
+
+    with caplog.at_level(logging.WARNING, logger="hgp.db"):
+        db.get_evidence("ev-op-lock")
+
+    lock_warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "non-lock" in r.message
+    ]
+    assert lock_warnings == [], (
+        f"Lock errors must not produce non-lock warnings: {[r.message for r in lock_warnings]}"
+    )

@@ -708,6 +708,91 @@ def test_edit_file_finalize_failure_returns_structured_error(project, monkeypatc
     assert op["status"] == "PENDING"
 
 
+# ── Phase 2: Task 2.1 — FILESYSTEM_ERROR logs a warning ─────────────────────
+
+
+def test_write_file_filesystem_error_logged(project, tmp_path, monkeypatch, caplog):
+    """hgp_write_file must log a WARNING when the filesystem write fails.
+
+    The PENDING op is left for the reconciler — the warning is the only signal
+    visible to operators before reconciler runs.
+    """
+    import logging
+
+    target = tmp_path / "readonly_dir" / "file.txt"
+
+    # Monkeypatch Path.write_text to simulate a filesystem write failure
+    original_write_text = Path.write_text
+
+    def _fail_write(self, *args, **kwargs):
+        if self == target:
+            raise OSError("[Errno 13] Permission denied")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _fail_write)
+
+    with caplog.at_level(logging.WARNING, logger="hgp.server"):
+        result = hgp_write_file(str(target), "content", "agent-1")
+
+    assert result.get("error") == "FILESYSTEM_ERROR"
+    assert any(
+        "FILESYSTEM_ERROR" in r.message or "filesystem write failed" in r.message
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    ), f"Expected FILESYSTEM_ERROR warning, got records: {[r.message for r in caplog.records]}"
+
+
+# ── Phase 2: Task 2.3 — cas.store() exceptions surface as error dicts ────────
+
+
+def test_write_file_payload_too_large_returns_error(project, tmp_path, monkeypatch):
+    """hgp_write_file returns PAYLOAD_TOO_LARGE when cas.store raises PayloadTooLargeError."""
+    from hgp.errors import PayloadTooLargeError
+
+    def _raise(_data):
+        raise PayloadTooLargeError("10485761 bytes exceeds 10485760 byte limit")
+
+    monkeypatch.setattr(server_module._cas, "store", _raise)
+
+    target = tmp_path / "big.txt"
+    result = hgp_write_file(str(target), "x" * 100, "agent-1")
+
+    assert result.get("error") == "PAYLOAD_TOO_LARGE"
+
+
+def test_write_file_blob_write_error_returns_error(project, tmp_path, monkeypatch):
+    """hgp_write_file returns BLOB_WRITE_ERROR when cas.store raises BlobWriteError."""
+    from hgp.errors import BlobWriteError
+
+    def _raise(_data):
+        raise BlobWriteError("rename failed")
+
+    monkeypatch.setattr(server_module._cas, "store", _raise)
+
+    target = tmp_path / "bad.txt"
+    result = hgp_write_file(str(target), "content", "agent-1")
+
+    assert result.get("error") == "BLOB_WRITE_ERROR"
+
+
+def test_move_file_dest_payload_too_large_returns_error(project, tmp_path, monkeypatch):
+    """hgp_move_file returns PAYLOAD_TOO_LARGE when cas.store raises for destination blob."""
+    from hgp.errors import PayloadTooLargeError
+
+    src = tmp_path / "src.txt"
+    src.write_text("content")
+    dst = tmp_path / "dst.txt"
+
+    def _raise(_data):
+        raise PayloadTooLargeError("too large")
+
+    monkeypatch.setattr(server_module._cas, "store", _raise)
+
+    result = hgp_move_file(str(src), str(dst), "agent-1")
+
+    assert result.get("error") == "PAYLOAD_TOO_LARGE"
+
+
 def test_delete_symlink_rejected(project, tmp_path):
     """hgp_delete_file rejects symlinks before any DB or filesystem change."""
     target = tmp_path / "real_file.txt"

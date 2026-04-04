@@ -515,3 +515,27 @@ def test_rule5_pending_move_pair_both_stale(hgp_dirs: dict):
     assert report.pending_recovered == 0
     assert db.get_operation(inv_id)["status"] == "STALE_PENDING"
     assert db.get_operation(art_id)["status"] == "STALE_PENDING"
+
+
+# ── Phase 2: Task 2.4 — unparseable created_at recorded in report.errors ─────
+
+
+def test_rule5_pending_unparseable_created_at_recorded_in_errors(hgp_dirs: dict):
+    """PENDING op with a non-ISO created_at must be recorded in report.errors (not crash)."""
+    db, cas, rec = _setup(hgp_dirs)
+    db.begin_immediate()
+    seq = db.next_commit_seq()
+    op_id = f"bad-ts-{seq}"
+    db.insert_operation(
+        op_id=op_id, op_type="artifact", agent_id="agent-test",
+        commit_seq=seq, chain_hash="sha256:" + "a" * 64,
+        status="PENDING", file_path="/some/path.txt",
+    )
+    db.execute("UPDATE operations SET created_at = 'not-a-date' WHERE op_id = ?", (op_id,))
+    db.commit()
+
+    report = rec.reconcile()
+
+    assert any(op_id in e for e in report.errors), (
+        f"Expected op_id {op_id!r} in report.errors, got: {report.errors}"
+    )

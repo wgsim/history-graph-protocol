@@ -65,6 +65,49 @@ def test_list_all_blobs_with_mtime(hgp_dirs: dict):
     assert all(h.startswith("sha256:") for h, _ in blobs)
 
 
+# ── Phase 2: Task 2.5 — concurrent stat() ENOENT is silently skipped ─────────
+
+
+def test_list_all_blobs_skips_file_not_found_on_stat(hgp_dirs: dict, monkeypatch):
+    """list_all_blobs_with_mtime must skip blobs that disappear between glob and stat.
+
+    This simulates a race where another process deletes a blob file after the
+    directory is listed but before stat() is called on it.  The iterator must
+    yield the surviving blobs and skip the missing one without raising.
+    """
+    cas = CAS(hgp_dirs["content_dir"])
+    cas.store(b"blob-a")
+    cas.store(b"blob-b")
+
+    # Track stat() call counts per blob path.
+    # Blob files: 62-char name inside a 2-char subdir.
+    # is_file() calls stat() first (call 1); the explicit blob_file.stat() is call 2.
+    # We raise only on call 2 to simulate TOCTOU: file exists at is_file() but
+    # disappears before the explicit mtime stat.
+    call_counts: dict[str, int] = {}
+    target_path: list[str | None] = [None]
+    original_stat = Path.stat
+
+    def patched_stat(self, *args, **kwargs):
+        real = original_stat(self, *args, **kwargs)
+        if len(self.name) == 62 and len(self.parent.name) == 2:
+            key = str(self)
+            if target_path[0] is None:
+                target_path[0] = key  # pick first blob as the race target
+            if key == target_path[0]:
+                call_counts[key] = call_counts.get(key, 0) + 1
+                if call_counts[key] >= 2:
+                    raise FileNotFoundError("simulated concurrent deletion")
+        return real
+
+    monkeypatch.setattr(Path, "stat", patched_stat)
+
+    blobs = list(cas.list_all_blobs_with_mtime())
+    # One blob disappeared mid-iteration → only one should be yielded
+    assert len(blobs) == 1
+    assert blobs[0][0].startswith("sha256:")
+
+
 # ── Security: C-1 Path traversal ────────────────────────────────────────────
 
 def test_path_traversal_rejected(hgp_dirs: dict):

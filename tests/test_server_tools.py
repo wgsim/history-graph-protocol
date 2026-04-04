@@ -967,3 +967,31 @@ def test_query_operations_with_op_id_found(server_components):
     assert isinstance(result, dict)
     assert len(result["operations"]) == 1
     assert result["operations"][0]["op_id"] == created["op_id"]
+
+
+# ── Phase 2: Task 2.8 — acquire_lease warns when memory tier update fails ────
+
+
+def test_acquire_lease_memory_tier_failure_returns_warning_field(server_components, monkeypatch):
+    """hgp_acquire_lease must return {"warning": ...} when set_memory_tier raises sqlite3.Error.
+
+    The lease is still valid — the warning field signals that the short_term
+    promotion failed, so the caller knows to treat this as a degraded-mode lease.
+    """
+    import sqlite3 as _sqlite3
+
+    r = hgp_create_operation(op_type="artifact", agent_id="a")
+    db = server_components["db"]
+
+    def _fail_set_tier(*args, **kwargs):
+        raise _sqlite3.OperationalError("simulated tier update failure")
+
+    monkeypatch.setattr(db, "set_memory_tier", _fail_set_tier)
+
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=r["op_id"])
+
+    assert "lease_id" in lease, f"lease_id must be present even on tier failure: {lease}"
+    assert "warning" in lease, (
+        f"warning field must be present when memory tier update fails: {lease}"
+    )
+    assert "short_term" in lease["warning"].lower() or "memory tier" in lease["warning"].lower()
