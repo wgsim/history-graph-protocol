@@ -626,33 +626,38 @@ Returns all evidence references recorded on a given operation — that is, the o
 
 ### Returns
 
-A list of up to 200 EvidenceRecord dicts:
-
 ```json
-[
-  {
-    "cited_op_id": "string",
-    "op_type": "string",
-    "status": "string",
-    "memory_tier": "string",
-    "relation": "string",
-    "scope": "string | null",
-    "inference": "string | null",
-    "created_at": "ISO 8601 timestamp"
-  }
-]
+{
+  "op_id": "string",
+  "evidence": [
+    {
+      "cited_op_id": "string",
+      "op_type": "string",
+      "status": "string",
+      "memory_tier": "string",
+      "relation": "string",
+      "scope": "string | null",
+      "inference": "string | null",
+      "created_at": "ISO 8601 timestamp"
+    }
+  ]
+}
 ```
+
+Up to 200 records are returned in `evidence`.
 
 | Field | Description |
 |---|---|
-| `cited_op_id` | Op ID of the operation that was cited as evidence |
-| `op_type` | Type of the cited operation |
-| `status` | Current status of the cited operation |
-| `memory_tier` | Current memory tier of the cited operation |
-| `relation` | Relationship type (e.g., `supports`, `refutes`) |
-| `scope` | Which part of the cited op was used (may be null) |
-| `inference` | Conclusion drawn from the cited op (may be null) |
-| `created_at` | Timestamp when the evidence link was created |
+| `op_id` | The operation ID whose evidence was queried |
+| `evidence` | List of EvidenceRecord dicts (up to 200) |
+| `evidence[].cited_op_id` | Op ID of the operation that was cited as evidence |
+| `evidence[].op_type` | Type of the cited operation |
+| `evidence[].status` | Current status of the cited operation |
+| `evidence[].memory_tier` | Current memory tier of the cited operation |
+| `evidence[].relation` | Relationship type (e.g., `supports`, `refutes`) |
+| `evidence[].scope` | Which part of the cited op was used (may be null) |
+| `evidence[].inference` | Conclusion drawn from the cited op (may be null) |
+| `evidence[].created_at` | Timestamp when the evidence link was created |
 
 ### Error Codes
 
@@ -670,18 +675,21 @@ Request:
 
 Response:
 ```json
-[
-  {
-    "cited_op_id": "01HZ1234ABCD",
-    "op_type": "artifact",
-    "status": "COMPLETED",
-    "memory_tier": "short_term",
-    "relation": "supports",
-    "scope": "section 2",
-    "inference": "The data confirms the hypothesis.",
-    "created_at": "2026-03-25T10:00:00Z"
-  }
-]
+{
+  "op_id": "01HZ5678EFGH",
+  "evidence": [
+    {
+      "cited_op_id": "01HZ1234ABCD",
+      "op_type": "artifact",
+      "status": "COMPLETED",
+      "memory_tier": "short_term",
+      "relation": "supports",
+      "scope": "section 2",
+      "inference": "The data confirms the hypothesis.",
+      "created_at": "2026-03-25T10:00:00Z"
+    }
+  ]
+}
 ```
 
 ---
@@ -700,33 +708,38 @@ Returns all operations that cited the given operation as evidence — the invers
 
 ### Returns
 
-A list of up to 200 CitingRecord dicts:
-
 ```json
-[
-  {
-    "citing_op_id": "string",
-    "op_type": "string",
-    "status": "string",
-    "memory_tier": "string",
-    "relation": "string",
-    "scope": "string | null",
-    "inference": "string | null",
-    "created_at": "ISO 8601 timestamp"
-  }
-]
+{
+  "op_id": "string",
+  "citing_ops": [
+    {
+      "citing_op_id": "string",
+      "op_type": "string",
+      "status": "string",
+      "memory_tier": "string",
+      "relation": "string",
+      "scope": "string | null",
+      "inference": "string | null",
+      "created_at": "ISO 8601 timestamp"
+    }
+  ]
+}
 ```
+
+Up to 200 records are returned in `citing_ops`.
 
 | Field | Description |
 |---|---|
-| `citing_op_id` | Op ID of the operation that cited this one |
-| `op_type` | Type of the citing operation |
-| `status` | Current status of the citing operation |
-| `memory_tier` | Current memory tier of the citing operation |
-| `relation` | Relationship type from the citing op's perspective |
-| `scope` | Which part of this op was used by the citing op (may be null) |
-| `inference` | Conclusion drawn by the citing op (may be null) |
-| `created_at` | Timestamp when the citation was created |
+| `op_id` | The operation ID whose citations were queried |
+| `citing_ops` | List of CitingRecord dicts (up to 200) |
+| `citing_ops[].citing_op_id` | Op ID of the operation that cited this one |
+| `citing_ops[].op_type` | Type of the citing operation |
+| `citing_ops[].status` | Current status of the citing operation |
+| `citing_ops[].memory_tier` | Current memory tier of the citing operation |
+| `citing_ops[].relation` | Relationship type from the citing op's perspective |
+| `citing_ops[].scope` | Which part of this op was used by the citing op (may be null) |
+| `citing_ops[].inference` | Conclusion drawn by the citing op (may be null) |
+| `citing_ops[].created_at` | Timestamp when the citation was created |
 
 ### Error Codes
 
@@ -744,18 +757,21 @@ Request:
 
 Response:
 ```json
-[
-  {
-    "citing_op_id": "01HZ5678EFGH",
-    "op_type": "hypothesis",
-    "status": "COMPLETED",
-    "memory_tier": "short_term",
-    "relation": "supports",
-    "scope": null,
-    "inference": "Artifact supports the core claim.",
-    "created_at": "2026-03-25T10:05:00Z"
-  }
-]
+{
+  "op_id": "01HZ1234ABCD",
+  "citing_ops": [
+    {
+      "citing_op_id": "01HZ5678EFGH",
+      "op_type": "hypothesis",
+      "status": "COMPLETED",
+      "memory_tier": "short_term",
+      "relation": "supports",
+      "scope": null,
+      "inference": "Artifact supports the core claim.",
+      "created_at": "2026-03-25T10:05:00Z"
+    }
+  ]
+}
 ```
 
 ---
@@ -916,6 +932,7 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 
 | Code | Meaning |
 |------|---------|
+| `SYMLINK_NOT_SUPPORTED` | `file_path` is a symbolic link; HGP does not track symlinks |
 | `FILE_NOT_FOUND` | `file_path` does not exist |
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
@@ -967,6 +984,7 @@ If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked o
 
 | Code | Meaning |
 |------|---------|
+| `SYMLINK_NOT_SUPPORTED` | `old_path` is a symbolic link; HGP does not track symlinks |
 | `FILE_NOT_FOUND` | `old_path` does not exist |
 | `PATH_OUTSIDE_ROOT` | `old_path` or `new_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
@@ -1028,11 +1046,12 @@ The following table consolidates all error codes across all tools.
 | `INVALIDATION_TARGET_NOT_FOUND` | `hgp_create_operation` | An `invalidates_op_ids` entry does not exist |
 | `INVALID_STATUS` | `hgp_query_operations` | `status` value is not one of `PENDING`, `COMPLETED`, `INVALIDATED`, `MISSING_BLOB`, `STALE_PENDING` |
 | `INVALID_TIER` | `hgp_set_memory_tier` | `tier` is not one of `short_term`, `long_term`, `inactive` |
-| `OP_NOT_FOUND` | `hgp_set_memory_tier`, `hgp_get_evidence`, `hgp_get_citing_ops` | No operation exists with the given `op_id` |
+| `OP_NOT_FOUND` | `hgp_set_memory_tier`, `hgp_get_evidence`, `hgp_get_citing_ops`, `hgp_anchor_git` | No operation exists with the given `op_id` |
 | `NOT_FOUND` | `hgp_get_artifact` | No artifact exists for the given `object_hash` |
 | `INVALID_SHA` | `hgp_anchor_git` | `git_commit_sha` is not exactly 40 lowercase hex characters |
-| `DB_ERROR` | `hgp_get_evidence`, `hgp_get_citing_ops` | An internal database error occurred |
+| `DB_ERROR` | `hgp_get_evidence`, `hgp_get_citing_ops`, `hgp_anchor_git` | An internal database error occurred |
 | `FILE_NOT_FOUND` | `hgp_edit_file`, `hgp_delete_file`, `hgp_move_file` | The target file does not exist on disk |
+| `SYMLINK_NOT_SUPPORTED` | `hgp_delete_file`, `hgp_move_file` | The path is a symbolic link; HGP does not track symlinks |
 | `STRING_NOT_FOUND` | `hgp_edit_file` | `old_string` not found in file |
 | `AMBIGUOUS_MATCH` | `hgp_edit_file` | `old_string` appears more than once |
 | `PATH_OUTSIDE_ROOT` | V4 file tools | File path resolves outside the project root |
