@@ -432,11 +432,17 @@ def hgp_anchor_git(
     db, _, _, _ = _get_components()
     if not _GIT_SHA_RE.fullmatch(git_commit_sha):
         return {"error": "INVALID_SHA", "message": "git_commit_sha must be 40 lowercase hex chars"}
-    db.execute(
-        "INSERT OR IGNORE INTO git_anchors (op_id, git_commit_sha, repository) VALUES (?, ?, ?)",
-        (op_id, git_commit_sha, repository),
-    )
-    db.commit()
+    if not db.get_operation(op_id):
+        return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
+    try:
+        db.execute(
+            "INSERT OR IGNORE INTO git_anchors (op_id, git_commit_sha, repository) VALUES (?, ?, ?)",
+            (op_id, git_commit_sha, repository),
+        )
+        db.commit()
+    except sqlite3.Error as exc:
+        _log.error("DB error in hgp_anchor_git op_id=%r: %s", op_id, exc, exc_info=True)
+        return {"error": "DB_ERROR", "message": "Internal database error"}
     return {"anchored": True, "op_id": op_id, "git_commit_sha": git_commit_sha}
 
 
@@ -449,26 +455,26 @@ def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
 
 
 @mcp.tool()
-def hgp_get_evidence(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
+def hgp_get_evidence(op_id: str) -> dict[str, Any]:
     """Return all operations that op_id cited as evidence."""
     db, _, _, _ = _get_components()
     try:
         if not db.get_operation(op_id):
             return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
-        return db.get_evidence(op_id)
+        return {"op_id": op_id, "evidence": db.get_evidence(op_id)}
     except sqlite3.Error as exc:
         _log.error("DB error in hgp_get_evidence op_id=%r: %s", op_id, exc, exc_info=True)
         return {"error": "DB_ERROR", "message": "Internal database error"}
 
 
 @mcp.tool()
-def hgp_get_citing_ops(op_id: str) -> dict[str, Any] | list[dict[str, Any]]:
+def hgp_get_citing_ops(op_id: str) -> dict[str, Any]:
     """Return all operations that cited op_id as evidence (reverse direction)."""
     db, _, _, _ = _get_components()
     try:
         if not db.get_operation(op_id):
             return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
-        return db.get_citing_ops(op_id)
+        return {"op_id": op_id, "citing_ops": db.get_citing_ops(op_id)}
     except sqlite3.Error as exc:
         _log.error("DB error in hgp_get_citing_ops op_id=%r: %s", op_id, exc, exc_info=True)
         return {"error": "DB_ERROR", "message": "Internal database error"}
@@ -717,6 +723,8 @@ def hgp_delete_file(
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
 
     path = Path(file_path)
+    if path.is_symlink():
+        return {"error": "SYMLINK_NOT_SUPPORTED", "message": f"{file_path} is a symlink; HGP does not track symlinks"}
     if not path.exists():
         return {"error": "FILE_NOT_FOUND", "message": f"{file_path} does not exist"}
 
@@ -801,6 +809,8 @@ def hgp_move_file(
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
 
     src = Path(old_path)
+    if src.is_symlink():
+        return {"error": "SYMLINK_NOT_SUPPORTED", "message": f"{old_path} is a symlink; HGP does not track symlinks"}
     if not src.exists():
         return {"error": "FILE_NOT_FOUND", "message": f"{old_path} does not exist"}
 

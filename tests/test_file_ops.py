@@ -706,3 +706,33 @@ def test_edit_file_finalize_failure_returns_structured_error(project, monkeypatc
     # New op must remain PENDING
     op = db.get_operation(result["op_id"])
     assert op["status"] == "PENDING"
+
+
+def test_delete_symlink_rejected(project, tmp_path):
+    """hgp_delete_file rejects symlinks before any DB or filesystem change."""
+    target = tmp_path / "real_file.txt"
+    target.write_text("content")
+    link = tmp_path / "link_to_file.txt"
+    link.symlink_to(target)
+
+    result = hgp_delete_file(str(link), "agent-1")
+
+    assert result.get("error") == "SYMLINK_NOT_SUPPORTED"
+    # Real file must be untouched
+    assert target.exists()
+
+
+def test_move_symlink_rejected(project, tmp_path):
+    """hgp_move_file rejects symlinks before any DB or filesystem change."""
+    target = tmp_path / "real_file.txt"
+    target.write_text("content")
+    link = tmp_path / "link_to_file.txt"
+    link.symlink_to(target)
+    dest = tmp_path / "dest.txt"
+
+    result = hgp_move_file(str(link), str(dest), "agent-1")
+
+    assert result.get("error") == "SYMLINK_NOT_SUPPORTED"
+    # Link and real file must be untouched
+    assert link.is_symlink()
+    assert target.exists()

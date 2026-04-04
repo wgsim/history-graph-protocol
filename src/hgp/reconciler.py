@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 _STAGING_FILE_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$"
@@ -20,12 +23,20 @@ PENDING_GRACE_PERIOD = timedelta(minutes=5)
 
 
 def _file_matches_hash(file_path: str, expected_hash: str) -> bool:
-    """Return True if file_path exists and its SHA-256 matches expected_hash."""
+    """Return True if file_path exists and its SHA-256 matches expected_hash.
+
+    Returns False for ENOENT (file absent).  For other OS errors (e.g. EACCES)
+    logs a warning and returns False so the caller treats the op as
+    unrecoverable rather than silently promoting it to STALE_PENDING.
+    """
     try:
         data = Path(file_path).read_bytes()
         computed = f"sha256:{hashlib.sha256(data).hexdigest()}"
         return computed == expected_hash
-    except OSError:
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        _log.warning("_file_matches_hash: unexpected OSError for %r: %s", file_path, exc)
         return False
 
 

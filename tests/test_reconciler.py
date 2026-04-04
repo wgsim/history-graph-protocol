@@ -474,6 +474,30 @@ def test_rule5_artifact_finalize_failure_does_not_abort_reconcile(hgp_dirs: dict
     assert db.get_operation(op_id)["status"] == "PENDING"
 
 
+def test_file_matches_hash_file_not_found_returns_false(hgp_dirs: dict):
+    """_file_matches_hash returns False when the file does not exist (FileNotFoundError)."""
+    from hgp.reconciler import _file_matches_hash
+    result = _file_matches_hash("/nonexistent/path/file.txt", "sha256:" + "a" * 64)
+    assert result is False
+
+
+def test_file_matches_hash_permission_error_returns_false(monkeypatch):
+    """_file_matches_hash returns False (not raises) when read_bytes raises PermissionError.
+
+    Before the fix, OSError was caught broadly but callers couldn't distinguish
+    ENOENT from EACCES. After the fix both return False but a warning is logged.
+    The key invariant: the function must never propagate an OSError to its caller.
+    """
+    from hgp.reconciler import _file_matches_hash
+
+    def _raise_permission(_self):
+        raise PermissionError("[Errno 13] Permission denied: '/no_read.txt'")
+
+    monkeypatch.setattr(Path, "read_bytes", _raise_permission)
+    result = _file_matches_hash("/no_read.txt", "sha256:" + "a" * 64)
+    assert result is False
+
+
 def test_rule5_pending_move_pair_both_stale(hgp_dirs: dict):
     """Move failed: file still at old path, nothing at new path → both STALE_PENDING."""
     db, cas, rec = _setup(hgp_dirs)

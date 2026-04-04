@@ -421,6 +421,12 @@ def test_git_anchor_hex_sha_accepted(server_components):
     assert result["anchored"] is True
 
 
+def test_git_anchor_nonexistent_op_returns_error(server_components):
+    """hgp_anchor_git with a non-existent op_id must return OP_NOT_FOUND, not silently succeed."""
+    result = hgp_anchor_git(op_id="does-not-exist", git_commit_sha="b" * 40)
+    assert result.get("error") == "OP_NOT_FOUND"
+
+
 # ── Security: H-5 ttl_seconds upper bound ────────────────────────────────────
 
 def test_acquire_lease_ttl_capped_at_86400(server_components):
@@ -609,7 +615,8 @@ def test_create_operation_with_evidence_refs(server_components):
         evidence_refs=[{"op_id": cited["op_id"], "relation": "supports", "inference": "confirmed"}],
     )
     assert "op_id" in citing
-    ev = hgp_get_evidence(citing["op_id"])
+    result = hgp_get_evidence(citing["op_id"])
+    ev = result["evidence"]
     assert len(ev) == 1
     assert ev[0]["cited_op_id"] == cited["op_id"]
     assert ev[0]["relation"] == "supports"
@@ -637,7 +644,8 @@ def test_hgp_get_citing_ops(server_components):
         op_type="hypothesis", agent_id="a",
         evidence_refs=[{"op_id": cited["op_id"], "relation": "source"}],
     )
-    result = hgp_get_citing_ops(cited["op_id"])
+    envelope = hgp_get_citing_ops(cited["op_id"])
+    result = envelope["citing_ops"]
     assert len(result) == 1
     assert result[0]["citing_op_id"] == citing["op_id"]
     assert result[0]["relation"] == "source"
@@ -782,7 +790,8 @@ def test_evidence_scope_and_inference_round_trip(server_components):
     from hgp.server import hgp_query_operations
     ops = hgp_query_operations(agent_id="a", op_type="hypothesis")["operations"]
     citing_id = ops[0]["op_id"]
-    ev = hgp_get_evidence(citing_id)
+    result = hgp_get_evidence(citing_id)
+    ev = result["evidence"]
     assert len(ev) == 1
     assert ev[0]["scope"] == "field.x[0:10]"
     assert ev[0]["inference"] == "the first 10 elements support the hypothesis"
@@ -800,7 +809,8 @@ def test_get_citing_ops_multiple_citing_ops(server_components):
         op_type="hypothesis", agent_id="b",
         evidence_refs=[{"op_id": cited["op_id"], "relation": "refutes"}],
     )
-    result = hgp_get_citing_ops(cited["op_id"])
+    envelope = hgp_get_citing_ops(cited["op_id"])
+    result = envelope["citing_ops"]
     citing_ids = {r["citing_op_id"] for r in result}
     assert len(result) == 2
     assert citing1["op_id"] in citing_ids
@@ -838,7 +848,8 @@ def test_create_operation_multiple_distinct_evidence_refs(server_components):
         ],
     )
     assert "op_id" in citing
-    ev = hgp_get_evidence(citing["op_id"])
+    result = hgp_get_evidence(citing["op_id"])
+    ev = result["evidence"]
     cited_ids = {e["cited_op_id"] for e in ev}
     assert len(ev) == 3
     assert cited1["op_id"] in cited_ids
@@ -859,7 +870,8 @@ def test_hgp_get_evidence_with_inactive_cited_op(server_components):
     db.commit()
     assert db.get_operation(cited["op_id"])["memory_tier"] == "inactive"
 
-    ev = hgp_get_evidence(citing["op_id"])
+    result = hgp_get_evidence(citing["op_id"])
+    ev = result["evidence"]
     assert len(ev) == 1
     assert ev[0]["cited_op_id"] == cited["op_id"]
     assert ev[0]["memory_tier"] == "inactive"  # row reflects tier at read time
@@ -875,7 +887,8 @@ def test_evidence_relation_refutes_round_trip(server_components):
         op_type="hypothesis", agent_id="a",
         evidence_refs=[{"op_id": cited["op_id"], "relation": "refutes", "inference": "contradicts obs"}],
     )
-    ev = hgp_get_evidence(citing["op_id"])
+    result = hgp_get_evidence(citing["op_id"])
+    ev = result["evidence"]
     assert len(ev) == 1
     assert ev[0]["relation"] == "refutes"
     assert ev[0]["inference"] == "contradicts obs"
@@ -890,7 +903,8 @@ def test_evidence_created_at_is_iso8601(server_components):
         op_type="hypothesis", agent_id="a",
         evidence_refs=[{"op_id": cited["op_id"], "relation": "method"}],
     )
-    ev = hgp_get_evidence(citing["op_id"])
+    result = hgp_get_evidence(citing["op_id"])
+    ev = result["evidence"]
     assert len(ev) == 1
     # SQLite stores: 2026-03-24T19:30:00.000Z — must parse without error
     created_at = ev[0]["created_at"]

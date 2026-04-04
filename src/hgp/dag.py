@@ -21,13 +21,14 @@ JOIN ancestors a ON o.op_id = a.op_id
 ORDER BY o.op_id
 """
 
-_EDGES_IN_SUBGRAPH_SQL = """
-WITH RECURSIVE ancestors(op_id) AS (
-    SELECT :root_op_id
+_EDGES_IN_SUBGRAPH_DEPTH_SQL = """
+WITH RECURSIVE ancestors(op_id, depth) AS (
+    SELECT :root_op_id, 0
     UNION
-    SELECT e.parent_op_id
+    SELECT e.parent_op_id, a.depth + 1
     FROM op_edges e
     JOIN ancestors a ON e.child_op_id = a.op_id
+    WHERE a.depth < :max_depth
 )
 SELECT e.child_op_id, e.parent_op_id, e.edge_type
 FROM op_edges e
@@ -119,10 +120,10 @@ def compute_chain_hash(db: Database, root_op_id: str, _max_depth: int = MAX_CHAI
     Traversal is depth-bounded by _max_depth to prevent DoS on deep DAGs.
     """
     ops = db.execute(_ANCESTOR_DEPTH_SQL, {"root_op_id": root_op_id, "max_depth": _max_depth}).fetchall()
-    ancestor_ids = {row["op_id"] for row in ops}
-    edges = db.execute(_EDGES_IN_SUBGRAPH_SQL, {"root_op_id": root_op_id}).fetchall()
-    # Filter edges to only those within the depth-bounded ancestor set
-    edges = [e for e in edges if e["child_op_id"] in ancestor_ids and e["parent_op_id"] in ancestor_ids]
+    edges = db.execute(
+        _EDGES_IN_SUBGRAPH_DEPTH_SQL,
+        {"root_op_id": root_op_id, "max_depth": _max_depth},
+    ).fetchall()
 
     ops_part = "|".join(
         f"{row['op_id']}:{row['status']}:{row['commit_seq']}" for row in ops

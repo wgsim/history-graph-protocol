@@ -178,3 +178,31 @@ def test_compute_chain_hash_max_depth_constant_exists(hgp_dirs: dict):
     """MAX_CHAIN_HASH_DEPTH must be exported from hgp.dag and be a reasonable bound."""
     from hgp.dag import MAX_CHAIN_HASH_DEPTH
     assert 100 <= MAX_CHAIN_HASH_DEPTH <= 2000
+
+
+def test_compute_chain_hash_depth_bounded_edges_sql(hgp_dirs: dict):
+    """_EDGES_IN_SUBGRAPH_DEPTH_SQL must exclude edges outside the depth cap.
+
+    Verifies that the SQL-level depth filter produces the same result as
+    the previous Python-level filter: edges to ancestors beyond the cap
+    must not appear in the hash input.
+    """
+    db = _make_db(hgp_dirs)
+    # Build chain: op-0 → op-1 → op-2 → op-3 → op-4
+    db.begin_immediate()
+    for i in range(5):
+        db.insert_operation(f"op-{i}", "artifact", "agent-1", i + 1, "sha256:" + str(i) * 64)
+    for i in range(1, 5):
+        db.insert_edge(f"op-{i}", f"op-{i-1}")
+    db.commit()
+
+    # With cap=2: includes op-4, op-3, op-2 and edges between them
+    # With cap=0: includes only op-4 (root), no edges
+    h_cap2 = compute_chain_hash(db, "op-4", _max_depth=2)
+    h_cap0 = compute_chain_hash(db, "op-4", _max_depth=0)
+    h_full = compute_chain_hash(db, "op-4", _max_depth=10)
+
+    # All three must be distinct (each has a different ancestor set + edge set)
+    assert h_cap0 != h_cap2
+    assert h_cap2 != h_full
+    assert h_cap0 != h_full
