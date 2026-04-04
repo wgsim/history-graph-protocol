@@ -522,6 +522,8 @@ Associates an HGP operation with a specific Git commit, creating a durable link 
 | Code | Condition |
 |---|---|
 | `INVALID_SHA` | `git_commit_sha` is not exactly 40 lowercase hex characters |
+| `OP_NOT_FOUND` | No operation exists with the given `op_id` |
+| `DB_ERROR` | An internal database error occurred |
 
 ### Example
 
