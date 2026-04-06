@@ -497,12 +497,54 @@ def test_query_operations_limit_clamped(server_components):
     assert len(result["operations"]) <= 1000
 
 
+def test_query_operations_negative_limit_clamped(server_components):
+    """limit=-1 must NOT behave as unbounded (SQLite LIMIT -1 returns all rows).
+    Negative values are clamped to 1 so the safety cap is always in effect."""
+    # Insert a few ops so there is something to return
+    for _ in range(3):
+        hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_query_operations(limit=-1)
+    assert isinstance(result, dict)
+    assert "operations" in result
+    # Clamped to 1 — must not return all rows
+    assert len(result["operations"]) <= 1, (
+        f"limit=-1 bypassed cap: got {len(result['operations'])} rows"
+    )
+
+
 def test_file_history_limit_clamped(server_components):
     """hgp_file_history limit > 1000 is clamped to 1000."""
     from hgp.server import hgp_file_history
     result = hgp_file_history(file_path="/nonexistent/path.py", limit=999999999)
     assert isinstance(result, dict)
     assert "operations" in result
+
+
+def test_file_history_negative_limit_clamped(server_components):
+    """hgp_file_history limit=-1 must not bypass the result cap."""
+    from hgp.server import hgp_file_history, hgp_write_file
+    import hgp.server as server_module
+    import os
+    import tempfile
+    # Write a few ops for the same file so there is history to return
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / ".git").mkdir()
+        orig_root = os.environ.get("HGP_PROJECT_ROOT")
+        os.environ["HGP_PROJECT_ROOT"] = tmp
+        try:
+            target = str(Path(tmp) / "f.txt")
+            for i in range(3):
+                hgp_write_file(target, f"v{i}", "agent-a")
+            result = hgp_file_history(file_path=target, limit=-1)
+        finally:
+            if orig_root is None:
+                os.environ.pop("HGP_PROJECT_ROOT", None)
+            else:
+                os.environ["HGP_PROJECT_ROOT"] = orig_root
+    assert isinstance(result, dict)
+    assert len(result["operations"]) <= 1, (
+        f"limit=-1 bypassed cap: got {len(result['operations'])} rows"
+    )
 
 
 def test_query_subgraph_max_depth_clamped(server_components):

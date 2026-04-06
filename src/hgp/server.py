@@ -277,7 +277,7 @@ def hgp_query_operations(
     """Query operations with optional filters. By default excludes inactive-tier ops; pass include_inactive=True to include them."""
     if status is not None and status not in _VALID_STATUSES:
         return {"error": "INVALID_STATUS", "message": f"status must be one of {sorted(_VALID_STATUSES)}"}
-    limit = min(limit, _MAX_QUERY_LIMIT)
+    limit = max(1, min(limit, _MAX_QUERY_LIMIT))
 
     db, _, _, _ = _get_components()
     if op_id:
@@ -317,7 +317,7 @@ def hgp_file_history(
     limit: int = 50,
 ) -> dict[str, Any]:
     """Return operations recorded for a given file_path, most recent first."""
-    limit = min(limit, _MAX_QUERY_LIMIT)
+    limit = max(1, min(limit, _MAX_QUERY_LIMIT))
     db, _, _, _ = _get_components()
     # Canonicalize query path so it matches stored canonical paths
     try:

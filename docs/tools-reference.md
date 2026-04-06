@@ -86,14 +86,15 @@ Each item in `evidence_refs` must conform to:
 | Code | Condition |
 |---|---|
 | `INVALID_OP_TYPE` | `op_type` is not one of the four valid values |
+| `INVALID_PAYLOAD` | `payload` is not valid base64 (strict validation — whitespace and non-alphabet characters are rejected) |
+| `PAYLOAD_TOO_LARGE` | Decoded `payload` exceeds the 10 MB CAS limit |
+| `BLOB_WRITE_ERROR` | CAS blob write failed; no op is committed |
+| `PARENT_NOT_FOUND` | An `op_id` in `parent_op_ids` does not exist |
+| `INVALIDATION_TARGET_NOT_FOUND` | An `op_id` in `invalidates_op_ids` does not exist |
 | `CHAIN_STALE` | Supplied `chain_hash` does not match the current subgraph hash (concurrent modification detected) |
 | `INVALID_EVIDENCE_REF` | One or more `evidence_refs` entries fail schema validation |
 | `TOO_MANY_EVIDENCE_REFS` | More than 50 `evidence_refs` provided |
 | `DUPLICATE_EVIDENCE_REF` | Two or more `evidence_refs` reference the same `op_id` |
-
-Raises `ParentNotFoundError` if any `op_id` in `parent_op_ids` does not exist.
-
-Raises `InvalidationTargetNotFoundError` (code `INVALIDATION_TARGET_NOT_FOUND`) if any `op_id` in `invalidates_op_ids` does not exist.
 
 ### Example
 
@@ -137,7 +138,7 @@ Queries operation records by one or more filter criteria. When `op_id` is suppli
 | `status` | `string` | No | `null` | Filter by status: `"PENDING"`, `"COMPLETED"`, `"INVALIDATED"`, `"MISSING_BLOB"`, `"STALE_PENDING"` |
 | `since_commit_seq` | `integer` | No | `null` | Return only operations with `commit_seq` greater than this value |
 | `include_inactive` | `boolean` | No | `false` | Whether to include operations in the `inactive` memory tier |
-| `limit` | `integer` | No | `100` | Maximum number of results to return |
+| `limit` | `integer` | No | `100` | Maximum number of results to return. Clamped to `[1, 1000]`; negative values are treated as `1`. |
 | `file_path` | `string` | No | `null` | Filter to operations recorded for this file path (canonicalized before matching) |
 
 ### Returns
@@ -203,7 +204,7 @@ Traverses the causal graph from a root operation and returns all reachable opera
 |---|---|---|---|---|
 | `root_op_id` | `string` | Yes | — | Starting node for the traversal |
 | `direction` | `string` | No | `"ancestors"` | Traversal direction: `"ancestors"` or `"descendants"` |
-| `max_depth` | `integer` | No | `50` | Maximum edge depth to traverse |
+| `max_depth` | `integer` | No | `50` | Maximum edge depth to traverse. Clamped to `[1, 500]`. |
 | `include_invalidated` | `boolean` | No | `false` | Whether to include `INVALIDATED` operations in results |
 
 ### Returns
@@ -1012,7 +1013,7 @@ Returns the operation history for a given file path, ordered most-recent-first. 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `file_path` | string | ✓ | Absolute path of the file |
-| `limit` | integer | | Maximum number of operations to return (default: 50) |
+| `limit` | integer | | Maximum number of operations to return (default: 50). Clamped to `[1, 1000]`. |
 
 ### Returns
 
