@@ -557,24 +557,31 @@ def test_query_subgraph_max_depth_clamped(server_components):
 
 
 def test_query_subgraph_max_depth_lower_bound_clamped(server_components):
-    """hgp_query_subgraph non-positive max_depth is clamped to 1 (lower bound)."""
+    """hgp_query_subgraph non-positive max_depth is clamped to 1 (lower bound).
+
+    Must query from child (has an ancestor) so depth=0/-1 would differ from
+    depth=1 on the pre-fix implementation.  Pre-fix: 2/1/1; post-fix: 2/2/2.
+    """
     from hgp.server import hgp_query_subgraph
 
     root = hgp_create_operation(op_type="artifact", agent_id="a")
     child = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[root["op_id"]])
     assert "op_id" in child, f"child creation failed: {child}"
 
-    baseline = hgp_query_subgraph(root_op_id=root["op_id"], max_depth=1)
-    count_at_1 = len(baseline["operations"])
-
-    result_zero = hgp_query_subgraph(root_op_id=root["op_id"], max_depth=0)
-    result_neg = hgp_query_subgraph(root_op_id=root["op_id"], max_depth=-1)
-
-    assert len(result_zero["operations"]) == count_at_1, (
-        f"max_depth=0 returned {len(result_zero['operations'])} ops, expected {count_at_1} (same as max_depth=1)"
+    # Baseline: child + its ancestor root → exactly 2 ops at depth=1
+    baseline = hgp_query_subgraph(root_op_id=child["op_id"], max_depth=1)
+    assert len(baseline["operations"]) == 2, (
+        f"baseline (max_depth=1 from child) should return 2 ops, got {len(baseline['operations'])}"
     )
-    assert len(result_neg["operations"]) == count_at_1, (
-        f"max_depth=-1 returned {len(result_neg['operations'])} ops, expected {count_at_1} (same as max_depth=1)"
+
+    result_zero = hgp_query_subgraph(root_op_id=child["op_id"], max_depth=0)
+    result_neg = hgp_query_subgraph(root_op_id=child["op_id"], max_depth=-1)
+
+    assert len(result_zero["operations"]) == 2, (
+        f"max_depth=0 returned {len(result_zero['operations'])} ops, expected 2 (clamped to 1)"
+    )
+    assert len(result_neg["operations"]) == 2, (
+        f"max_depth=-1 returned {len(result_neg['operations'])} ops, expected 2 (clamped to 1)"
     )
 
 
