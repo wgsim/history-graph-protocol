@@ -280,6 +280,7 @@ Acquires an exclusive lease on a subgraph rooted at the specified operation. Ret
 | `lease_id` | Opaque token to use in subsequent calls |
 | `chain_hash` | Subgraph hash at the moment the lease was acquired |
 | `expires_at` | UTC timestamp when the lease expires |
+| `warning` | *(optional)* Present when the short-term memory-tier promotion failed. The lease is still valid; `warning` signals degraded mode only. |
 
 ### Error Codes
 
@@ -829,6 +830,8 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `PARENT_NOT_FOUND` | A `parent_op_ids` entry does not exist |
 | `INVALID_EVIDENCE_REF` | An `evidence_refs` entry failed validation |
+| `PAYLOAD_TOO_LARGE` | Content exceeds the 10 MB CAS limit; no op is committed |
+| `BLOB_WRITE_ERROR` | CAS blob write failed (e.g. filesystem error during atomic rename); no op is committed |
 | `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem write failed (op remains PENDING) |
 | `DB_FINALIZE_ERROR` | Filesystem write succeeded but post-write DB finalization failed; op remains PENDING, file has new content |
 
@@ -991,6 +994,8 @@ If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked o
 | `PATH_OUTSIDE_ROOT` | `old_path` or `new_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
+| `PAYLOAD_TOO_LARGE` | Destination content exceeds the 10 MB CAS limit; no ops are committed |
+| `BLOB_WRITE_ERROR` | CAS blob write failed for the destination blob; no ops are committed |
 | `FILESYSTEM_ERROR` | Both ops committed as PENDING but the filesystem rename failed (ops remain PENDING, prior artifact preserved as COMPLETED) |
 | `DB_FINALIZE_ERROR` | Rename succeeded but post-rename DB finalization failed atomically; ops remain PENDING, prior artifact remains COMPLETED |
 
@@ -1052,6 +1057,8 @@ The following table consolidates all error codes across all tools.
 | `NOT_FOUND` | `hgp_get_artifact` | No artifact exists for the given `object_hash` |
 | `INVALID_SHA` | `hgp_anchor_git` | `git_commit_sha` is not exactly 40 lowercase hex characters |
 | `DB_ERROR` | `hgp_get_evidence`, `hgp_get_citing_ops`, `hgp_anchor_git` | An internal database error occurred |
+| `PAYLOAD_TOO_LARGE` | V4 file tools | Content exceeds the 10 MB CAS limit; no op is committed |
+| `BLOB_WRITE_ERROR` | V4 file tools | CAS blob write failed; no op is committed. Note: the internal `BlobWriteError` class uses code `BLOB_WRITE_FAILED`; the MCP-facing code is `BLOB_WRITE_ERROR`. |
 | `FILE_NOT_FOUND` | `hgp_edit_file`, `hgp_delete_file`, `hgp_move_file` | The target file does not exist on disk |
 | `SYMLINK_NOT_SUPPORTED` | `hgp_delete_file`, `hgp_move_file` | The path is a symbolic link; HGP does not track symlinks |
 | `STRING_NOT_FOUND` | `hgp_edit_file` | `old_string` not found in file |
