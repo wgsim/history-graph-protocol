@@ -341,7 +341,7 @@ def hgp_query_subgraph(
     include_invalidated: bool = False,
 ) -> dict[str, Any]:
     """Traverse the causal subgraph from root_op_id."""
-    max_depth = min(max_depth, _MAX_SUBGRAPH_DEPTH)
+    max_depth = max(1, min(max_depth, _MAX_SUBGRAPH_DEPTH))
     db, _, _, _ = _get_components()
     # Use a single deferred transaction so chain_hash and ops come from the same snapshot.
     db.begin_deferred()

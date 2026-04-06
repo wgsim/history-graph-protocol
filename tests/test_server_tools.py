@@ -556,6 +556,28 @@ def test_query_subgraph_max_depth_clamped(server_components):
     assert "operations" in result
 
 
+def test_query_subgraph_max_depth_lower_bound_clamped(server_components):
+    """hgp_query_subgraph non-positive max_depth is clamped to 1 (lower bound)."""
+    from hgp.server import hgp_query_subgraph
+
+    root = hgp_create_operation(op_type="artifact", agent_id="a")
+    child = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=[root["op_id"]])
+    assert "op_id" in child, f"child creation failed: {child}"
+
+    baseline = hgp_query_subgraph(root_op_id=root["op_id"], max_depth=1)
+    count_at_1 = len(baseline["operations"])
+
+    result_zero = hgp_query_subgraph(root_op_id=root["op_id"], max_depth=0)
+    result_neg = hgp_query_subgraph(root_op_id=root["op_id"], max_depth=-1)
+
+    assert len(result_zero["operations"]) == count_at_1, (
+        f"max_depth=0 returned {len(result_zero['operations'])} ops, expected {count_at_1} (same as max_depth=1)"
+    )
+    assert len(result_neg["operations"]) == count_at_1, (
+        f"max_depth=-1 returned {len(result_neg['operations'])} ops, expected {count_at_1} (same as max_depth=1)"
+    )
+
+
 # ── Phase 3: Task 3.3 — hgp_create_operation error dict unification ──────────
 
 
