@@ -22,6 +22,8 @@ _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MAX_TTL_SECONDS = 86400
 # Limits evidence refs per operation to cap O(N) existence checks inside BEGIN IMMEDIATE.
 _MAX_EVIDENCE_REFS = 50
+_MAX_QUERY_LIMIT = 1000
+_MAX_SUBGRAPH_DEPTH = 500
 
 from hgp.cas import CAS
 from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
@@ -107,12 +109,12 @@ def hgp_create_operation(
     # Validate parents exist
     for pid in (parent_op_ids or []):
         if not db.get_operation(pid):
-            raise ParentNotFoundError(f"Parent operation not found: {pid}")
+            return {"error": "PARENT_NOT_FOUND", "message": f"Parent operation not found: {pid}"}
 
     # Validate invalidation targets exist
     for inv_id in (invalidates_op_ids or []):
         if not db.get_operation(inv_id):
-            raise InvalidationTargetNotFoundError(f"Invalidation target not found: {inv_id}")
+            return {"error": "INVALIDATION_TARGET_NOT_FOUND", "message": f"Invalidation target not found: {inv_id}"}
 
     root_op_id = subgraph_root_op_id or (parent_op_ids[0] if parent_op_ids else None)
 
@@ -120,13 +122,21 @@ def hgp_create_operation(
     if chain_hash and root_op_id:
         current = compute_chain_hash(db, root_op_id)
         if current != chain_hash:
-            raise ChainStaleError(f"CHAIN_STALE: expected {chain_hash}, got {current}")
+            return {"error": "CHAIN_STALE", "message": f"CHAIN_STALE: expected {chain_hash}, got {current}"}
 
     # Phase 2: Write blob to CAS (idempotent, outside transaction)
     object_hash: str | None = None
     if payload:
-        raw = base64.b64decode(payload)
-        object_hash = cas.store(raw)
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except Exception:
+            return {"error": "INVALID_PAYLOAD", "message": "payload is not valid base64"}
+        try:
+            object_hash = cas.store(raw)
+        except PayloadTooLargeError as exc:
+            return {"error": "PAYLOAD_TOO_LARGE", "message": str(exc)}
+        except BlobWriteError as exc:
+            return {"error": "BLOB_WRITE_ERROR", "message": str(exc)}
 
     # Phase 3: Atomic DB commit (BEGIN IMMEDIATE)
     op_id = str(uuid.uuid4())
@@ -137,9 +147,7 @@ def hgp_create_operation(
             current = compute_chain_hash(db, root_op_id)
             if current != chain_hash:
                 db.rollback()
-                raise ChainStaleError(
-                    f"CHAIN_STALE (under lock): expected {chain_hash}, got {current}"
-                )
+                return {"error": "CHAIN_STALE", "message": f"CHAIN_STALE (under lock): expected {chain_hash}, got {current}"}
 
         seq = db.next_commit_seq()
         db.insert_operation(
@@ -269,6 +277,7 @@ def hgp_query_operations(
     """Query operations with optional filters. By default excludes inactive-tier ops; pass include_inactive=True to include them."""
     if status is not None and status not in _VALID_STATUSES:
         return {"error": "INVALID_STATUS", "message": f"status must be one of {sorted(_VALID_STATUSES)}"}
+    limit = min(limit, _MAX_QUERY_LIMIT)
 
     db, _, _, _ = _get_components()
     if op_id:
@@ -308,6 +317,7 @@ def hgp_file_history(
     limit: int = 50,
 ) -> dict[str, Any]:
     """Return operations recorded for a given file_path, most recent first."""
+    limit = min(limit, _MAX_QUERY_LIMIT)
     db, _, _, _ = _get_components()
     # Canonicalize query path so it matches stored canonical paths
     try:
@@ -331,6 +341,7 @@ def hgp_query_subgraph(
     include_invalidated: bool = False,
 ) -> dict[str, Any]:
     """Traverse the causal subgraph from root_op_id."""
+    max_depth = min(max_depth, _MAX_SUBGRAPH_DEPTH)
     db, _, _, _ = _get_components()
     # Use a single deferred transaction so chain_hash and ops come from the same snapshot.
     db.begin_deferred()

@@ -95,39 +95,38 @@ def test_create_with_parents(server_components):
 
 
 def test_create_parent_not_found(server_components):
-    with pytest.raises(ParentNotFoundError):
-        hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=["nonexistent-id"])
+    """Missing parent_op_id returns PARENT_NOT_FOUND error dict (no exception raised)."""
+    result = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=["nonexistent-id"])
+    assert result.get("error") == "PARENT_NOT_FOUND"
 
 
 def test_create_invalidates_target_not_found(server_components):
-    """invalidates_op_ids referencing a missing op raises a domain error, not a raw SQLite IntegrityError."""
+    """invalidates_op_ids referencing a missing op returns error dict, not a raw SQLite IntegrityError."""
     import sqlite3
-    with pytest.raises(InvalidationTargetNotFoundError):
-        hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=["missing-op"])
-    # Confirm raw IntegrityError is NOT raised (redundant guard)
+    result = hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=["missing-op"])
+    assert result.get("error") == "INVALIDATION_TARGET_NOT_FOUND"
+    # Confirm raw IntegrityError is NOT raised
     try:
         hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=["missing-op-2"])
-    except InvalidationTargetNotFoundError:
-        pass
     except sqlite3.IntegrityError as exc:
         raise AssertionError(f"Raw SQLite IntegrityError leaked: {exc}") from exc
 
 
 def test_create_chain_stale(server_components):
-    """Providing an outdated chain_hash raises ChainStaleError."""
+    """Providing an outdated chain_hash returns CHAIN_STALE error dict (no exception raised)."""
     op = hgp_create_operation(op_type="artifact", agent_id="a")
     stale_hash = op["chain_hash"]
     # Mutate the subgraph
     server_components["db"].update_operation_status(op["op_id"], "INVALIDATED")
     server_components["db"].commit()
-    with pytest.raises(ChainStaleError):
-        hgp_create_operation(
-            op_type="artifact",
-            agent_id="a",
-            parent_op_ids=[op["op_id"]],
-            subgraph_root_op_id=op["op_id"],
-            chain_hash=stale_hash,
-        )
+    result = hgp_create_operation(
+        op_type="artifact",
+        agent_id="a",
+        parent_op_ids=[op["op_id"]],
+        subgraph_root_op_id=op["op_id"],
+        chain_hash=stale_hash,
+    )
+    assert result.get("error") == "CHAIN_STALE"
 
 
 def test_create_invalidates_cascade(server_components):
@@ -462,11 +461,89 @@ def test_create_max_payload_ok(server_components):
 
 
 def test_create_max_payload_exceeded(server_components):
-    """10 MB + 1 byte raises PayloadTooLargeError."""
+    """10 MB + 1 byte returns PAYLOAD_TOO_LARGE error dict."""
     TOO_BIG = 10 * 1024 * 1024 + 1
     payload = base64.b64encode(b"x" * TOO_BIG).decode()
-    with pytest.raises(PayloadTooLargeError):
-        hgp_create_operation(op_type="artifact", agent_id="a", payload=payload)
+    result = hgp_create_operation(op_type="artifact", agent_id="a", payload=payload)
+    assert result.get("error") == "PAYLOAD_TOO_LARGE"
+
+
+# ── Phase 3: Task 3.1 — base64 validate=True ─────────────────────────────────
+
+
+def test_create_invalid_base64_returns_error(server_components):
+    """payload with non-base64 characters returns INVALID_PAYLOAD (not corrupt CAS store)."""
+    result = hgp_create_operation(op_type="artifact", agent_id="a", payload="not!!valid==base64")
+    assert result.get("error") == "INVALID_PAYLOAD"
+
+
+def test_create_base64_with_whitespace_returns_error(server_components):
+    """base64 with embedded whitespace is silently accepted by default but rejected with validate=True."""
+    # b64decode without validate=True strips spaces; validate=True rejects them
+    valid_b64 = base64.b64encode(b"hello").decode()
+    padded = valid_b64[:4] + " " + valid_b64[4:]  # inject whitespace mid-string
+    result = hgp_create_operation(op_type="artifact", agent_id="a", payload=padded)
+    assert result.get("error") == "INVALID_PAYLOAD"
+
+
+# ── Phase 3: Task 3.2 — limit / max_depth clamping ───────────────────────────
+
+
+def test_query_operations_limit_clamped(server_components):
+    """limit > 1000 is silently clamped; no error, result count ≤ 1000."""
+    result = hgp_query_operations(limit=999999999)
+    assert isinstance(result, dict)
+    assert "operations" in result
+    assert len(result["operations"]) <= 1000
+
+
+def test_file_history_limit_clamped(server_components):
+    """hgp_file_history limit > 1000 is clamped to 1000."""
+    from hgp.server import hgp_file_history
+    result = hgp_file_history(file_path="/nonexistent/path.py", limit=999999999)
+    assert isinstance(result, dict)
+    assert "operations" in result
+
+
+def test_query_subgraph_max_depth_clamped(server_components):
+    """hgp_query_subgraph max_depth > 500 is clamped to 500."""
+    from hgp.server import hgp_query_subgraph
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    result = hgp_query_subgraph(root_op_id=op["op_id"], max_depth=999999)
+    assert isinstance(result, dict)
+    assert "operations" in result
+
+
+# ── Phase 3: Task 3.3 — hgp_create_operation error dict unification ──────────
+
+
+def test_create_parent_not_found_no_exception(server_components):
+    """PARENT_NOT_FOUND must be an error dict, not a raised exception."""
+    result = hgp_create_operation(op_type="artifact", agent_id="a", parent_op_ids=["missing"])
+    assert isinstance(result, dict), "must return dict, not raise"
+    assert result["error"] == "PARENT_NOT_FOUND"
+
+
+def test_create_invalidation_target_not_found_no_exception(server_components):
+    """INVALIDATION_TARGET_NOT_FOUND must be an error dict, not a raised exception."""
+    result = hgp_create_operation(op_type="invalidation", agent_id="a", invalidates_op_ids=["missing"])
+    assert isinstance(result, dict), "must return dict, not raise"
+    assert result["error"] == "INVALIDATION_TARGET_NOT_FOUND"
+
+
+def test_create_chain_stale_no_exception(server_components):
+    """CHAIN_STALE must be an error dict, not a raised exception."""
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    server_components["db"].update_operation_status(op["op_id"], "INVALIDATED")
+    server_components["db"].commit()
+    result = hgp_create_operation(
+        op_type="artifact", agent_id="a",
+        parent_op_ids=[op["op_id"]],
+        subgraph_root_op_id=op["op_id"],
+        chain_hash=op["chain_hash"],
+    )
+    assert isinstance(result, dict), "must return dict, not raise"
+    assert result["error"] == "CHAIN_STALE"
 
 
 # ── V2 Memory Tier Tests ─────────────────────────────────────
