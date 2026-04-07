@@ -829,6 +829,7 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 |------|---------|
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `CROSS_REPO_OPERATION` | `file_path` belongs to a different repository than the one this server is bound to |
 | `PARENT_NOT_FOUND` | A `parent_op_ids` entry does not exist |
 | `INVALID_EVIDENCE_REF` | An `evidence_refs` entry failed validation |
 | `PAYLOAD_TOO_LARGE` | Content exceeds the 10 MB CAS limit; no op is committed |
@@ -896,6 +897,7 @@ Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, 
 | `AMBIGUOUS_MATCH` | `old_string` found more than once |
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `CROSS_REPO_OPERATION` | `file_path` belongs to a different repository than the one this server is bound to |
 | `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem write failed (op remains PENDING) |
 | `DB_FINALIZE_ERROR` | Filesystem write succeeded but post-write DB finalization failed; op remains PENDING, file has new content |
 
@@ -942,6 +944,7 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 | `FILE_NOT_FOUND` | `file_path` does not exist |
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `CROSS_REPO_OPERATION` | `file_path` belongs to a different repository than the one this server is bound to |
 | `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
 | `FILESYSTEM_ERROR` | HGP op committed as PENDING but the filesystem unlink failed (op remains PENDING, file preserved) |
 | `DB_FINALIZE_ERROR` | Unlink succeeded but post-unlink DB finalization failed atomically; op remains PENDING, prior artifact remains COMPLETED |
@@ -994,6 +997,7 @@ If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked o
 | `FILE_NOT_FOUND` | `old_path` does not exist |
 | `PATH_OUTSIDE_ROOT` | `old_path` or `new_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `CROSS_REPO_OPERATION` | Source file belongs to a different repository than the one this server is bound to |
 | `INVALID_PARENT_OP_ID` | `previous_op_id` was supplied but does not exist in HGP |
 | `PAYLOAD_TOO_LARGE` | Destination content exceeds the 10 MB CAS limit; no ops are committed |
 | `BLOB_WRITE_ERROR` | CAS blob write failed for the destination blob; no ops are committed |
@@ -1066,4 +1070,5 @@ The following table consolidates all error codes across all tools.
 | `AMBIGUOUS_MATCH` | `hgp_edit_file` | `old_string` appears more than once |
 | `PATH_OUTSIDE_ROOT` | V4 file tools | File path resolves outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | V4 file tools | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
+| `CROSS_REPO_OPERATION` | V4 file tools | File belongs to a different repository than the one this server process is bound to; start a separate HGP server for that project |
 | `INVALID_PARENT_OP_ID` | `hgp_delete_file`, `hgp_move_file` | `previous_op_id` supplied but does not exist in HGP |

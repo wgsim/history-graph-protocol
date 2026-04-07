@@ -43,26 +43,39 @@ _db: Database | None = None
 _cas: CAS | None = None
 _lease_mgr: LeaseManager | None = None
 _reconciler: Reconciler | None = None
-_project_root: Path | None = None  # bound repo root; None means global (~/.hgp/) mode
+_project_root: Path | None = None  # bound repo root; None = global (~/.hgp/) mode
+_project_bound: bool = False        # True once root resolution has completed
+
+
+def _ensure_project_bound() -> None:
+    """Resolve and cache _project_root without opening DB/CAS.
+
+    Separates project root resolution from DB initialization so that
+    _check_file_project() works correctly on the very first call in a
+    fresh process, before _get_components() has been called.
+    """
+    global _project_root, _project_bound
+    if _project_bound:
+        return
+    if os.environ.get("HGP_GLOBAL_MODE"):
+        _project_root = None
+    else:
+        try:
+            _project_root = find_project_root(Path.cwd())
+        except ProjectRootError:
+            _log.warning(
+                "No .git repository found from cwd; using global store ~/.hgp/. "
+                "Set HGP_PROJECT_ROOT or run from inside a git repository for repo-local storage."
+            )
+            _project_root = None
+    _project_bound = True
 
 
 def _get_components() -> tuple[Database, CAS, LeaseManager, Reconciler]:
-    global _db, _cas, _lease_mgr, _reconciler, _project_root
+    global _db, _cas, _lease_mgr, _reconciler
+    _ensure_project_bound()
     if _db is None:
-        if os.environ.get("HGP_GLOBAL_MODE"):
-            bound_root: Path | None = None
-            hgp_dir = Path.home() / ".hgp"
-        else:
-            try:
-                bound_root = find_project_root(Path.cwd())
-                hgp_dir = bound_root / ".hgp"
-            except ProjectRootError:
-                _log.warning(
-                    "No .git repository found from cwd; using global store ~/.hgp/. "
-                    "Set HGP_PROJECT_ROOT or run from inside a git repository for repo-local storage."
-                )
-                bound_root = None
-                hgp_dir = Path.home() / ".hgp"
+        hgp_dir = (_project_root / ".hgp") if _project_root else (Path.home() / ".hgp")
         hgp_content_dir = hgp_dir / ".hgp_content"
         # Use locals to avoid partial global state on failure: only assign globals
         # after all components initialize successfully.
@@ -83,7 +96,6 @@ def _get_components() -> tuple[Database, CAS, LeaseManager, Reconciler]:
             db.close()
             raise
         _db, _cas, _lease_mgr, _reconciler = db, cas, lease_mgr, reconciler
-        _project_root = bound_root
     assert _db and _cas and _lease_mgr and _reconciler
     return _db, _cas, _lease_mgr, _reconciler
 
@@ -92,8 +104,7 @@ def _check_file_project(file_root: Path) -> dict[str, Any] | None:
     """Return an error dict if file_root doesn't match the bound project root.
 
     Returns None when the check passes (global mode, or roots match).
-    This prevents file operations in one repo from being recorded in another
-    repo's DB when the server is bound to a specific project.
+    Must be called after _ensure_project_bound() so _project_root is set.
     """
     if _project_root is not None and file_root.resolve() != _project_root.resolve():
         return {
@@ -605,6 +616,7 @@ def hgp_write_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+    _ensure_project_bound()
     if err := _check_file_project(root):
         return err
 
@@ -657,6 +669,7 @@ def hgp_append_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+    _ensure_project_bound()
     if err := _check_file_project(root):
         return err
 
@@ -714,6 +727,7 @@ def hgp_edit_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+    _ensure_project_bound()
     if err := _check_file_project(root):
         return err
 
@@ -774,6 +788,7 @@ def hgp_delete_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+    _ensure_project_bound()
     if err := _check_file_project(root):
         return err
 
@@ -859,6 +874,7 @@ def hgp_move_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
+    _ensure_project_bound()
     if err := _check_file_project(root):
         return err
 

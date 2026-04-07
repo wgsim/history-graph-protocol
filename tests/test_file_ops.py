@@ -31,22 +31,21 @@ def project(tmp_path):
     reconciler = Reconciler(db, cas, content_dir)
 
     # Save originals
+    import os
     orig = (
-        server_module._db,
-        server_module._cas,
-        server_module._lease_mgr,
-        server_module._reconciler,
+        server_module._db, server_module._cas,
+        server_module._lease_mgr, server_module._reconciler,
+        server_module._project_root, server_module._project_bound,
     )
+    orig_env = os.environ.get("HGP_PROJECT_ROOT")
 
     # Patch globals
     server_module._db = db
     server_module._cas = cas
     server_module._lease_mgr = lease_mgr
     server_module._reconciler = reconciler
-
-    # Also patch HGP_PROJECT_ROOT via env var by monkeypatching os.environ
-    import os
-    orig_env = os.environ.get("HGP_PROJECT_ROOT")
+    server_module._project_root = tmp_path
+    server_module._project_bound = True
     os.environ["HGP_PROJECT_ROOT"] = str(tmp_path)
 
     yield tmp_path
@@ -57,7 +56,11 @@ def project(tmp_path):
     else:
         os.environ["HGP_PROJECT_ROOT"] = orig_env
 
-    server_module._db, server_module._cas, server_module._lease_mgr, server_module._reconciler = orig
+    (
+        server_module._db, server_module._cas,
+        server_module._lease_mgr, server_module._reconciler,
+        server_module._project_root, server_module._project_bound,
+    ) = orig
     db.close()
 
 

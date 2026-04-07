@@ -43,18 +43,28 @@ def server_components(tmp_path: Path):
     reconciler = Reconciler(db, cas, content_dir)
 
     # Save originals
-    orig = (server_module._db, server_module._cas, server_module._lease_mgr, server_module._reconciler)
+    orig = (
+        server_module._db, server_module._cas,
+        server_module._lease_mgr, server_module._reconciler,
+        server_module._project_root, server_module._project_bound,
+    )
 
     # Patch globals
     server_module._db = db
     server_module._cas = cas
     server_module._lease_mgr = lease_mgr
     server_module._reconciler = reconciler
+    server_module._project_root = tmp_path
+    server_module._project_bound = True
 
     yield {"db": db, "cas": cas, "lease_mgr": lease_mgr, "reconciler": reconciler, "content_dir": content_dir}
 
     # Restore originals
-    server_module._db, server_module._cas, server_module._lease_mgr, server_module._reconciler = orig
+    (
+        server_module._db, server_module._cas,
+        server_module._lease_mgr, server_module._reconciler,
+        server_module._project_root, server_module._project_bound,
+    ) = orig
     db.close()
 
 
@@ -1170,35 +1180,49 @@ def test_check_file_project_passes_when_roots_match(tmp_path):
         server_module._project_root = orig
 
 
-def test_write_file_rejects_cross_repo(server_components, tmp_path):
-    """hgp_write_file returns CROSS_REPO_OPERATION when file is outside the bound project."""
-    import os
+def test_write_file_rejects_cross_repo_cold_start(server_components, tmp_path, monkeypatch):
+    """hgp_write_file rejects cross-repo ops on the FIRST call (cold-start state).
+
+    Exercises the real startup path: _project_bound=False, _project_root=None.
+    Verifies that _ensure_project_bound() resolves the project root before
+    _check_file_project() runs, so cross-repo rejection is immediate even
+    before _get_components() has been called.
+    """
     from hgp.server import hgp_write_file
 
     repo_a = tmp_path / "repo_a"
     repo_a.mkdir()
-    (repo_a / ".git").mkdir()
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
-    (repo_b / ".git").mkdir()
 
-    orig_root = server_module._project_root
-    orig_env = os.environ.get("HGP_PROJECT_ROOT")
-    server_module._project_root = repo_a
-    os.environ["HGP_PROJECT_ROOT"] = str(repo_b)
-    try:
-        # File is in repo_b but server is bound to repo_a
-        result = hgp_write_file(
-            file_path=str(repo_b / "test.txt"),
-            content="hello",
-            agent_id="agent-a",
-        )
-        assert result.get("error") == "CROSS_REPO_OPERATION", (
-            f"Expected CROSS_REPO_OPERATION, got: {result}"
-        )
-    finally:
-        server_module._project_root = orig_root
-        if orig_env is None:
-            os.environ.pop("HGP_PROJECT_ROOT", None)
-        else:
-            os.environ["HGP_PROJECT_ROOT"] = orig_env
+    # Simulate cold-start: root not yet resolved (_db is set by fixture so
+    # _get_components() won't re-open the DB, but _project_bound is fresh)
+    monkeypatch.setattr(server_module, "_project_root", None)
+    monkeypatch.setattr(server_module, "_project_bound", False)
+
+    # find_project_root is called in two places:
+    #   1. hgp_write_file → find_project_root(repo_b/...) → should return repo_b
+    #   2. _ensure_project_bound → find_project_root(cwd) → should return repo_a
+    # Mock returns repo_b for paths under repo_b, repo_a otherwise.
+    def mock_find_root(start: Path) -> Path:
+        try:
+            start.resolve().relative_to(repo_b.resolve())
+            return repo_b
+        except ValueError:
+            return repo_a
+
+    monkeypatch.setattr(server_module, "find_project_root", mock_find_root)
+
+    # First call with a file in repo_b — must be rejected immediately
+    result = hgp_write_file(
+        file_path=str(repo_b / "test.txt"),
+        content="hello",
+        agent_id="agent-a",
+    )
+    assert result.get("error") == "CROSS_REPO_OPERATION", (
+        f"First cold-start cross-repo call must be rejected immediately, got: {result}"
+    )
+    assert server_module._project_bound, "_project_bound must be True after first call"
+    assert server_module._project_root == repo_a, (
+        f"_project_root must be repo_a after _ensure_project_bound(), got: {server_module._project_root}"
+    )
