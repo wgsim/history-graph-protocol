@@ -1002,21 +1002,42 @@ def hgp_move_file(
     }
 
 
+_INSTALL_HOOKS_USAGE = (
+    "usage: hgp install-hooks [--claude] [--gemini]\n"
+    "\n"
+    "  (no flags)   install both Claude Code and Gemini CLI hooks\n"
+    "  --claude     install Claude Code hooks only\n"
+    "  --gemini     install Gemini CLI hooks only\n"
+)
+
+_VALID_INSTALL_FLAGS = {"--claude", "--gemini"}
+
+
 def _install_hooks(args: list[str]) -> None:
     """Install HGP hook files into .claude/hooks/ and/or .gemini/hooks/."""
     import importlib.resources
     import shutil
     import sys
 
-    all_targets = not args or (args == ["--claude"] or args == ["--gemini"]) is False
-    do_claude = not args or "--claude" in args or all_targets
-    do_gemini = not args or "--gemini" in args or all_targets
+    unknown = [a for a in args if a not in _VALID_INSTALL_FLAGS]
+    if unknown:
+        print(f"hgp install-hooks: unknown flag(s): {' '.join(unknown)}", file=sys.stderr)
+        print(_INSTALL_HOOKS_USAGE, file=sys.stderr)
+        sys.exit(1)
 
-    # default: both when no flag given
-    if not args:
-        do_claude = do_gemini = True
+    do_claude = not args or "--claude" in args
+    do_gemini = not args or "--gemini" in args
 
-    cwd = Path.cwd()
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp install-hooks: no git repository found from current directory.\n"
+            "Run this command from inside a git repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     installed: list[str] = []
 
     def _copy_hooks(pkg: str, dest_dir: Path) -> None:
@@ -1027,12 +1048,12 @@ def _install_hooks(args: list[str]) -> None:
                 dest = dest_dir / item.name
                 with importlib.resources.as_file(item) as src:
                     shutil.copy2(src, dest)
-                installed.append(str(dest.relative_to(cwd)))
+                installed.append(str(dest.relative_to(project_root)))
 
     if do_claude:
-        _copy_hooks("claude", cwd / ".claude" / "hooks")
+        _copy_hooks("claude", project_root / ".claude" / "hooks")
     if do_gemini:
-        _copy_hooks("gemini", cwd / ".gemini" / "hooks")
+        _copy_hooks("gemini", project_root / ".gemini" / "hooks")
 
     if installed:
         print("Installed HGP hooks:")
