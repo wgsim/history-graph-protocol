@@ -87,6 +87,18 @@ hgp
 python -m hgp.server
 ```
 
+### Installing hooks
+
+HGP ships hook scripts for Claude Code and Gemini CLI. Run once inside your project:
+
+```bash
+hgp install-hooks            # install both Claude Code and Gemini CLI hooks
+hgp install-hooks --claude   # Claude Code only
+hgp install-hooks --gemini   # Gemini CLI only
+```
+
+Hooks are installed into `<repo_root>/.claude/hooks/` and `<repo_root>/.gemini/hooks/`. The command must be run from inside a git repository.
+
 ### Storage
 
 HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gitignored). The server resolves the project root from the working directory at startup — it is bound to one repository per process.
