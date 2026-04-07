@@ -2,9 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 dist/
-.hgp_content/
-# HGP database (committed to git per-project for consistent restore — V4 design)
-# *.db  ← intentionally not ignored; only WAL/SHM lock files are excluded
+# HGP repo-local storage (not committed to git)
+.hgp/
 *.db-wal
 *.db-shm
 .mypy_cache/

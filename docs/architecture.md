@@ -527,14 +527,21 @@ Layers 2c/2e use a marker-file gate: the Pre hook writes `/tmp/.hgp_bash_mutatin
 - Codex CLI enforcement — `PreToolUse` in Codex only intercepts Bash (not file write tools) as of April 2026; only instruction files (`AGENTS.md`) apply for Codex
 - Binary files are out of scope (future work)
 
-### Git + HGP Consistency
+### Storage placement
 
-V4 removes `*.db` from `.gitignore`. The HGP database is committed to git alongside project files. This provides:
+HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/`, which is listed in `.gitignore`. The HGP store is **not** committed to git.
 
-- **Consistent restore** — `git restore` or `git checkout` on a previous commit restores both code and the HGP history that corresponds to that code
-- **Branch isolation** — Each git branch carries its own HGP history
-- **No orphaned history** — Deleting a branch removes its history too
+```
+<repo_root>/
+  .hgp/
+    hgp.db            ← SQLite database (gitignored)
+    .hgp_content/     ← CAS blob store (gitignored)
+```
 
-**WAL/SHM files** (`.db-wal`, `.db-shm`) remain in `.gitignore` because they are SQLite lock files that are meaningless outside an active connection.
+This keeps durable project-level file history co-located with the project without introducing binary blob churn into git history. The project root is resolved at server startup via `find_project_root(Path.cwd())` (checks `HGP_PROJECT_ROOT` env var, then walks up to nearest `.git`).
+
+**Legacy mode:** Set `HGP_GLOBAL_MODE=1` to use `~/.hgp/` instead (single global store across all projects). This is retained for backward compatibility only.
+
+**WAL/SHM files** (`.db-wal`, `.db-shm`) are also gitignored — they are SQLite lock files meaningless outside an active connection.
 
 The `hgp_reconcile` tool handles crash-recovery for the case where the DB is in an inconsistent state after an unexpected shutdown.

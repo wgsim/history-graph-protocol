@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import sqlite3
 import uuid
@@ -36,10 +37,6 @@ from hgp.reconciler import Reconciler
 
 # ── Server initialization ───────────────────────────────────
 
-HGP_DIR = Path.home() / ".hgp"
-HGP_CONTENT_DIR = HGP_DIR / ".hgp_content"
-HGP_DB_PATH = HGP_DIR / "hgp.db"
-
 mcp = FastMCP("hgp")
 
 _db: Database | None = None
@@ -48,19 +45,33 @@ _lease_mgr: LeaseManager | None = None
 _reconciler: Reconciler | None = None
 
 
+def _resolve_hgp_dir() -> Path:
+    """Return the HGP storage directory for the current project.
+
+    Uses ~/.hgp/ when HGP_GLOBAL_MODE=1 is set (legacy fallback).
+    Otherwise resolves <repo_root>/.hgp/ via find_project_root().
+    """
+    if os.environ.get("HGP_GLOBAL_MODE"):
+        return Path.home() / ".hgp"
+    root = find_project_root(Path.cwd())
+    return root / ".hgp"
+
+
 def _get_components() -> tuple[Database, CAS, LeaseManager, Reconciler]:
     global _db, _cas, _lease_mgr, _reconciler
     if _db is None:
+        hgp_dir = _resolve_hgp_dir()
+        hgp_content_dir = hgp_dir / ".hgp_content"
         # Use locals to avoid partial global state on failure: only assign globals
         # after all components initialize successfully.
-        db = Database(HGP_DB_PATH)
+        db = Database(hgp_dir / "hgp.db")
         try:
-            HGP_DIR.mkdir(parents=True, exist_ok=True)
-            HGP_CONTENT_DIR.mkdir(exist_ok=True)
+            hgp_dir.mkdir(parents=True, exist_ok=True)
+            hgp_content_dir.mkdir(exist_ok=True)
             db.initialize()
-            cas = CAS(HGP_CONTENT_DIR)
+            cas = CAS(hgp_content_dir)
             lease_mgr = LeaseManager(db)
-            reconciler = Reconciler(db, cas, HGP_CONTENT_DIR)
+            reconciler = Reconciler(db, cas, hgp_content_dir)
             db.expire_leases()
             db.commit()
             startup_report = reconciler.reconcile()
