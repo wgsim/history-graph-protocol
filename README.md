@@ -71,15 +71,19 @@ This allows full auditability: given any decision, you can reconstruct exactly w
 
 ```bash
 # With uv (recommended)
-uv pip install hgp
+uv pip install history-graph-protocol
 
 # With pip
-pip install hgp
+pip install history-graph-protocol
 ```
+
+> **Note:** The PyPI package name is `history-graph-protocol`; the installed CLI command is `hgp`.
 
 **Run as MCP server (stdio transport):**
 
 ```bash
+hgp
+# or
 python -m hgp.server
 ```
 
