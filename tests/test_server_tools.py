@@ -1357,6 +1357,6 @@ def test_lease_validate_extend_true_advances_expires_at(server_components):
         "SELECT expires_at FROM leases WHERE lease_id=?", (lease["lease_id"],)
     ).fetchone()["expires_at"]
 
-    assert after_expires >= original_expires, (
-        f"extend=True must not reduce expires_at: {original_expires} → {after_expires}"
+    assert after_expires > original_expires, (
+        f"extend=True must advance expires_at: {original_expires} → {after_expires}"
     )
