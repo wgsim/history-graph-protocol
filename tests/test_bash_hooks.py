@@ -106,7 +106,10 @@ def test_pre_bash_writes_marker_on_mutating_command():
     # Marker file: /tmp/.hgp_bash_mutating_<ppid-of-hook-process>
     # The hook uses os.getppid() which will be our test process pid
     marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
-    # Clean up if exists
+    # Task 5.6: assert the marker was actually written before cleaning it up
+    assert marker.exists(), (
+        f"Pre hook must write marker file {marker} for mutating commands"
+    )
     marker.unlink(missing_ok=True)
 
 

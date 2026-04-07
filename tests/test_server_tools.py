@@ -1226,3 +1226,137 @@ def test_write_file_rejects_cross_repo_cold_start(server_components, tmp_path, m
     assert server_module._project_root == repo_a, (
         f"_project_root must be repo_a after _ensure_project_bound(), got: {server_module._project_root}"
     )
+
+
+# ── Phase 5 — Test Coverage Gaps ────────────────────────────────────────────
+
+
+# Task 5.1 ─────────────────────────────────────────────────────────────────────
+
+def test_acquire_lease_auto_releases_prior_active_lease(server_components):
+    """acquire() for same agent+subgraph releases the prior ACTIVE lease.
+
+    Acquiring a second lease must result in exactly one ACTIVE lease and
+    the first lease transitioning to RELEASED.
+    """
+    root = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease1 = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=root["op_id"])
+    lease2 = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=root["op_id"])
+
+    db = server_components["db"]
+
+    row1 = db.execute(
+        "SELECT status FROM leases WHERE lease_id=?", (lease1["lease_id"],)
+    ).fetchone()
+    assert row1["status"] == "RELEASED", (
+        f"First lease must be RELEASED after re-acquire, got: {row1['status']}"
+    )
+
+    row2 = db.execute(
+        "SELECT status FROM leases WHERE lease_id=?", (lease2["lease_id"],)
+    ).fetchone()
+    assert row2["status"] == "ACTIVE", (
+        f"Second lease must be ACTIVE, got: {row2['status']}"
+    )
+
+    active_count = db.execute(
+        "SELECT COUNT(*) AS n FROM leases "
+        "WHERE agent_id='a' AND subgraph_root_op_id=? AND status='ACTIVE'",
+        (root["op_id"],),
+    ).fetchone()["n"]
+    assert active_count == 1, f"Exactly one ACTIVE lease expected, got: {active_count}"
+
+
+# Task 5.2 ─────────────────────────────────────────────────────────────────────
+
+def test_get_components_init_failure_leaves_db_none(monkeypatch, tmp_path):
+    """_get_components() leaves _db=None if DB initialization fails.
+
+    This ensures the next call retries initialization rather than using
+    a partially-initialized global state.
+    """
+    # Reset all singleton state
+    orig = (
+        server_module._db, server_module._cas,
+        server_module._lease_mgr, server_module._reconciler,
+        server_module._project_root, server_module._project_bound,
+    )
+    server_module._db = None
+    server_module._cas = None
+    server_module._lease_mgr = None
+    server_module._reconciler = None
+    server_module._project_root = None
+    server_module._project_bound = False
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("HGP_PROJECT_ROOT", str(tmp_path))
+
+    class FailingDatabase:
+        """Stub that raises on initialize() to simulate DB init failure."""
+        def __init__(self, path): pass
+        def initialize(self): raise RuntimeError("simulated DB init failure")
+        def close(self): pass
+
+    monkeypatch.setattr(server_module, "Database", FailingDatabase)
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated DB init failure"):
+            server_module._get_components()
+
+        assert server_module._db is None, "_db must remain None after failed init"
+        assert server_module._cas is None, "_cas must remain None after failed init"
+        assert server_module._lease_mgr is None, "_lease_mgr must remain None after failed init"
+        assert server_module._reconciler is None, "_reconciler must remain None after failed init"
+    finally:
+        (
+            server_module._db, server_module._cas,
+            server_module._lease_mgr, server_module._reconciler,
+            server_module._project_root, server_module._project_bound,
+        ) = orig
+
+
+# Task 5.3 ─────────────────────────────────────────────────────────────────────
+
+def test_file_history_outside_project_root_returns_empty(server_components):
+    """hgp_file_history with a path outside the project root returns empty operations.
+
+    Must not raise — callers rely on an empty-list response for paths
+    that have no recorded history, including paths outside the project.
+    """
+    from hgp.server import hgp_file_history
+
+    # /dev/null is guaranteed to be outside any test tmp_path project root
+    result = hgp_file_history(file_path="/dev/null")
+    assert isinstance(result, dict), f"Must return a dict, got: {type(result)}"
+    assert "operations" in result, f"Must have 'operations' key, got: {result}"
+    assert result["operations"] == [], (
+        f"Must return empty operations for out-of-project path, got: {result['operations']}"
+    )
+
+
+# Task 5.5 ─────────────────────────────────────────────────────────────────────
+
+def test_lease_validate_extend_true_advances_expires_at(server_components):
+    """hgp_validate_lease(extend=True) advances expires_at beyond the original value.
+
+    extend=True resets the TTL from now, so expires_at must be strictly
+    greater than the value recorded at acquire time.
+    """
+    root = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=root["op_id"], ttl_seconds=300)
+
+    db = server_components["db"]
+    original_expires = db.execute(
+        "SELECT expires_at FROM leases WHERE lease_id=?", (lease["lease_id"],)
+    ).fetchone()["expires_at"]
+
+    validated = hgp_validate_lease(lease["lease_id"], extend=True)
+    assert validated["valid"] is True
+
+    after_expires = db.execute(
+        "SELECT expires_at FROM leases WHERE lease_id=?", (lease["lease_id"],)
+    ).fetchone()["expires_at"]
+
+    assert after_expires >= original_expires, (
+        f"extend=True must not reduce expires_at: {original_expires} → {after_expires}"
+    )

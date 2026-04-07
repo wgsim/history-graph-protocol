@@ -824,3 +824,33 @@ def test_move_symlink_rejected(project, tmp_path):
     # Link and real file must be untouched
     assert link.is_symlink()
     assert target.exists()
+
+
+# ── Phase 5 — Task 5.4 ────────────────────────────────────────────────────────
+
+def test_write_file_symlink_pointing_outside_root_rejected(project):
+    """hgp_write_file returns PATH_OUTSIDE_ROOT for a symlink that resolves outside the project.
+
+    canonical_file_path() resolves symlinks before validating against the project
+    root, so a symlink inside the project that points outside must be rejected.
+    """
+    # Create an external file outside the project root
+    external = project.parent / "external_target.txt"
+    external.write_text("external content")
+
+    # Create a symlink inside the project that points to the external file
+    inside_link = project / "seemingly_internal.txt"
+    inside_link.symlink_to(external)
+
+    result = hgp_write_file(
+        file_path=str(inside_link),
+        content="via symlink",
+        agent_id="agent-a",
+    )
+
+    assert result.get("error") == "PATH_OUTSIDE_ROOT", (
+        f"Symlink pointing outside project root must return PATH_OUTSIDE_ROOT, got: {result}"
+    )
+    # External file must be untouched
+    assert external.read_text() == "external content"
+
