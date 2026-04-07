@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import hgp.server as server_module
+from hgp.server import HGPContext
 from hgp.db import Database
 from hgp.cas import CAS
 from hgp.lease import LeaseManager
@@ -18,7 +19,7 @@ from hgp.server import hgp_write_file, hgp_append_file, hgp_edit_file, hgp_delet
 
 @pytest.fixture
 def project(tmp_path):
-    """Inject temp DB/CAS into server module globals and set up a fake git project root."""
+    """Inject temp DB/CAS into server module _ctx and set up a fake git project root."""
     (tmp_path / ".git").mkdir()
 
     content_dir = tmp_path / ".hgp_content"
@@ -30,37 +31,24 @@ def project(tmp_path):
     lease_mgr = LeaseManager(db)
     reconciler = Reconciler(db, cas, content_dir)
 
-    # Save originals
     import os
-    orig = (
-        server_module._db, server_module._cas,
-        server_module._lease_mgr, server_module._reconciler,
-        server_module._project_root, server_module._project_bound,
-    )
+    orig_ctx = server_module._ctx
     orig_env = os.environ.get("HGP_PROJECT_ROOT")
 
-    # Patch globals
-    server_module._db = db
-    server_module._cas = cas
-    server_module._lease_mgr = lease_mgr
-    server_module._reconciler = reconciler
-    server_module._project_root = tmp_path
-    server_module._project_bound = True
+    server_module._ctx = HGPContext(
+        db=db, cas=cas, lease_mgr=lease_mgr, reconciler=reconciler,
+        project_root=tmp_path,
+    )
     os.environ["HGP_PROJECT_ROOT"] = str(tmp_path)
 
     yield tmp_path
 
-    # Restore
     if orig_env is None:
         os.environ.pop("HGP_PROJECT_ROOT", None)
     else:
         os.environ["HGP_PROJECT_ROOT"] = orig_env
 
-    (
-        server_module._db, server_module._cas,
-        server_module._lease_mgr, server_module._reconciler,
-        server_module._project_root, server_module._project_bound,
-    ) = orig
+    server_module._ctx = orig_ctx
     db.close()
 
 
@@ -100,7 +88,7 @@ def test_write_file_default_reason_in_metadata(project):
     result = hgp_write_file(
         file_path=str(target), content="# Title", agent_id="agent-1"
     )
-    db = server_module._db
+    db = server_module._ctx.db
     op = db.get_operation(result["op_id"])
     meta = json.loads(op["metadata"] or "{}")
     assert "CREATE" in meta.get("reason", "")
@@ -177,8 +165,7 @@ def test_edit_records_op_with_file_path(project):
         file_path=str(target), old_string="a = 1",
         new_string="a = 2", agent_id="agent-1"
     )
-    from hgp.server import _get_components
-    db, _, _, _ = _get_components()
+    db = server_module._ctx.db
     op = db.get_operation(result["op_id"])
     assert op["file_path"] == str(target)
 
@@ -201,8 +188,7 @@ def test_delete_marks_previous_op_invalidated(project):
     target.write_text("x")
     write_result = hgp_write_file(str(target), "x", "agent-1")
     hgp_delete_file(str(target), "agent-1", previous_op_id=write_result["op_id"])
-    from hgp.server import _get_components
-    db, _, _, _ = _get_components()
+    db = server_module._ctx.db
     prev_op = db.get_operation(write_result["op_id"])
     assert prev_op["status"] == "INVALIDATED"
 
@@ -238,8 +224,7 @@ def test_move_records_new_path_op(project):
     src.write_text("hello")
     write_result = hgp_write_file(str(src), "hello", "agent-1")
     result = hgp_move_file(str(src), str(dst), "agent-1", previous_op_id=write_result["op_id"])
-    from hgp.server import _get_components
-    db, _, _, _ = _get_components()
+    db = server_module._ctx.db
     new_op = db.get_operation(result["op_id"])
     assert new_op["file_path"] == str(dst)
     assert new_op["op_type"] == "artifact"
@@ -516,7 +501,7 @@ def test_delete_file_fs_failure_preserves_prior_op_status(project, monkeypatch):
     )
     assert "error" in result, f"expected error dict, got: {result}"
 
-    db = server_module._db
+    db = server_module._ctx.db
     prior_op = db.get_operation(prior_op_id)
     assert prior_op["status"] == "COMPLETED", (
         f"prior artifact must remain COMPLETED after failed delete, got: {prior_op['status']}"
@@ -538,7 +523,7 @@ def test_move_file_fs_failure_preserves_prior_op_status(project, monkeypatch):
     result = hgp_move_file(str(src), str(dst), "agent-1")
     assert "error" in result, f"expected error dict, got: {result}"
 
-    db = server_module._db
+    db = server_module._ctx.db
     prior_op = db.get_operation(prior_op_id)
     assert prior_op["status"] == "COMPLETED", (
         f"prior artifact must remain COMPLETED after failed move, got: {prior_op['status']}"
@@ -552,7 +537,7 @@ def test_delete_file_finalize_failure_no_partial_state(project, monkeypatch):
     write_result = hgp_write_file(str(target), "data", "agent-1")
     prior_op_id = write_result["op_id"]
 
-    db = server_module._db
+    db = server_module._ctx.db
 
     def failing_finalize(op_id):
         raise RuntimeError("simulated finalize failure")
@@ -575,7 +560,7 @@ def test_move_file_finalize_failure_no_partial_state(project, monkeypatch):
     write_result = hgp_write_file(str(src), "content", "agent-1")
     prior_op_id = write_result["op_id"]
 
-    db = server_module._db
+    db = server_module._ctx.db
 
     def failing_finalize(op_id):
         raise RuntimeError("simulated finalize failure")
@@ -637,7 +622,7 @@ def test_write_file_finalize_failure_returns_structured_error(project, monkeypat
     """If post-write DB finalization fails, tool returns structured error (not exception)."""
     target = project / "write_finalize_fail.txt"
 
-    db = server_module._db
+    db = server_module._ctx.db
 
     def failing_finalize(op_id):
         raise RuntimeError("simulated finalize failure")
@@ -665,7 +650,7 @@ def test_append_file_finalize_failure_returns_structured_error(project, monkeypa
     # Establish a COMPLETED prior op so the file is tracked
     hgp_write_file(str(target), "orig", "agent-1")
 
-    db = server_module._db
+    db = server_module._ctx.db
 
     def failing_finalize(op_id):
         raise RuntimeError("simulated finalize failure")
@@ -691,7 +676,7 @@ def test_edit_file_finalize_failure_returns_structured_error(project, monkeypatc
     target.write_text("old")
     hgp_write_file(str(target), "old", "agent-1")
 
-    db = server_module._db
+    db = server_module._ctx.db
 
     def failing_finalize(op_id):
         raise RuntimeError("simulated finalize failure")
@@ -755,7 +740,7 @@ def test_write_file_payload_too_large_returns_error(project, tmp_path, monkeypat
     def _raise(_data):
         raise PayloadTooLargeError("10485761 bytes exceeds 10485760 byte limit")
 
-    monkeypatch.setattr(server_module._cas, "store", _raise)
+    monkeypatch.setattr(server_module._ctx.cas, "store", _raise)
 
     target = tmp_path / "big.txt"
     result = hgp_write_file(str(target), "x" * 100, "agent-1")
@@ -770,7 +755,7 @@ def test_write_file_blob_write_error_returns_error(project, tmp_path, monkeypatc
     def _raise(_data):
         raise BlobWriteError("rename failed")
 
-    monkeypatch.setattr(server_module._cas, "store", _raise)
+    monkeypatch.setattr(server_module._ctx.cas, "store", _raise)
 
     target = tmp_path / "bad.txt"
     result = hgp_write_file(str(target), "content", "agent-1")
@@ -789,7 +774,7 @@ def test_move_file_dest_payload_too_large_returns_error(project, tmp_path, monke
     def _raise(_data):
         raise PayloadTooLargeError("too large")
 
-    monkeypatch.setattr(server_module._cas, "store", _raise)
+    monkeypatch.setattr(server_module._ctx.cas, "store", _raise)
 
     result = hgp_move_file(str(src), str(dst), "agent-1")
 

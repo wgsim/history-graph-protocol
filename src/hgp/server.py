@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -39,46 +40,44 @@ from hgp.reconciler import Reconciler
 
 mcp = FastMCP("hgp")
 
-_db: Database | None = None
-_cas: CAS | None = None
-_lease_mgr: LeaseManager | None = None
-_reconciler: Reconciler | None = None
-_project_root: Path | None = None  # bound repo root; None = global (~/.hgp/) mode
-_project_bound: bool = False        # True once root resolution has completed
 
+@dataclass
+class HGPContext:
+    """Fully-initialized server context: project binding + all components.
 
-def _ensure_project_bound() -> None:
-    """Resolve and cache _project_root without opening DB/CAS.
-
-    Separates project root resolution from DB initialization so that
-    _check_file_project() works correctly on the very first call in a
-    fresh process, before _get_components() has been called.
+    _ctx is None until every component is successfully initialized.
+    A failed init leaves _ctx=None so the next call retries cleanly.
     """
-    global _project_root, _project_bound
-    if _project_bound:
-        return
-    if os.environ.get("HGP_GLOBAL_MODE"):
-        _project_root = None
-    else:
-        try:
-            _project_root = find_project_root(Path.cwd())
-        except ProjectRootError:
-            _log.warning(
-                "No .git repository found from cwd; using global store ~/.hgp/. "
-                "Set HGP_PROJECT_ROOT or run from inside a git repository for repo-local storage."
-            )
-            _project_root = None
-    _project_bound = True
+    db: Database
+    cas: CAS
+    lease_mgr: LeaseManager
+    reconciler: Reconciler
+    project_root: Path | None  # None = global mode (~/.hgp/)
 
 
-def _get_components() -> tuple[Database, CAS, LeaseManager, Reconciler]:
-    global _db, _cas, _lease_mgr, _reconciler
-    _ensure_project_bound()
-    if _db is None:
-        hgp_dir = (_project_root / ".hgp") if _project_root else (Path.home() / ".hgp")
+_ctx: HGPContext | None = None
+
+
+def _get_context() -> HGPContext:
+    """Return (and lazily create) the server context singleton.
+
+    Resolves project root and initializes all components in one step.
+    """
+    global _ctx
+    if _ctx is None:
+        if os.environ.get("HGP_GLOBAL_MODE"):
+            project_root = None
+        else:
+            try:
+                project_root = find_project_root(Path.cwd())
+            except ProjectRootError:
+                _log.warning(
+                    "No .git repository found from cwd; using global store ~/.hgp/. "
+                    "Set HGP_PROJECT_ROOT or run from inside a git repository for repo-local storage."
+                )
+                project_root = None
+        hgp_dir = (project_root / ".hgp") if project_root else (Path.home() / ".hgp")
         hgp_content_dir = hgp_dir / ".hgp_content"
-        # Use locals to avoid partial global state on failure: only assign globals
-        # after all components initialize successfully.
         db = Database(hgp_dir / "hgp.db")
         try:
             hgp_dir.mkdir(parents=True, exist_ok=True)
@@ -95,23 +94,24 @@ def _get_components() -> tuple[Database, CAS, LeaseManager, Reconciler]:
         except Exception:
             db.close()
             raise
-        _db, _cas, _lease_mgr, _reconciler = db, cas, lease_mgr, reconciler
-    assert _db and _cas and _lease_mgr and _reconciler
-    return _db, _cas, _lease_mgr, _reconciler
+        _ctx = HGPContext(
+            db=db, cas=cas, lease_mgr=lease_mgr, reconciler=reconciler,
+            project_root=project_root,
+        )
+    return _ctx
 
 
-def _check_file_project(file_root: Path) -> dict[str, Any] | None:
+def _check_file_project(file_root: Path, ctx: HGPContext) -> dict[str, Any] | None:
     """Return an error dict if file_root doesn't match the bound project root.
 
     Returns None when the check passes (global mode, or roots match).
-    Must be called after _ensure_project_bound() so _project_root is set.
     """
-    if _project_root is not None and file_root.resolve() != _project_root.resolve():
+    if ctx.project_root is not None and file_root.resolve() != ctx.project_root.resolve():
         return {
             "error": "CROSS_REPO_OPERATION",
             "message": (
                 f"File belongs to project {file_root} but this server is bound to "
-                f"{_project_root}. Start a separate HGP server instance for that project."
+                f"{ctx.project_root}. Start a separate HGP server instance for that project."
             ),
         }
     return None
@@ -147,7 +147,9 @@ def hgp_create_operation(
         except ValidationError as exc:
             return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
-    db, cas, _, _ = _get_components()
+    ctx = _get_context()
+    db = ctx.db
+    cas = ctx.cas
 
     # Validate parents exist
     for pid in (parent_op_ids or []):
@@ -309,7 +311,7 @@ def hgp_query_operations(
         return {"error": "INVALID_STATUS", "message": f"status must be one of {sorted(_VALID_STATUSES)}"}
     limit = max(1, min(limit, _MAX_QUERY_LIMIT))
 
-    db, _, _, _ = _get_components()
+    db = _get_context().db
     if op_id:
         op = db.get_operation(op_id)
         if op:
@@ -348,7 +350,7 @@ def hgp_file_history(
 ) -> dict[str, Any]:
     """Return operations recorded for a given file_path, most recent first."""
     limit = max(1, min(limit, _MAX_QUERY_LIMIT))
-    db, _, _, _ = _get_components()
+    db = _get_context().db
     # Canonicalize query path so it matches stored canonical paths
     try:
         root = find_project_root(Path(file_path).parent)
@@ -372,7 +374,7 @@ def hgp_query_subgraph(
 ) -> dict[str, Any]:
     """Traverse the causal subgraph from root_op_id."""
     max_depth = max(1, min(max_depth, _MAX_SUBGRAPH_DEPTH))
-    db, _, _, _ = _get_components()
+    db = _get_context().db
     # Use a single deferred transaction so chain_hash and ops come from the same snapshot.
     db.begin_deferred()
     try:
@@ -399,7 +401,9 @@ def hgp_acquire_lease(
     ttl_seconds: int = 300,
 ) -> dict[str, Any]:
     """Acquire a lease on a subgraph for optimistic concurrency."""
-    db, _, lease_mgr, _ = _get_components()
+    ctx = _get_context()
+    db = ctx.db
+    lease_mgr = ctx.lease_mgr
     lease = lease_mgr.acquire(agent_id, subgraph_root_op_id, min(ttl_seconds, _MAX_TTL_SECONDS))
     response: dict[str, Any] = {
         "lease_id": lease.lease_id,
@@ -421,14 +425,16 @@ def hgp_acquire_lease(
 @mcp.tool()
 def hgp_validate_lease(lease_id: str, extend: bool = True) -> dict[str, Any]:
     """Validate (PING) a lease token before LLM compute."""
-    _, _, lease_mgr, _ = _get_components()
+    lease_mgr = _get_context().lease_mgr
     return lease_mgr.validate(lease_id, extend=extend)
 
 
 @mcp.tool()
 def hgp_release_lease(lease_id: str) -> dict[str, Any]:
     """Release a lease token explicitly."""
-    db, _, lease_mgr, _ = _get_components()
+    ctx = _get_context()
+    db = ctx.db
+    lease_mgr = ctx.lease_mgr
     root_op_id = db.get_lease_root(lease_id)
     lease_mgr.release(lease_id)
     if root_op_id:
@@ -444,7 +450,7 @@ def hgp_set_memory_tier(op_id: str, tier: str) -> dict[str, Any]:
     valid = {"short_term", "long_term", "inactive"}
     if tier not in valid:
         return {"error": "INVALID_TIER", "valid_tiers": sorted(valid)}
-    db, _, _, _ = _get_components()
+    db = _get_context().db
     found = db.set_memory_tier(op_id, tier)
     db.commit()
     if not found:
@@ -455,7 +461,7 @@ def hgp_set_memory_tier(op_id: str, tier: str) -> dict[str, Any]:
 @mcp.tool()
 def hgp_get_artifact(object_hash: str) -> dict[str, Any]:
     """Retrieve blob content from CAS by hash."""
-    _, cas, _, _ = _get_components()
+    cas = _get_context().cas
     data = cas.read(object_hash)
     if data is None:
         return {"error": "NOT_FOUND", "object_hash": object_hash}
@@ -473,7 +479,7 @@ def hgp_anchor_git(
     repository: str | None = None,
 ) -> dict[str, Any]:
     """Link an HGP operation to a Git commit SHA."""
-    db, _, _, _ = _get_components()
+    db = _get_context().db
     if not _GIT_SHA_RE.fullmatch(git_commit_sha):
         return {"error": "INVALID_SHA", "message": "git_commit_sha must be 40 lowercase hex chars"}
     if not db.get_operation(op_id):
@@ -490,7 +496,7 @@ def hgp_anchor_git(
 @mcp.tool()
 def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
     """Run crash recovery reconciler."""
-    _, _, _, reconciler = _get_components()
+    reconciler = _get_context().reconciler
     report = reconciler.reconcile(dry_run=dry_run)
     return report.model_dump()
 
@@ -498,7 +504,7 @@ def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
 @mcp.tool()
 def hgp_get_evidence(op_id: str) -> dict[str, Any]:
     """Return all operations that op_id cited as evidence."""
-    db, _, _, _ = _get_components()
+    db = _get_context().db
     try:
         if not db.get_operation(op_id):
             return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
@@ -511,7 +517,7 @@ def hgp_get_evidence(op_id: str) -> dict[str, Any]:
 @mcp.tool()
 def hgp_get_citing_ops(op_id: str) -> dict[str, Any]:
     """Return all operations that cited op_id as evidence (reverse direction)."""
-    db, _, _, _ = _get_components()
+    db = _get_context().db
     try:
         if not db.get_operation(op_id):
             return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
@@ -544,7 +550,9 @@ def _record_file_op(
         except ValidationError as exc:
             return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
-    db, cas, _, _ = _get_components()
+    ctx = _get_context()
+    db = ctx.db
+    cas = ctx.cas
 
     try:
         object_hash = cas.store(content_bytes)
@@ -616,8 +624,8 @@ def hgp_write_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
-    _ensure_project_bound()
-    if err := _check_file_project(root):
+    ctx = _get_context()
+    if err := _check_file_project(root, ctx):
         return err
 
     path = Path(file_path)
@@ -643,9 +651,8 @@ def hgp_write_file(
             result["op_id"], file_path, exc,
         )
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
-    db, _, _, _ = _get_components()
     try:
-        db.finalize_operation(result["op_id"])
+        ctx.db.finalize_operation(result["op_id"])
     except Exception as exc:
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
@@ -669,8 +676,8 @@ def hgp_append_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
-    _ensure_project_bound()
-    if err := _check_file_project(root):
+    ctx = _get_context()
+    if err := _check_file_project(root, ctx):
         return err
 
     path = Path(file_path)
@@ -700,9 +707,8 @@ def hgp_append_file(
             result["op_id"], file_path, exc,
         )
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
-    db, _, _, _ = _get_components()
     try:
-        db.finalize_operation(result["op_id"])
+        ctx.db.finalize_operation(result["op_id"])
     except Exception as exc:
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
@@ -727,8 +733,8 @@ def hgp_edit_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
-    _ensure_project_bound()
-    if err := _check_file_project(root):
+    ctx = _get_context()
+    if err := _check_file_project(root, ctx):
         return err
 
     path = Path(file_path)
@@ -764,9 +770,8 @@ def hgp_edit_file(
             result["op_id"], file_path, exc,
         )
         return {"error": "FILESYSTEM_ERROR", "message": str(exc), "op_id": result["op_id"]}
-    db, _, _, _ = _get_components()
     try:
-        db.finalize_operation(result["op_id"])
+        ctx.db.finalize_operation(result["op_id"])
     except Exception as exc:
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
@@ -788,8 +793,8 @@ def hgp_delete_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
-    _ensure_project_bound()
-    if err := _check_file_project(root):
+    ctx = _get_context()
+    if err := _check_file_project(root, ctx):
         return err
 
     path = Path(file_path)
@@ -798,7 +803,7 @@ def hgp_delete_file(
     if not path.exists():
         return {"error": "FILE_NOT_FOUND", "message": f"{file_path} does not exist"}
 
-    db, _, _, _ = _get_components()
+    db = ctx.db
 
     # Preflight: validate previous_op_id before any filesystem side effect
     if previous_op_id and not db.get_operation(previous_op_id):
@@ -874,8 +879,8 @@ def hgp_move_file(
         return {"error": "PROJECT_ROOT_NOT_FOUND", "message": str(e)}
     except PathOutsideRootError as e:
         return {"error": "PATH_OUTSIDE_ROOT", "message": str(e)}
-    _ensure_project_bound()
-    if err := _check_file_project(root):
+    ctx = _get_context()
+    if err := _check_file_project(root, ctx):
         return err
 
     src = Path(old_path)
@@ -896,7 +901,8 @@ def hgp_move_file(
         except ValidationError as exc:
             return {"error": "INVALID_EVIDENCE_REF", "message": str(exc)}
 
-    db, cas, _, _ = _get_components()
+    db = ctx.db
+    cas = ctx.cas
 
     # Preflight: validate previous_op_id before any filesystem side effect
     if previous_op_id and not db.get_operation(previous_op_id):

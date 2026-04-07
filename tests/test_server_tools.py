@@ -1,7 +1,7 @@
 """Tests for MCP tool functions in server.py.
 
-Monkey-patches server module globals to inject an isolated tmp DB/CAS,
-bypassing the _get_components() lazy-init guard (_db is None check).
+Monkey-patches server module _ctx to inject an isolated tmp DB/CAS,
+bypassing the _get_context() lazy-init guard (_ctx is None check).
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import hgp.server as server_module
+from hgp.server import HGPContext
 from hgp.server import (
     hgp_create_operation,
     hgp_query_operations,
@@ -32,7 +33,7 @@ from hgp.errors import ChainStaleError, InvalidationTargetNotFoundError, ParentN
 
 @pytest.fixture
 def server_components(tmp_path: Path):
-    """Inject temp DB/CAS into server module globals, bypassing lazy init."""
+    """Inject temp DB/CAS into server module _ctx, bypassing lazy init."""
     content_dir = tmp_path / ".hgp_content"
     content_dir.mkdir()
 
@@ -42,29 +43,15 @@ def server_components(tmp_path: Path):
     lease_mgr = LeaseManager(db)
     reconciler = Reconciler(db, cas, content_dir)
 
-    # Save originals
-    orig = (
-        server_module._db, server_module._cas,
-        server_module._lease_mgr, server_module._reconciler,
-        server_module._project_root, server_module._project_bound,
+    orig_ctx = server_module._ctx
+    server_module._ctx = HGPContext(
+        db=db, cas=cas, lease_mgr=lease_mgr, reconciler=reconciler,
+        project_root=tmp_path,
     )
-
-    # Patch globals
-    server_module._db = db
-    server_module._cas = cas
-    server_module._lease_mgr = lease_mgr
-    server_module._reconciler = reconciler
-    server_module._project_root = tmp_path
-    server_module._project_bound = True
 
     yield {"db": db, "cas": cas, "lease_mgr": lease_mgr, "reconciler": reconciler, "content_dir": content_dir}
 
-    # Restore originals
-    (
-        server_module._db, server_module._cas,
-        server_module._lease_mgr, server_module._reconciler,
-        server_module._project_root, server_module._project_bound,
-    ) = orig
+    server_module._ctx = orig_ctx
     db.close()
 
 
@@ -1159,34 +1146,23 @@ def test_acquire_lease_memory_tier_failure_returns_warning_field(server_componen
 
 
 def test_check_file_project_passes_in_global_mode(tmp_path):
-    """_check_file_project returns None when _project_root is None (global/unbound mode)."""
-    orig = server_module._project_root
-    server_module._project_root = None
-    try:
-        result = server_module._check_file_project(tmp_path)
-        assert result is None
-    finally:
-        server_module._project_root = orig
+    """_check_file_project returns None when ctx.project_root is None (global mode)."""
+    ctx = HGPContext(db=None, cas=None, lease_mgr=None, reconciler=None, project_root=None)
+    assert server_module._check_file_project(tmp_path, ctx) is None
 
 
 def test_check_file_project_passes_when_roots_match(tmp_path):
-    """_check_file_project returns None when file root matches bound project root."""
-    orig = server_module._project_root
-    server_module._project_root = tmp_path
-    try:
-        result = server_module._check_file_project(tmp_path)
-        assert result is None
-    finally:
-        server_module._project_root = orig
+    """_check_file_project returns None when file root matches ctx.project_root."""
+    ctx = HGPContext(db=None, cas=None, lease_mgr=None, reconciler=None, project_root=tmp_path)
+    assert server_module._check_file_project(tmp_path, ctx) is None
 
 
 def test_write_file_rejects_cross_repo_cold_start(server_components, tmp_path, monkeypatch):
     """hgp_write_file rejects cross-repo ops on the FIRST call (cold-start state).
 
-    Exercises the real startup path: _project_bound=False, _project_root=None.
-    Verifies that _ensure_project_bound() resolves the project root before
-    _check_file_project() runs, so cross-repo rejection is immediate even
-    before _get_components() has been called.
+    Exercises the real startup path: _ctx=None (uninitialized).
+    Verifies that _get_context() resolves the project root before
+    _check_file_project() runs, so cross-repo rejection is immediate.
     """
     from hgp.server import hgp_write_file
 
@@ -1195,14 +1171,12 @@ def test_write_file_rejects_cross_repo_cold_start(server_components, tmp_path, m
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
 
-    # Simulate cold-start: root not yet resolved (_db is set by fixture so
-    # _get_components() won't re-open the DB, but _project_bound is fresh)
-    monkeypatch.setattr(server_module, "_project_root", None)
-    monkeypatch.setattr(server_module, "_project_bound", False)
+    # Simulate cold-start: _ctx not yet initialized
+    monkeypatch.setattr(server_module, "_ctx", None)
 
     # find_project_root is called in two places:
     #   1. hgp_write_file → find_project_root(repo_b/...) → should return repo_b
-    #   2. _ensure_project_bound → find_project_root(cwd) → should return repo_a
+    #   2. _get_context → find_project_root(cwd) → should return repo_a
     # Mock returns repo_b for paths under repo_b, repo_a otherwise.
     def mock_find_root(start: Path) -> Path:
         try:
@@ -1222,9 +1196,9 @@ def test_write_file_rejects_cross_repo_cold_start(server_components, tmp_path, m
     assert result.get("error") == "CROSS_REPO_OPERATION", (
         f"First cold-start cross-repo call must be rejected immediately, got: {result}"
     )
-    assert server_module._project_bound, "_project_bound must be True after first call"
-    assert server_module._project_root == repo_a, (
-        f"_project_root must be repo_a after _ensure_project_bound(), got: {server_module._project_root}"
+    assert server_module._ctx is not None, "_ctx must be initialized after first call"
+    assert server_module._ctx.project_root == repo_a, (
+        f"ctx.project_root must be repo_a after _get_context(), got: {server_module._ctx.project_root}"
     )
 
 
@@ -1269,26 +1243,14 @@ def test_acquire_lease_auto_releases_prior_active_lease(server_components):
 
 # Task 5.2 ─────────────────────────────────────────────────────────────────────
 
-def test_get_components_init_failure_leaves_db_none(monkeypatch, tmp_path):
-    """_get_components() leaves _db=None if DB initialization fails.
+def test_get_context_init_failure_leaves_ctx_none(monkeypatch, tmp_path):
+    """_get_context() leaves _ctx=None if DB initialization fails.
 
     This ensures the next call retries initialization rather than using
-    a partially-initialized global state.
+    a partially-initialized singleton.
     """
-    # Reset all singleton state
-    orig = (
-        server_module._db, server_module._cas,
-        server_module._lease_mgr, server_module._reconciler,
-        server_module._project_root, server_module._project_bound,
-    )
-    server_module._db = None
-    server_module._cas = None
-    server_module._lease_mgr = None
-    server_module._reconciler = None
-    server_module._project_root = None
-    server_module._project_bound = False
-
-    (tmp_path / ".git").mkdir()
+    orig_ctx = server_module._ctx
+    server_module._ctx = None
     monkeypatch.setenv("HGP_PROJECT_ROOT", str(tmp_path))
 
     class FailingDatabase:
@@ -1301,18 +1263,11 @@ def test_get_components_init_failure_leaves_db_none(monkeypatch, tmp_path):
 
     try:
         with pytest.raises(RuntimeError, match="simulated DB init failure"):
-            server_module._get_components()
+            server_module._get_context()
 
-        assert server_module._db is None, "_db must remain None after failed init"
-        assert server_module._cas is None, "_cas must remain None after failed init"
-        assert server_module._lease_mgr is None, "_lease_mgr must remain None after failed init"
-        assert server_module._reconciler is None, "_reconciler must remain None after failed init"
+        assert server_module._ctx is None, "_ctx must remain None after failed init"
     finally:
-        (
-            server_module._db, server_module._cas,
-            server_module._lease_mgr, server_module._reconciler,
-            server_module._project_root, server_module._project_bound,
-        ) = orig
+        server_module._ctx = orig_ctx
 
 
 # Task 5.3 ─────────────────────────────────────────────────────────────────────
