@@ -1002,9 +1002,62 @@ def hgp_move_file(
     }
 
 
+def _install_hooks(args: list[str]) -> None:
+    """Install HGP hook files into .claude/hooks/ and/or .gemini/hooks/."""
+    import importlib.resources
+    import shutil
+    import sys
+
+    all_targets = not args or (args == ["--claude"] or args == ["--gemini"]) is False
+    do_claude = not args or "--claude" in args or all_targets
+    do_gemini = not args or "--gemini" in args or all_targets
+
+    # default: both when no flag given
+    if not args:
+        do_claude = do_gemini = True
+
+    cwd = Path.cwd()
+    installed: list[str] = []
+
+    def _copy_hooks(pkg: str, dest_dir: Path) -> None:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        pkg_ref = importlib.resources.files(f"hgp.hooks.{pkg}")
+        for item in pkg_ref.iterdir():
+            if item.name.endswith(".py") and not item.name.startswith("__"):
+                dest = dest_dir / item.name
+                with importlib.resources.as_file(item) as src:
+                    shutil.copy2(src, dest)
+                installed.append(str(dest.relative_to(cwd)))
+
+    if do_claude:
+        _copy_hooks("claude", cwd / ".claude" / "hooks")
+    if do_gemini:
+        _copy_hooks("gemini", cwd / ".gemini" / "hooks")
+
+    if installed:
+        print("Installed HGP hooks:")
+        for p in installed:
+            print(f"  {p}")
+    else:
+        print("No hooks installed.", file=sys.stderr)
+
+
 def run() -> None:
-    """Entry point for `hgp` console script."""
-    mcp.run()
+    """Entry point for `hgp` console script.
+
+    Usage:
+        hgp                          # start MCP server (stdio)
+        hgp install-hooks            # install both Claude Code and Gemini CLI hooks
+        hgp install-hooks --claude   # Claude Code hooks only
+        hgp install-hooks --gemini   # Gemini CLI hooks only
+    """
+    import sys
+
+    args = sys.argv[1:]
+    if args and args[0] == "install-hooks":
+        _install_hooks(args[1:])
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
