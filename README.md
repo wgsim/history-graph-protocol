@@ -83,13 +83,16 @@ pip install hgp
 python -m hgp.server
 ```
 
+### Storage
+
+HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gitignored). The server resolves the project root from the working directory at startup — it is bound to one repository per process.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HGP_DB_PATH` | `~/.hgp/hgp.db` | SQLite database path |
-| `HGP_CAS_DIR` | `~/.hgp/.hgp_content/` | WORM content-addressable store directory |
-| `HGP_PROJECT_ROOT` | _(auto)_ | Override project root for file-scoped tools (default: nearest `.git`) |
+| `HGP_PROJECT_ROOT` | _(auto)_ | Override project root (default: nearest `.git` from cwd, or `~/.hgp/` if not in a repo) |
+| `HGP_GLOBAL_MODE` | _(unset)_ | Set to `1` to force legacy global store at `~/.hgp/` (all projects share one DB) |
 | `HGP_HOOK_BLOCK` | `0` | Set to `1` to block native file tool calls (Write/Edit) instead of warning |
 
 ### MCP Client Configuration
@@ -101,14 +104,13 @@ python -m hgp.server
   "mcpServers": {
     "hgp": {
       "command": "python",
-      "args": ["-m", "hgp.server"],
-      "env": {
-        "HGP_DB_PATH": "/your/path/hgp.db"
-      }
+      "args": ["-m", "hgp.server"]
     }
   }
 }
 ```
+
+The server is started from the project directory by the MCP host, so `HGP_PROJECT_ROOT` is typically not needed. Set it explicitly if the working directory at startup is not the project root.
 
 ---
 

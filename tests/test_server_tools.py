@@ -1143,3 +1143,62 @@ def test_acquire_lease_memory_tier_failure_returns_warning_field(server_componen
         f"warning field must be present when memory tier update fails: {lease}"
     )
     assert "short_term" in lease["warning"].lower() or "memory tier" in lease["warning"].lower()
+
+
+# ── Storage routing regressions (522f901 followup) ───────────────────────────
+
+
+def test_check_file_project_passes_in_global_mode(tmp_path):
+    """_check_file_project returns None when _project_root is None (global/unbound mode)."""
+    orig = server_module._project_root
+    server_module._project_root = None
+    try:
+        result = server_module._check_file_project(tmp_path)
+        assert result is None
+    finally:
+        server_module._project_root = orig
+
+
+def test_check_file_project_passes_when_roots_match(tmp_path):
+    """_check_file_project returns None when file root matches bound project root."""
+    orig = server_module._project_root
+    server_module._project_root = tmp_path
+    try:
+        result = server_module._check_file_project(tmp_path)
+        assert result is None
+    finally:
+        server_module._project_root = orig
+
+
+def test_write_file_rejects_cross_repo(server_components, tmp_path):
+    """hgp_write_file returns CROSS_REPO_OPERATION when file is outside the bound project."""
+    import os
+    from hgp.server import hgp_write_file
+
+    repo_a = tmp_path / "repo_a"
+    repo_a.mkdir()
+    (repo_a / ".git").mkdir()
+    repo_b = tmp_path / "repo_b"
+    repo_b.mkdir()
+    (repo_b / ".git").mkdir()
+
+    orig_root = server_module._project_root
+    orig_env = os.environ.get("HGP_PROJECT_ROOT")
+    server_module._project_root = repo_a
+    os.environ["HGP_PROJECT_ROOT"] = str(repo_b)
+    try:
+        # File is in repo_b but server is bound to repo_a
+        result = hgp_write_file(
+            file_path=str(repo_b / "test.txt"),
+            content="hello",
+            agent_id="agent-a",
+        )
+        assert result.get("error") == "CROSS_REPO_OPERATION", (
+            f"Expected CROSS_REPO_OPERATION, got: {result}"
+        )
+    finally:
+        server_module._project_root = orig_root
+        if orig_env is None:
+            os.environ.pop("HGP_PROJECT_ROOT", None)
+        else:
+            os.environ["HGP_PROJECT_ROOT"] = orig_env
