@@ -1002,5 +1002,10 @@ def hgp_move_file(
     }
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Entry point for `hgp` console script."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    run()
