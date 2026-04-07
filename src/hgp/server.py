@@ -182,27 +182,14 @@ def hgp_create_operation(
         # Compute final chain_hash AFTER all edges are inserted
         new_root = subgraph_root_op_id or op_id
         final_chain_hash = compute_chain_hash(db, new_root)
-        db.execute(
-            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
-            (final_chain_hash, op_id),
-        )
+        db.update_chain_hash(op_id, final_chain_hash)
 
         if lease_id:
-            lease_root = db.execute(
-                "SELECT subgraph_root_op_id FROM leases WHERE lease_id = ? AND status = 'ACTIVE'",
-                (lease_id,),
-            ).fetchone()
-            db.execute(
-                "UPDATE leases SET status = 'RELEASED' WHERE lease_id = ? AND status = 'ACTIVE'",
-                (lease_id,),
-            )
-            if lease_root:
-                other_active = db.execute(
-                    "SELECT COUNT(*) FROM leases WHERE subgraph_root_op_id = ? AND status = 'ACTIVE'",
-                    (lease_root["subgraph_root_op_id"],),
-                ).fetchone()[0]
-                if other_active == 0:
-                    db.set_memory_tier(lease_root["subgraph_root_op_id"], "long_term")
+            lease_root_id = db.get_active_lease_root(lease_id)
+            db.release_active_lease(lease_id)
+            if lease_root_id:
+                if db.count_active_leases_for_root(lease_root_id) == 0:
+                    db.set_memory_tier(lease_root_id, "long_term")
 
         db.commit()
     except Exception:
@@ -399,17 +386,11 @@ def hgp_validate_lease(lease_id: str, extend: bool = True) -> dict[str, Any]:
 def hgp_release_lease(lease_id: str) -> dict[str, Any]:
     """Release a lease token explicitly."""
     db, _, lease_mgr, _ = _get_components()
-    root_row = db.execute(
-        "SELECT subgraph_root_op_id FROM leases WHERE lease_id = ?", (lease_id,)
-    ).fetchone()
+    root_op_id = db.get_lease_root(lease_id)
     lease_mgr.release(lease_id)
-    if root_row:
-        other_active = db.execute(
-            "SELECT COUNT(*) FROM leases WHERE subgraph_root_op_id = ? AND status = 'ACTIVE'",
-            (root_row["subgraph_root_op_id"],),
-        ).fetchone()[0]
-        if other_active == 0:
-            db.set_memory_tier(root_row["subgraph_root_op_id"], "long_term")
+    if root_op_id:
+        if db.count_active_leases_for_root(root_op_id) == 0:
+            db.set_memory_tier(root_op_id, "long_term")
             db.commit()
     return {"released": True, "lease_id": lease_id}
 
@@ -421,9 +402,9 @@ def hgp_set_memory_tier(op_id: str, tier: str) -> dict[str, Any]:
     if tier not in valid:
         return {"error": "INVALID_TIER", "valid_tiers": sorted(valid)}
     db, _, _, _ = _get_components()
-    cur = db.execute("UPDATE operations SET memory_tier = ? WHERE op_id = ?", (tier, op_id))
+    found = db.set_memory_tier(op_id, tier)
     db.commit()
-    if cur.rowcount == 0:
+    if not found:
         return {"error": "OP_NOT_FOUND", "op_id": op_id}
     return {"op_id": op_id, "tier": tier}
 
@@ -455,10 +436,7 @@ def hgp_anchor_git(
     if not db.get_operation(op_id):
         return {"error": "OP_NOT_FOUND", "message": f"Operation not found: {op_id!r}"}
     try:
-        db.execute(
-            "INSERT OR IGNORE INTO git_anchors (op_id, git_commit_sha, repository) VALUES (?, ?, ?)",
-            (op_id, git_commit_sha, repository),
-        )
+        db.insert_git_anchor(op_id, git_commit_sha, repository)
         db.commit()
     except sqlite3.Error as exc:
         _log.error("DB error in hgp_anchor_git op_id=%r: %s", op_id, exc, exc_info=True)
@@ -560,10 +538,7 @@ def _record_file_op(
                 db.rollback()
                 return {"error": "DUPLICATE_EVIDENCE_REF", "message": "Evidence link already exists"}
         final_hash = compute_chain_hash(db, op_id)
-        db.execute(
-            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
-            (final_hash, op_id),
-        )
+        db.update_chain_hash(op_id, final_hash)
         db.commit()
     except Exception:
         try:
@@ -791,10 +766,7 @@ def hgp_delete_file(
             # Edge records intent; status update deferred until after unlink() succeeds.
             db.insert_edge(op_id, previous_op_id, "invalidates")
         final_hash = compute_chain_hash(db, op_id)
-        db.execute(
-            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
-            (final_hash, op_id),
-        )
+        db.update_chain_hash(op_id, final_hash)
         db.commit()
     except Exception:
         try:
@@ -904,7 +876,7 @@ def hgp_move_file(
             # Edge records intent; status update deferred until after rename() succeeds.
             db.insert_edge(inv_op_id, resolved_previous_op_id, "invalidates")
         inv_hash = compute_chain_hash(db, inv_op_id)
-        db.execute("UPDATE operations SET chain_hash = ? WHERE op_id = ?", (inv_hash, inv_op_id))
+        db.update_chain_hash(inv_op_id, inv_hash)
 
         # Insert artifact op for new_path, causally linked to the invalidation op.
         op_id = str(uuid.uuid4())
@@ -927,10 +899,7 @@ def hgp_move_file(
                 db.rollback()
                 return {"error": "DUPLICATE_EVIDENCE_REF", "message": "Evidence link already exists"}
         final_hash = compute_chain_hash(db, op_id)
-        db.execute(
-            "UPDATE operations SET chain_hash = ? WHERE op_id = ?",
-            (final_hash, op_id),
-        )
+        db.update_chain_hash(op_id, final_hash)
         db.commit()
     except Exception:
         try:

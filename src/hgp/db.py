@@ -445,10 +445,58 @@ class Database:
                 (weight, op_id),
             )
 
-    def set_memory_tier(self, op_id: str, tier: str) -> None:
+    def set_memory_tier(self, op_id: str, tier: str) -> bool:
+        """Set memory tier. Returns True if the op was found, False if not."""
+        assert self._conn
+        cur = self._conn.execute(
+            "UPDATE operations SET memory_tier = ? WHERE op_id = ?", (tier, op_id)
+        )
+        return cur.rowcount > 0
+
+    def update_chain_hash(self, op_id: str, chain_hash: str) -> None:
         assert self._conn
         self._conn.execute(
-            "UPDATE operations SET memory_tier = ? WHERE op_id = ?", (tier, op_id)
+            "UPDATE operations SET chain_hash = ? WHERE op_id = ?", (chain_hash, op_id)
+        )
+
+    def get_lease_root(self, lease_id: str) -> str | None:
+        """Return subgraph_root_op_id for a lease (any status), or None."""
+        assert self._conn
+        row = self._conn.execute(
+            "SELECT subgraph_root_op_id FROM leases WHERE lease_id = ?", (lease_id,)
+        ).fetchone()
+        return row["subgraph_root_op_id"] if row else None
+
+    def get_active_lease_root(self, lease_id: str) -> str | None:
+        """Return subgraph_root_op_id if the lease is ACTIVE, else None."""
+        assert self._conn
+        row = self._conn.execute(
+            "SELECT subgraph_root_op_id FROM leases WHERE lease_id = ? AND status = 'ACTIVE'",
+            (lease_id,),
+        ).fetchone()
+        return row["subgraph_root_op_id"] if row else None
+
+    def release_active_lease(self, lease_id: str) -> None:
+        """Set an ACTIVE lease to RELEASED."""
+        assert self._conn
+        self._conn.execute(
+            "UPDATE leases SET status = 'RELEASED' WHERE lease_id = ? AND status = 'ACTIVE'",
+            (lease_id,),
+        )
+
+    def count_active_leases_for_root(self, root_op_id: str) -> int:
+        """Return the number of ACTIVE leases for a given subgraph root."""
+        assert self._conn
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM leases WHERE subgraph_root_op_id = ? AND status = 'ACTIVE'",
+            (root_op_id,),
+        ).fetchone()[0]
+
+    def insert_git_anchor(self, op_id: str, git_commit_sha: str, repository: str | None) -> None:
+        assert self._conn
+        self._conn.execute(
+            "INSERT OR IGNORE INTO git_anchors (op_id, git_commit_sha, repository) VALUES (?, ?, ?)",
+            (op_id, git_commit_sha, repository),
         )
 
     def demote_inactive(self, threshold_days: int = 30) -> int:
