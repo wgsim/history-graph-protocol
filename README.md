@@ -99,6 +99,20 @@ hgp install-hooks --gemini   # Gemini CLI only
 
 Hooks are installed into `<repo_root>/.claude/hooks/` and `<repo_root>/.gemini/hooks/`. The command must be run from inside a git repository.
 
+### Hook enforcement policy
+
+By default, hooks warn when native file tools are used instead of HGP equivalents. You can change this persistently with:
+
+```bash
+hgp hook-policy              # show current policy (default: advisory)
+hgp hook-policy advisory     # warn only — native file tools allowed
+hgp hook-policy block        # block native Write/Edit/write_file/replace
+```
+
+The policy is stored in `<repo_root>/.hgp/hook-policy`. The `HGP_HOOK_BLOCK` environment variable takes precedence over the file if set.
+
+> **Note:** If you installed hooks before this feature was added, run `hgp install-hooks` again to update them.
+
 ### Storage
 
 HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gitignored). The server resolves the project root from the working directory at startup — it is bound to one repository per process.

@@ -1108,6 +1108,23 @@ def _hook_policy(args: list[str]) -> None:
     policy_file.write_text(new_policy)
     print(f"Hook policy set to: {new_policy}")
 
+    # warn if installed hooks predate hook-policy support
+    stale: list[str] = []
+    for hook_path in [
+        project_root / ".claude" / "hooks" / "pre_tool_use_hgp.py",
+        project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py",
+    ]:
+        if hook_path.exists() and "def _resolve_block_mode" not in hook_path.read_text():
+            stale.append(str(hook_path.relative_to(project_root)))
+    if stale:
+        print(
+            "\nWarning: the following installed hook(s) predate hook-policy support\n"
+            "and will not honor the new policy until reinstalled:\n"
+            + "".join(f"  {p}\n" for p in stale)
+            + "Run `hgp install-hooks` to update them.",
+            file=sys.stderr,
+        )
+
 
 def run() -> None:
     """Entry point for `hgp` console script.
