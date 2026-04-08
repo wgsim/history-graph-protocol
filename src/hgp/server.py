@@ -1063,6 +1063,52 @@ def _install_hooks(args: list[str]) -> None:
         print("No hooks installed.", file=sys.stderr)
 
 
+_VALID_HOOK_POLICIES = {"advisory", "block"}
+
+_HOOK_POLICY_USAGE = (
+    "usage: hgp hook-policy [advisory|block]\n"
+    "\n"
+    "  (no args)   show current policy\n"
+    "  advisory    warn only — native file tools allowed (default)\n"
+    "  block       block native file tools (Write/Edit/write_file/replace)\n"
+)
+
+
+def _hook_policy(args: list[str]) -> None:
+    """Read or set the persistent hook enforcement policy."""
+    import sys
+
+    if len(args) > 1 or (args and args[0] not in _VALID_HOOK_POLICIES):
+        print(f"hgp hook-policy: invalid argument: {' '.join(args)}", file=sys.stderr)
+        print(_HOOK_POLICY_USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp hook-policy: no git repository found from current directory.\n"
+            "Run this command from inside a git repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    policy_file = project_root / ".hgp" / "hook-policy"
+
+    if not args:
+        # read current policy
+        if policy_file.exists():
+            print(policy_file.read_text().strip())
+        else:
+            print("advisory")
+        return
+
+    new_policy = args[0]
+    policy_file.parent.mkdir(parents=True, exist_ok=True)
+    policy_file.write_text(new_policy)
+    print(f"Hook policy set to: {new_policy}")
+
+
 def run() -> None:
     """Entry point for `hgp` console script.
 
@@ -1071,12 +1117,17 @@ def run() -> None:
         hgp install-hooks            # install both Claude Code and Gemini CLI hooks
         hgp install-hooks --claude   # Claude Code hooks only
         hgp install-hooks --gemini   # Gemini CLI hooks only
+        hgp hook-policy              # show current hook enforcement policy
+        hgp hook-policy advisory     # warn only (default)
+        hgp hook-policy block        # block native file tools
     """
     import sys
 
     args = sys.argv[1:]
     if args and args[0] == "install-hooks":
         _install_hooks(args[1:])
+    elif args and args[0] == "hook-policy":
+        _hook_policy(args[1:])
     else:
         mcp.run()
 

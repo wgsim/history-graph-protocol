@@ -14,7 +14,22 @@ HGP_TOOLS = {
     "MultiEdit": "hgp_edit_file",
 }
 
-BLOCK_MODE = os.environ.get("HGP_HOOK_BLOCK", "0") == "1"
+def _resolve_block_mode() -> bool:
+    """Check HGP_HOOK_BLOCK env var, then fall back to .hgp/hook-policy file."""
+    env = os.environ.get("HGP_HOOK_BLOCK")
+    if env is not None:
+        return env == "1"
+    from pathlib import Path
+    for parent in [Path.cwd(), *Path.cwd().parents]:
+        policy_file = parent / ".hgp" / "hook-policy"
+        if policy_file.exists():
+            return policy_file.read_text().strip() == "block"
+        if (parent / ".git").exists():
+            break
+    return False
+
+
+BLOCK_MODE = _resolve_block_mode()
 
 
 def main() -> None:
@@ -31,7 +46,7 @@ def main() -> None:
     msg = (
         f"[HGP] Native `{tool_name}` detected. "
         f"Use `{hgp_equiv}` instead to record this file operation in HGP history. "
-        f"Set HGP_HOOK_BLOCK=1 to enforce this as an error."
+        f"Set HGP_HOOK_BLOCK=1 or run `hgp hook-policy block` to enforce."
     )
     print(msg, file=sys.stderr)
 
