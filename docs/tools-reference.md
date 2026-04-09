@@ -49,6 +49,7 @@ Creates a new operation node in the history graph. This is the primary write ent
 | `subgraph_root_op_id` | `string` | No | `null` | Root op used to compute `chain_hash` |
 | `metadata` | `dict` | No | `null` | Free-form JSON metadata |
 | `evidence_refs` | `list[dict]` | No | `null` | Evidence references (max 50). See [EvidenceRef schema](#evidenceref-schema) below |
+| `verbose` | `boolean` | No | `true` | When `false`, omit `object_hash` and `chain_hash` from the response to reduce token usage |
 
 #### EvidenceRef Schema
 
@@ -63,6 +64,8 @@ Each item in `evidence_refs` must conform to:
 
 ### Returns
 
+**Default (`verbose=true`):**
+
 ```json
 {
   "op_id": "string",
@@ -73,13 +76,23 @@ Each item in `evidence_refs` must conform to:
 }
 ```
 
+**Minimal (`verbose=false`):**
+
+```json
+{
+  "op_id": "string",
+  "status": "string",
+  "commit_seq": "integer"
+}
+```
+
 | Field | Description |
 |---|---|
 | `op_id` | Unique identifier assigned to the new operation |
 | `status` | Initial status of the operation (e.g., `"COMPLETED"`) |
 | `commit_seq` | Monotonically increasing sequence number of this commit |
-| `object_hash` | Content-addressable hash of the stored payload (if any) |
-| `chain_hash` | Current chain hash of the subgraph after this write |
+| `object_hash` | Content-addressable hash of the stored payload (if any). Omitted when `verbose=false` |
+| `chain_hash` | Current chain hash of the subgraph after this write. Omitted when `verbose=false` |
 
 ### Error Codes
 
@@ -802,8 +815,11 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 | `reason` | string | | Human-readable reason for the write (default: `"CREATE <file_path>"`) |
 | `parent_op_ids` | string[] | | Op IDs this operation causally depends on |
 | `evidence_refs` | object[] | | Evidence citations (same schema as `hgp_create_operation`) |
+| `verbose` | boolean | | `true` — when `false`, omit `object_hash` and `chain_hash` from the response to reduce token usage |
 
 ### Returns
+
+**Default (`verbose=true`):**
 
 ```json
 {
@@ -815,13 +831,23 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 }
 ```
 
+**Minimal (`verbose=false`):**
+
+```json
+{
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42
+}
+```
+
 | Field | Description |
 |-------|-------------|
 | `op_id` | Unique identifier assigned to the new artifact operation |
 | `status` | `"COMPLETED"` when the filesystem write succeeded |
 | `commit_seq` | Monotonically increasing sequence number of this commit |
-| `object_hash` | SHA-256 hash of the stored content blob |
-| `chain_hash` | Chain hash of the subgraph after this operation |
+| `object_hash` | SHA-256 hash of the stored content blob. Omitted when `verbose=false` |
+| `chain_hash` | Chain hash of the subgraph after this operation. Omitted when `verbose=false` |
 
 ### Error Codes
 
@@ -855,10 +881,11 @@ Appends content to a file (creates it if it does not exist) and records the resu
 | `reason` | string | | Human-readable reason (default: `"APPEND <file_path>"`) |
 | `parent_op_ids` | string[] | | Causal parent op IDs |
 | `evidence_refs` | object[] | | Evidence citations |
+| `verbose` | boolean | | `true` — when `false`, omit `object_hash` and `chain_hash` from the response to reduce token usage |
 
 ### Returns
 
-Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, `chain_hash`.
+Same shape as `hgp_write_file`, including the same `verbose` behaviour: `op_id`, `status`, `commit_seq` always present; `object_hash` and `chain_hash` present only when `verbose=true`.
 
 ### Error Codes
 
@@ -883,10 +910,11 @@ Replaces the first (and only) occurrence of `old_string` with `new_string` in a 
 | `reason` | string | | Human-readable reason (default: `"MODIFY <file_path>"`) |
 | `parent_op_ids` | string[] | | Causal parent op IDs |
 | `evidence_refs` | object[] | | Evidence citations |
+| `verbose` | boolean | | `true` — when `false`, omit `object_hash` and `chain_hash` from the response to reduce token usage |
 
 ### Returns
 
-Same shape as `hgp_write_file`: `op_id`, `status`, `commit_seq`, `object_hash`, `chain_hash`.
+Same shape as `hgp_write_file`, including the same `verbose` behaviour: `op_id`, `status`, `commit_seq` always present; `object_hash` and `chain_hash` present only when `verbose=true`.
 
 ### Error Codes
 
@@ -917,8 +945,11 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 | `agent_id` | string | ✓ | Identifier of the calling agent |
 | `previous_op_id` | string | | Op ID of the last write/edit op for this file; will be marked INVALIDATED |
 | `reason` | string | | Human-readable reason (default: `"DELETE <file_path>"`) |
+| `verbose` | boolean | | `true` — when `false`, omit `chain_hash` from the response to reduce token usage (`object_hash` is never present for invalidation ops) |
 
 ### Returns
+
+**Default (`verbose=true`):**
 
 ```json
 {
@@ -929,12 +960,22 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 }
 ```
 
+**Minimal (`verbose=false`):**
+
+```json
+{
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42
+}
+```
+
 | Field | Description |
 |-------|-------------|
 | `op_id` | Unique identifier assigned to the invalidation operation |
 | `status` | `"COMPLETED"` when the filesystem unlink succeeded |
 | `commit_seq` | Monotonically increasing sequence number of this commit |
-| `chain_hash` | Chain hash of the subgraph after this operation |
+| `chain_hash` | Chain hash of the subgraph after this operation. Omitted when `verbose=false`. Note: `object_hash` is never present for invalidation ops |
 
 ### Error Codes
 
@@ -973,8 +1014,11 @@ If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked o
 | `previous_op_id` | string | | Op ID of the last op for `old_path`; will be marked INVALIDATED. When omitted the tool auto-resolves the most recent tracked op for `old_path`. |
 | `reason` | string | | Human-readable reason (default: `"MOVE <old_path> → <new_path>"`) |
 | `evidence_refs` | object[] | | Evidence citations for the new artifact op |
+| `verbose` | boolean | | `true` — when `false`, omit `object_hash` and `chain_hash` from the response to reduce token usage |
 
 ### Returns
+
+**Default (`verbose=true`):**
 
 ```json
 {
@@ -987,7 +1031,18 @@ If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked o
 }
 ```
 
-`invalidation_op_id` is the op recorded for `old_path`; `op_id` is the new artifact op for `new_path`.
+**Minimal (`verbose=false`):**
+
+```json
+{
+  "invalidation_op_id": "op-...",
+  "op_id": "op-...",
+  "status": "COMPLETED",
+  "commit_seq": 42
+}
+```
+
+`invalidation_op_id` is the op recorded for `old_path`; `op_id` is the new artifact op for `new_path`. `object_hash` and `chain_hash` are omitted when `verbose=false`.
 
 ### Error Codes
 

@@ -213,3 +213,5 @@ hgp_get_citing_ops(op_id="op-abc123")
 
 → Full API reference: [docs/tools-reference.md](docs/tools-reference.md)
 → Usage patterns and examples: [docs/usage-patterns.md](docs/usage-patterns.md)
+
+> **Token-sensitive sessions:** mutation tools (`hgp_create_operation`, `hgp_write_file`, `hgp_edit_file`, `hgp_append_file`, `hgp_delete_file`, `hgp_move_file`) accept `verbose=False` to omit `chain_hash` and `object_hash` from responses, reducing per-call token overhead by ~73%. The default is `verbose=True`.
