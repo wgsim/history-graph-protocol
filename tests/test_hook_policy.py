@@ -130,3 +130,33 @@ def test_fresh_hook_no_warning(tmp_path: Path) -> None:
     result = _run(["hook-policy", "block"], cwd=repo)
     assert result.returncode == 0
     assert "predate" not in result.stderr
+
+
+def test_missing_post_tool_use_warns_advisory_only(tmp_path: Path) -> None:
+    """Missing post_tool_use_hgp.py warns about advisory gap, not policy enforcement."""
+    repo = _make_git_repo(tmp_path / "repo")
+    gemini_hooks = repo / ".gemini" / "hooks"
+    gemini_hooks.mkdir(parents=True)
+    # pre_tool_use present and current (has _resolve_block_mode)
+    (gemini_hooks / "pre_tool_use_hgp.py").write_text(
+        "def _resolve_block_mode(): return False\n"
+        "BLOCK_MODE = _resolve_block_mode()\n"
+    )
+    # post_tool_use intentionally absent
+    result = _run(["hook-policy", "block"], cwd=repo)
+    assert result.returncode == 0
+    # policy enforcement warning must NOT appear
+    assert "predate hook-policy support" not in result.stderr
+    assert "will not honor" not in result.stderr
+    # advisory-gap warning must appear
+    assert "post_tool_use_hgp.py is missing" in result.stderr
+    assert "Advisory/block policy enforcement still works" in result.stderr
+
+
+def test_missing_post_tool_use_no_warn_without_pre(tmp_path: Path) -> None:
+    """No post_tool_use warning when Gemini pre_tool_use is also absent."""
+    repo = _make_git_repo(tmp_path / "repo")
+    # no .gemini/hooks at all
+    result = _run(["hook-policy"], cwd=repo)
+    assert result.returncode == 0
+    assert "post_tool_use_hgp.py is missing" not in result.stderr

@@ -1134,8 +1134,8 @@ def _hook_policy(args: list[str]) -> None:
     policy_file.write_text(new_policy)
     print(f"Hook policy set to: {new_policy}")
 
-    # warn if installed hooks predate hook-policy support
-    stale: list[str] = []
+    # warn if installed hooks predate hook-policy support (policy enforcement broken)
+    stale_policy: list[str] = []
     for hook_path in [
         project_root / ".claude" / "hooks" / "pre_tool_use_hgp.py",
         project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py",
@@ -1145,18 +1145,24 @@ def _hook_policy(args: list[str]) -> None:
                 hook_path.read_text(),
                 re.MULTILINE,
             ):
-            stale.append(str(hook_path.relative_to(project_root)))
-    # warn if post_tool_use_hgp.py is missing (predates agent-context advisory warning)
+            stale_policy.append(str(hook_path.relative_to(project_root)))
+    if stale_policy:
+        print(
+            "\nWarning: the following installed hook(s) predate hook-policy support\n"
+            "and will not honor the advisory/block policy until reinstalled:\n"
+            + "".join(f"  {p}\n" for p in stale_policy)
+            + "Run `hgp install-hooks` to update them.",
+            file=sys.stderr,
+        )
+    # warn if post_tool_use_hgp.py is missing (agent-context advisory degraded, not policy)
     post_tool_use = project_root / ".gemini" / "hooks" / "post_tool_use_hgp.py"
     gemini_pre = project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py"
     if gemini_pre.exists() and not post_tool_use.exists():
-        stale.append(".gemini/hooks/post_tool_use_hgp.py (missing)")
-    if stale:
         print(
-            "\nWarning: the following installed hook(s) predate hook-policy support\n"
-            "and will not honor the new policy until reinstalled:\n"
-            + "".join(f"  {p}\n" for p in stale)
-            + "Run `hgp install-hooks` to update them.",
+            "\nWarning: .gemini/hooks/post_tool_use_hgp.py is missing.\n"
+            "Advisory/block policy enforcement still works, but the agent will not\n"
+            "receive in-context warnings after native file tool use.\n"
+            "Run `hgp install-hooks --gemini` to add it.",
             file=sys.stderr,
         )
 
