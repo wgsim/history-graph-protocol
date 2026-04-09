@@ -1,7 +1,8 @@
 # Benchmark: HGP Mutation Tool Response Token Overhead
 
 - Date: 2026-04-08
-- Branch/commit: `557f86d` (main); corrected at `8ecc31d`
+- Measured against commit: `557f86d`
+- Corrected in commits: `8ecc31d` (factual errors), `5ad5657` (provenance)
 - Author: claude-code
 - Purpose: Decide whether to implement a `verbose=False` option that strips
   `chain_hash` and `object_hash` from mutation tool responses
@@ -153,12 +154,13 @@ includes system prompt, conversation history, tool calls, and model responses.
 
 ### Real session data point
 
-The three `hgp_edit_file` calls made during this session (commits `eff7504`,
-`557f86d`, and the stale-hook fix) produced responses with an average serialised
-length of **259 characters**, consistent with the 268-char estimate above.
+Three `hgp_edit_file` calls captured while developing commits `eff7504`–`557f86d`
+produced responses with an average serialised length of **259 characters**,
+consistent with the 268-char estimate above.
 
 ```
-# Actual responses from this session:
+# Sampled from commits eff7504, 557f86d, and the intermediate stale-hook fix
+# (all three are hgp_edit_file responses on src/hgp/server.py):
 {"op_id":"64270c33-...","status":"COMPLETED","commit_seq":8,
  "object_hash":"sha256:8e89b05b...","chain_hash":"sha256:39068f1a..."}  → 259 chars
 
