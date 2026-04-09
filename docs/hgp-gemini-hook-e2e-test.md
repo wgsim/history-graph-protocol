@@ -46,8 +46,10 @@ If HGP tools are not listed, the MCP server failed to start. Check that
 ls .gemini/hooks/
 # expected: post_bash_hgp.py  post_tool_use_hgp.py  pre_bash_hgp.py  pre_tool_use_hgp.py
 
-cat .hgp/hook-policy
+hgp hook-policy
 # expected: advisory
+# Note: .hgp/hook-policy file is only created after explicitly setting a policy;
+# on a fresh repo the default advisory mode is implicit and the file may not exist.
 
 echo "${HGP_HOOK_BLOCK:-unset}"
 # expected: unset  (if not unset, run: unset HGP_HOOK_BLOCK)
