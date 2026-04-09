@@ -1146,6 +1146,11 @@ def _hook_policy(args: list[str]) -> None:
                 re.MULTILINE,
             ):
             stale.append(str(hook_path.relative_to(project_root)))
+    # warn if post_tool_use_hgp.py is missing (predates agent-context advisory warning)
+    post_tool_use = project_root / ".gemini" / "hooks" / "post_tool_use_hgp.py"
+    gemini_pre = project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py"
+    if gemini_pre.exists() and not post_tool_use.exists():
+        stale.append(".gemini/hooks/post_tool_use_hgp.py (missing)")
     if stale:
         print(
             "\nWarning: the following installed hook(s) predate hook-policy support\n"

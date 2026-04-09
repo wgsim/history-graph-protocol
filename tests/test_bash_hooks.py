@@ -142,7 +142,7 @@ def test_post_bash_no_git_repo():
 # ── Gemini Pre-Bash hook ──────────────────────────────────────────────────────
 
 def _gemini_shell_event(command: str) -> dict:
-    return {"tool_name": "shell", "tool_input": {"command": command}}
+    return {"tool_name": "run_shell_command", "tool_input": {"command": command}}
 
 
 def test_gemini_pre_bash_json_output_on_mutating():

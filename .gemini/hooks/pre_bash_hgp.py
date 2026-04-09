@@ -108,7 +108,7 @@ def main() -> None:
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)
 
-    if event.get("tool_name") != "shell":
+    if event.get("tool_name") != "run_shell_command":
         sys.exit(0)
 
     command: str = event.get("tool_input", {}).get("command", "")

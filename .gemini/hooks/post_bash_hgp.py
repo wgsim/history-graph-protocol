@@ -58,7 +58,7 @@ def main() -> None:
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)
 
-    if event.get("tool_name") != "shell":
+    if event.get("tool_name") != "run_shell_command":
         sys.exit(0)
 
     if not _consume_marker():
