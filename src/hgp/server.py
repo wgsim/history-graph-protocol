@@ -132,6 +132,7 @@ def hgp_create_operation(
     subgraph_root_op_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
+    verbose: bool = True,
 ) -> dict[str, Any]:
     """Create a new operation in the causal history DAG."""
     if op_type not in _VALID_OP_TYPES:
@@ -244,13 +245,17 @@ def hgp_create_operation(
             _log.error("ROLLBACK failed after transaction error: %s", rb_exc)
         raise
 
-    return {
+    result: dict[str, Any] = {
         "op_id": op_id,
         "status": "COMPLETED",
         "commit_seq": seq,
         "object_hash": object_hash,
         "chain_hash": final_chain_hash,
     }
+    if not verbose:
+        result.pop("object_hash", None)
+        result.pop("chain_hash", None)
+    return result
 
 
 _SUMMARY_FIELDS = {"op_id", "op_type", "status", "commit_seq", "agent_id", "memory_tier"}
@@ -615,6 +620,7 @@ def hgp_write_file(
     reason: str | None = None,
     parent_op_ids: list[str] | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
+    verbose: bool = True,
 ) -> dict[str, Any]:
     """Write (create or overwrite) a file and record it as an artifact operation."""
     try:
@@ -656,6 +662,9 @@ def hgp_write_file(
     except Exception as exc:
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
+    if not verbose:
+        result.pop("object_hash", None)
+        result.pop("chain_hash", None)
     return result
 
 
@@ -667,6 +676,7 @@ def hgp_append_file(
     reason: str | None = None,
     parent_op_ids: list[str] | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
+    verbose: bool = True,
 ) -> dict[str, Any]:
     """Append content to a file (creates it if absent) and record as artifact."""
     try:
@@ -712,6 +722,9 @@ def hgp_append_file(
     except Exception as exc:
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
+    if not verbose:
+        result.pop("object_hash", None)
+        result.pop("chain_hash", None)
     return result
 
 
@@ -724,6 +737,7 @@ def hgp_edit_file(
     reason: str | None = None,
     parent_op_ids: list[str] | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
+    verbose: bool = True,
 ) -> dict[str, Any]:
     """Replace the first (and only) occurrence of old_string with new_string."""
     try:
@@ -775,6 +789,9 @@ def hgp_edit_file(
     except Exception as exc:
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": result["op_id"]}
     result["status"] = "COMPLETED"
+    if not verbose:
+        result.pop("object_hash", None)
+        result.pop("chain_hash", None)
     return result
 
 
@@ -784,6 +801,7 @@ def hgp_delete_file(
     agent_id: str,
     previous_op_id: str | None = None,
     reason: str | None = None,
+    verbose: bool = True,
 ) -> dict[str, Any]:
     """Delete a file and record an invalidation operation."""
     try:
@@ -853,12 +871,15 @@ def hgp_delete_file(
         except Exception as rb_exc:
             _log.error("hgp_delete_file: ROLLBACK failed after finalize error op_id=%s: %s", op_id, rb_exc)
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": op_id}
-    return {
+    result: dict[str, Any] = {
         "op_id": op_id,
         "status": "COMPLETED",
         "commit_seq": seq,
         "chain_hash": final_hash,
     }
+    if not verbose:
+        result.pop("chain_hash", None)
+    return result
 
 
 @mcp.tool()
@@ -869,6 +890,7 @@ def hgp_move_file(
     previous_op_id: str | None = None,
     reason: str | None = None,
     evidence_refs: list[dict[str, Any]] | None = None,
+    verbose: bool = True,
 ) -> dict[str, Any]:
     """Move/rename a file: invalidates old path op, creates new artifact op."""
     try:
@@ -992,7 +1014,7 @@ def hgp_move_file(
         except Exception as rb_exc:
             _log.error("hgp_move_file: ROLLBACK failed after finalize error op_id=%s: %s", op_id, rb_exc)
         return {"error": "DB_FINALIZE_ERROR", "message": str(exc), "op_id": op_id}
-    return {
+    result = {
         "invalidation_op_id": inv_op_id,
         "op_id": op_id,
         "status": "COMPLETED",
@@ -1000,6 +1022,10 @@ def hgp_move_file(
         "object_hash": object_hash,
         "chain_hash": final_hash,
     }
+    if not verbose:
+        result.pop("object_hash", None)
+        result.pop("chain_hash", None)
+    return result
 
 
 _INSTALL_HOOKS_USAGE = (

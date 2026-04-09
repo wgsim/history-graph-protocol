@@ -813,6 +813,63 @@ def test_move_symlink_rejected(project, tmp_path):
 
 # ── Phase 5 — Task 5.4 ────────────────────────────────────────────────────────
 
+# ── verbose=False ─────────────────────────────────────────────────────────────
+
+def test_write_file_verbose_false_omits_hashes(project):
+    target = project / "f.txt"
+    result = hgp_write_file(file_path=str(target), content="x", agent_id="a", verbose=False)
+    assert result["status"] == "COMPLETED"
+    assert "op_id" in result
+    assert "commit_seq" in result
+    assert "object_hash" not in result
+    assert "chain_hash" not in result
+
+
+def test_write_file_verbose_true_includes_hashes(project):
+    target = project / "f2.txt"
+    result = hgp_write_file(file_path=str(target), content="x", agent_id="a", verbose=True)
+    assert "object_hash" in result
+    assert "chain_hash" in result
+
+
+def test_append_file_verbose_false_omits_hashes(project):
+    target = project / "log.txt"
+    result = hgp_append_file(file_path=str(target), content="line\n", agent_id="a", verbose=False)
+    assert result["status"] == "COMPLETED"
+    assert "object_hash" not in result
+    assert "chain_hash" not in result
+
+
+def test_edit_file_verbose_false_omits_hashes(project):
+    target = project / "edit.txt"
+    target.write_text("hello world")
+    result = hgp_edit_file(
+        file_path=str(target), old_string="hello", new_string="hi",
+        agent_id="a", verbose=False,
+    )
+    assert result["status"] == "COMPLETED"
+    assert "object_hash" not in result
+    assert "chain_hash" not in result
+
+
+def test_delete_file_verbose_false_omits_hash(project):
+    target = project / "del.txt"
+    target.write_text("bye")
+    result = hgp_delete_file(file_path=str(target), agent_id="a", verbose=False)
+    assert result["status"] == "COMPLETED"
+    assert "chain_hash" not in result
+
+
+def test_move_file_verbose_false_omits_hashes(project):
+    src = project / "src.txt"
+    dst = project / "dst.txt"
+    src.write_text("content")
+    result = hgp_move_file(old_path=str(src), new_path=str(dst), agent_id="a", verbose=False)
+    assert result["status"] == "COMPLETED"
+    assert "object_hash" not in result
+    assert "chain_hash" not in result
+
+
 def test_write_file_symlink_pointing_outside_root_rejected(project):
     """hgp_write_file returns PATH_OUTSIDE_ROOT for a symlink that resolves outside the project.
 

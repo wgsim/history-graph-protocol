@@ -1315,3 +1315,20 @@ def test_lease_validate_extend_true_advances_expires_at(server_components):
     assert after_expires > original_expires, (
         f"extend=True must advance expires_at: {original_expires} → {after_expires}"
     )
+
+
+# ── verbose=False ──────────────────────────────────────────────────────────────
+
+def test_create_operation_verbose_false_omits_hashes(server_components):
+    result = hgp_create_operation(op_type="artifact", agent_id="a", verbose=False)
+    assert result["status"] == "COMPLETED"
+    assert "op_id" in result
+    assert "commit_seq" in result
+    assert "object_hash" not in result
+    assert "chain_hash" not in result
+
+
+def test_create_operation_verbose_true_includes_hashes(server_components):
+    result = hgp_create_operation(op_type="artifact", agent_id="a", verbose=True)
+    assert "object_hash" in result
+    assert "chain_hash" in result
