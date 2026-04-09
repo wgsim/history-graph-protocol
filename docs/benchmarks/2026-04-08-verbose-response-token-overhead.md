@@ -2,7 +2,7 @@
 
 - Date: 2026-04-08
 - Measured against commit: `557f86d`
-- Corrected in commits: `8ecc31d` (factual errors), `5ad5657` (provenance)
+- Last updated: `2838171`
 - Author: claude-code
 - Purpose: Decide whether to implement a `verbose=False` option that strips
   `chain_hash` and `object_hash` from mutation tool responses
@@ -154,21 +154,20 @@ includes system prompt, conversation history, tool calls, and model responses.
 
 ### Real session data point
 
-Three `hgp_edit_file` calls captured while developing commits `eff7504`–`557f86d`
-produced responses with an average serialised length of **259 characters**,
-consistent with the 268-char estimate above.
+Two `hgp_edit_file` calls on `src/hgp/server.py` captured while authoring
+commits `eff7504` and `557f86d` produced serialised lengths of **259 characters**
+each, consistent with the 268-char estimate above.
 
 ```
-# Sampled from commits eff7504, 557f86d, and the intermediate stale-hook fix
-# (all three are hgp_edit_file responses on src/hgp/server.py):
-{"op_id":"64270c33-...","status":"COMPLETED","commit_seq":8,
- "object_hash":"sha256:8e89b05b...","chain_hash":"sha256:39068f1a..."}  → 259 chars
+# op_id 64270c33 — hgp_edit_file on src/hgp/server.py (landed in eff7504):
+{"op_id":"64270c33-1d1c-43cd-8f42-ff13700c4a06","status":"COMPLETED",
+ "commit_seq":8,"object_hash":"sha256:8e89b05b...","chain_hash":"sha256:39068f1a..."}
+→ 259 chars
 
-{"op_id":"f1ca7261-...","status":"COMPLETED","commit_seq":9,
- "object_hash":"sha256:1a688a20...","chain_hash":"sha256:487de5e2..."}  → 259 chars
-
-{"op_id":"086777e4-...","status":"COMPLETED","commit_seq":10,
- "object_hash":"sha256:20d46286...","chain_hash":"sha256:b000e742..."}  → 259 chars
+# op_id f1ca7261 — hgp_edit_file on src/hgp/server.py (landed in 557f86d):
+{"op_id":"f1ca7261-b728-4bc9-a655-470017647072","status":"COMPLETED",
+ "commit_seq":9,"object_hash":"sha256:1a688a20...","chain_hash":"sha256:487de5e2..."}
+→ 259 chars
 ```
 
 ---
