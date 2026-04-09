@@ -160,3 +160,23 @@ def test_missing_post_tool_use_no_warn_without_pre(tmp_path: Path) -> None:
     result = _run(["hook-policy"], cwd=repo)
     assert result.returncode == 0
     assert "post_tool_use_hgp.py is missing" not in result.stderr
+
+
+def test_stale_pre_and_missing_post_no_contradiction(tmp_path: Path) -> None:
+    """Stale pre + missing post: no contradictory 'policy still works' sentence."""
+    repo = _make_git_repo(tmp_path / "repo")
+    gemini_hooks = repo / ".gemini" / "hooks"
+    gemini_hooks.mkdir(parents=True)
+    # stale pre hook (no _resolve_block_mode)
+    (gemini_hooks / "pre_tool_use_hgp.py").write_text(
+        "# old hook without def _resolve_block_mode( support\n"
+    )
+    # post_tool_use absent
+    result = _run(["hook-policy", "advisory"], cwd=repo)
+    assert result.returncode == 0
+    # stale-policy warning must appear
+    assert "predate hook-policy support" in result.stderr
+    # post-hook absence still diagnosable
+    assert "post_tool_use_hgp.py" in result.stderr
+    # no contradictory claim
+    assert "Advisory/block policy enforcement still works" not in result.stderr

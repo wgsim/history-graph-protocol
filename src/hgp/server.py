@@ -1155,16 +1155,30 @@ def _hook_policy(args: list[str]) -> None:
             file=sys.stderr,
         )
     # warn if post_tool_use_hgp.py is missing (agent-context advisory degraded, not policy)
+    # only emit the "policy still works" sentence when the pre hook is current;
+    # if the pre hook is stale, the stale-policy warning above already covers the
+    # combined state and the "still works" claim would be contradictory.
     post_tool_use = project_root / ".gemini" / "hooks" / "post_tool_use_hgp.py"
     gemini_pre = project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py"
+    gemini_pre_stale = any(
+        ".gemini" in p for p in stale_policy
+    )
     if gemini_pre.exists() and not post_tool_use.exists():
-        print(
-            "\nWarning: .gemini/hooks/post_tool_use_hgp.py is missing.\n"
-            "Advisory/block policy enforcement still works, but the agent will not\n"
-            "receive in-context warnings after native file tool use.\n"
-            "Run `hgp install-hooks --gemini` to add it.",
-            file=sys.stderr,
-        )
+        if gemini_pre_stale:
+            # stale pre hook already diagnosed; just note the post hook is also absent
+            print(
+                "\nWarning: .gemini/hooks/post_tool_use_hgp.py is also missing.\n"
+                "Run `hgp install-hooks --gemini` to install all current hooks.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "\nWarning: .gemini/hooks/post_tool_use_hgp.py is missing.\n"
+                "Advisory/block policy enforcement still works, but the agent will not\n"
+                "receive in-context warnings after native file tool use.\n"
+                "Run `hgp install-hooks --gemini` to add it.",
+                file=sys.stderr,
+            )
 
 
 def run() -> None:
