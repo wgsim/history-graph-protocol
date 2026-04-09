@@ -13,3 +13,4 @@ dist/
 SESSION_HANDOVER.md
 docs/plans/
 docs/reviews/
+.mcp.json
