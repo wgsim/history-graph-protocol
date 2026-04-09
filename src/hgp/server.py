@@ -1114,7 +1114,11 @@ def _hook_policy(args: list[str]) -> None:
         project_root / ".claude" / "hooks" / "pre_tool_use_hgp.py",
         project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py",
     ]:
-        if hook_path.exists() and "def _resolve_block_mode" not in hook_path.read_text():
+        if hook_path.exists() and not re.search(
+                r"^def\s+_resolve_block_mode\s*\(",
+                hook_path.read_text(),
+                re.MULTILINE,
+            ):
             stale.append(str(hook_path.relative_to(project_root)))
     if stale:
         print(

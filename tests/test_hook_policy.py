@@ -103,6 +103,21 @@ def test_stale_hook_triggers_warning(tmp_path: Path) -> None:
     assert "hgp install-hooks" in result.stderr
 
 
+def test_stale_hook_comment_no_false_negative(tmp_path: Path) -> None:
+    repo = _make_git_repo(tmp_path / "repo")
+    # hook that mentions def _resolve_block_mode( only in a comment — still stale
+    claude_hooks = repo / ".claude" / "hooks"
+    claude_hooks.mkdir(parents=True)
+    (claude_hooks / "pre_tool_use_hgp.py").write_text(
+        "# old hook without def _resolve_block_mode( support\n"
+        "import os\n"
+        "BLOCK_MODE = os.environ.get('HGP_HOOK_BLOCK', '0') == '1'\n"
+    )
+    result = _run(["hook-policy", "block"], cwd=repo)
+    assert result.returncode == 0
+    assert "predate hook-policy support" in result.stderr
+
+
 def test_fresh_hook_no_warning(tmp_path: Path) -> None:
     repo = _make_git_repo(tmp_path / "repo")
     # install a current hook containing _resolve_block_mode
