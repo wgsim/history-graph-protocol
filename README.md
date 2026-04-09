@@ -51,7 +51,7 @@ Each operation carries a memory tier that reflects access recency:
 | `long_term` | Older but still reachable; included in all queries |
 | `inactive` | Not accessed recently; excluded from default queries, never deleted |
 
-Tiers are updated automatically based on access patterns and can be set manually via `hgp_set_memory_tier`.
+Tiers are updated automatically based on access patterns and can be set manually via `hgp_set_memory_tier`. Valid tier values: `short_term`, `long_term`, `inactive`. See [docs/tools-reference.md](docs/tools-reference.md#hgp_set_memory_tier) for details.
 
 ### Evidence Trail (V3)
 
@@ -200,7 +200,7 @@ hgp_get_citing_ops(op_id="op-abc123")
 | `hgp_release_lease` | Release a lease explicitly after writing |
 | `hgp_set_memory_tier` | Manually promote or demote an operation's memory tier |
 | `hgp_get_artifact` | Retrieve binary payload from CAS by its object_hash |
-| `hgp_anchor_git` | Link an operation to a Git commit SHA |
+| `hgp_anchor_git` | Link an operation to a Git commit SHA (requires full 40-char SHA) |
 | `hgp_reconcile` | Run crash-recovery reconciler (use after unexpected shutdown) |
 | `hgp_get_evidence` | List all operations a given op cited as evidence |
 | `hgp_get_citing_ops` | Reverse lookup — list all ops that cited a given op as evidence |
