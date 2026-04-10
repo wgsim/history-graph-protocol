@@ -1104,9 +1104,10 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
             p = hooks_dir / name
             return f"python3 {p}" if scope == "global" else f"python3 .claude/hooks/{name}"
 
+        # Claude Code hooks: stderr from pre hooks reaches the agent directly,
+        # so no separate PostToolUse advisory hook is needed.
         hook_specs = {
             "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("pre_tool_use_hgp.py")}]}],
-            "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("post_tool_use_hgp.py")}]}],
             "PreBash": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("pre_bash_hgp.py")}]}],
             "PostBash": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("post_bash_hgp.py")}]}],
         }

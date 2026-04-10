@@ -129,6 +129,35 @@ def test_update_hooks_settings_claude_includes_bash_hooks(tmp_path):
     assert "PostBash" in hook_events
     pre_bash_cmd = data["hooks"]["PreBash"][0]["hooks"][0]["command"]
     assert "pre_bash_hgp.py" in pre_bash_cmd
+    # Claude has no post_tool_use hook — PostToolUse must not be generated
+    assert "PostToolUse" not in hook_events
+
+
+def test_update_hooks_settings_claude_settings_match_installed_files(tmp_path):
+    """Every generated Claude hook command must reference a file that _install_hooks_files copies."""
+    import importlib.resources
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    _update_hooks_settings("claude", settings, hooks_dir, "global")
+
+    # Collect basenames referenced in generated settings
+    data = json.loads(settings.read_text())
+    referenced = set()
+    for entries in data["hooks"].values():
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                cmd = h.get("command", "")
+                if "_hgp.py" in cmd:
+                    referenced.add(cmd.split()[-1].split("/")[-1])
+
+    # Collect basenames that _install_hooks_files would actually copy
+    pkg_ref = importlib.resources.files("hgp.hooks.claude")
+    installed = {item.name for item in pkg_ref.iterdir() if item.name.endswith(".py") and not item.name.startswith("__")}
+
+    assert referenced <= installed, (
+        f"Settings reference hook files not in the Claude package: {referenced - installed}"
+    )
 
 
 def test_update_hooks_settings_claude_local_uses_relative_path(tmp_path):
