@@ -15,19 +15,28 @@ in a real Gemini CLI session. Run all steps in order; record actual output for e
 HGP hooks warn agents to use `hgp_*` tools instead of native file tools. For those tools
 to actually be available in the session, HGP must be registered as an MCP server.
 
-Add the following to `~/.gemini/settings.json` under `mcpServers`:
+Add the following to `~/.gemini/settings.json` (global) or `.gemini/settings.json`
+in the project root (per-project):
 
 ```json
-"mcpServers": {
-  "hgp": {
-    "command": "python",
-    "args": ["-m", "hgp.server"]
+{
+  "mcpServers": {
+    "hgp": {
+      "command": "python",
+      "args": ["-m", "hgp.server"],
+      "cwd": "/path/to/your/project"
+    }
   }
 }
 ```
 
-> **Note:** The server is started from the working directory at session start, so launch
-> Gemini CLI from inside the repo root. `HGP_PROJECT_ROOT` is not needed in normal use.
+> **`cwd` is required.** Gemini CLI does not automatically set the working directory
+> to the project root when starting MCP servers. Without `cwd`, HGP cannot locate
+> the `.git` directory and will fail to connect (shows as disconnected in `/tools`).
+> Replace `/path/to/your/project` with the absolute path to this repo.
+>
+> If using a virtual environment, use the venv python directly:
+> `"command": "/path/to/project/.venv/bin/python"`
 
 Verify HGP tools are visible after launching Gemini CLI:
 

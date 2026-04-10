@@ -142,6 +142,30 @@ HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gi
 
 The server is started from the project directory by the MCP host, so `HGP_PROJECT_ROOT` is typically not needed. Set it explicitly if the working directory at startup is not the project root.
 
+**Gemini CLI** (`~/.gemini/settings.json` for global, or `.gemini/settings.json` in the project root for per-project):
+
+```json
+{
+  "mcpServers": {
+    "hgp": {
+      "command": "python",
+      "args": ["-m", "hgp.server"],
+      "cwd": "/path/to/your/project"
+    }
+  }
+}
+```
+
+> **`cwd` is required for Gemini CLI.** Unlike Claude Code, Gemini CLI does not
+> automatically set the working directory to the project root when starting MCP servers.
+> Without `cwd`, HGP cannot locate the `.git` directory and will fail to connect.
+>
+> Use an absolute path. If you work across multiple projects, prefer per-project
+> `.gemini/settings.json` with each project's own `cwd`.
+
+After adding the config, restart Gemini CLI and verify with `/tools` — you should see
+`mcp_hgp_hgp_create_operation`, `mcp_hgp_hgp_write_file`, etc. in the tool list.
+
 ---
 
 ## Quick Start
