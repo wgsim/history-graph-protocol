@@ -1100,14 +1100,15 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
 
     hook_specs: dict[str, list[dict]] = {}
     if client == "claude":
-        hooks_dir_path = hooks_dir
         def _cmd(name: str) -> str:
-            p = hooks_dir_path / name
+            p = hooks_dir / name
             return f"python3 {p}" if scope == "global" else f"python3 .claude/hooks/{name}"
 
         hook_specs = {
             "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("pre_tool_use_hgp.py")}]}],
             "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("post_tool_use_hgp.py")}]}],
+            "PreBash": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("pre_bash_hgp.py")}]}],
+            "PostBash": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("post_bash_hgp.py")}]}],
         }
     elif client == "gemini":
         def _gcmd(name: str) -> str:
@@ -1131,8 +1132,13 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
             return
 
     existing_hooks = existing.get("hooks", {})
-    for event, entries in hook_specs.items():
-        existing_hooks[event] = entries
+    for event, hgp_entries in hook_specs.items():
+        # Preserve non-HGP entries; replace HGP entries in place.
+        non_hgp = [
+            e for e in existing_hooks.get(event, [])
+            if not any("_hgp.py" in h.get("command", "") for h in e.get("hooks", []))
+        ]
+        existing_hooks[event] = non_hgp + hgp_entries
     existing["hooks"] = existing_hooks
     settings_path.write_text(json.dumps(existing, indent=2) + "\n")
 

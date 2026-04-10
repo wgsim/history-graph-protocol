@@ -118,6 +118,19 @@ def test_update_hooks_settings_claude_global_creates_file(tmp_path):
     assert str(hooks_dir) in cmd
 
 
+def test_update_hooks_settings_claude_includes_bash_hooks(tmp_path):
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    _update_hooks_settings("claude", settings, hooks_dir, "global")
+    data = json.loads(settings.read_text())
+    hook_events = set(data["hooks"].keys())
+    assert "PreBash" in hook_events
+    assert "PostBash" in hook_events
+    pre_bash_cmd = data["hooks"]["PreBash"][0]["hooks"][0]["command"]
+    assert "pre_bash_hgp.py" in pre_bash_cmd
+
+
 def test_update_hooks_settings_claude_local_uses_relative_path(tmp_path):
     settings = tmp_path / "settings.json"
     hooks_dir = tmp_path / ".claude" / "hooks"
@@ -126,6 +139,36 @@ def test_update_hooks_settings_claude_local_uses_relative_path(tmp_path):
     data = json.loads(settings.read_text())
     cmd = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert cmd.startswith("python3 .claude/hooks/")
+
+
+def test_update_hooks_settings_preserves_non_hgp_hooks(tmp_path):
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    # Pre-populate with an existing non-HGP hook
+    settings.write_text(json.dumps({
+        "hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "my_custom_hook.sh"}]}],
+        }
+    }))
+    _update_hooks_settings("claude", settings, hooks_dir, "global")
+    data = json.loads(settings.read_text())
+    pre_tool_use = data["hooks"]["PreToolUse"]
+    commands = [h["command"] for entry in pre_tool_use for h in entry.get("hooks", [])]
+    assert any("my_custom_hook.sh" in c for c in commands), "existing hook was deleted"
+    assert any("pre_tool_use_hgp.py" in c for c in commands), "HGP hook not added"
+
+
+def test_update_hooks_settings_idempotent_no_duplicates(tmp_path):
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    _update_hooks_settings("claude", settings, hooks_dir, "global")
+    first = json.loads(settings.read_text())
+    _update_hooks_settings("claude", settings, hooks_dir, "global")
+    second = json.loads(settings.read_text())
+    # Running twice must not add duplicate HGP entries
+    assert len(second["hooks"]["PreToolUse"]) == len(first["hooks"]["PreToolUse"])
 
 
 def test_update_hooks_settings_merges_existing_keys(tmp_path):
