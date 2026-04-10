@@ -1038,6 +1038,295 @@ _INSTALL_HOOKS_USAGE = (
 
 _VALID_INSTALL_FLAGS = {"--claude", "--gemini"}
 
+_INSTALL_USAGE = (
+    "usage: hgp install [--claude] [--gemini] [--codex] [--local]\n"
+    "\n"
+    "  (no flags)   install for Claude Code, Gemini CLI, and Codex (global scope)\n"
+    "  --claude     Claude Code only\n"
+    "  --gemini     Gemini CLI only\n"
+    "  --codex      Codex only\n"
+    "  --local      project-local scope (default: global/user scope)\n"
+)
+
+_VALID_INSTALL_ARGS = {"--claude", "--gemini", "--codex", "--local"}
+
+_HGP_INSTRUCTIONS_BLOCK = """\
+<!-- hgp-instructions-start -->
+## HGP — History Graph Protocol
+
+HGP is connected as an MCP server. Use HGP tools to record every significant
+action and decision.
+
+**Use HGP file tools instead of native file tools:**
+
+| Native tool | HGP equivalent |
+|-------------|----------------|
+| Write / write_file | `hgp_write_file` |
+| Edit / replace | `hgp_edit_file` |
+| Bash append | `hgp_append_file` |
+
+Record `hypothesis` operations for decisions, `artifact` for outputs,
+`invalidation` when superseding prior work.
+<!-- hgp-instructions-end -->"""
+
+
+def _install_hooks_files(pkg: str, dest_dir: Path) -> list[str]:
+    """Copy hook .py files from hgp.hooks.<pkg> package to dest_dir.
+
+    Returns list of installed file paths (relative to dest_dir parent if possible).
+    """
+    import importlib.resources
+    import shutil
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    installed: list[str] = []
+    pkg_ref = importlib.resources.files(f"hgp.hooks.{pkg}")
+    for item in pkg_ref.iterdir():
+        if item.name.endswith(".py") and not item.name.startswith("__"):
+            dest = dest_dir / item.name
+            with importlib.resources.as_file(item) as src:
+                shutil.copy2(src, dest)
+            installed.append(str(dest))
+    return installed
+
+
+def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, scope: str) -> None:
+    """Merge HGP hook entries into a client settings.json file.
+
+    scope: "global" → absolute paths in hook commands
+           "local"  → relative paths (relative to project root, i.e. .claude/hooks/...)
+    """
+    import sys
+
+    hook_specs: dict[str, list[dict]] = {}
+    if client == "claude":
+        hooks_dir_path = hooks_dir
+        def _cmd(name: str) -> str:
+            p = hooks_dir_path / name
+            return f"python3 {p}" if scope == "global" else f"python3 .claude/hooks/{name}"
+
+        hook_specs = {
+            "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("pre_tool_use_hgp.py")}]}],
+            "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("post_tool_use_hgp.py")}]}],
+        }
+    elif client == "gemini":
+        def _gcmd(name: str) -> str:
+            p = hooks_dir / name
+            return f"python3 {p}" if scope == "global" else f"python3 .gemini/hooks/{name}"
+
+        hook_specs = {
+            "BeforeTool": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("pre_tool_use_hgp.py")}]}],
+            "AfterTool": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("post_tool_use_hgp.py")}]}],
+            "BeforeShell": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("pre_bash_hgp.py")}]}],
+            "AfterShell": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("post_bash_hgp.py")}]}],
+        }
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if settings_path.exists():
+        try:
+            existing = json.loads(settings_path.read_text())
+        except json.JSONDecodeError as exc:
+            print(f"  ✗ failed to parse {settings_path}: {exc}", file=sys.stderr)
+            return
+
+    existing_hooks = existing.get("hooks", {})
+    for event, entries in hook_specs.items():
+        existing_hooks[event] = entries
+    existing["hooks"] = existing_hooks
+    settings_path.write_text(json.dumps(existing, indent=2) + "\n")
+
+
+def _inject_instructions(md_path: Path) -> str:
+    """Append or update the HGP instructions block in a markdown file.
+
+    Returns "injected", "updated", or "already_current".
+    """
+    START = "<!-- hgp-instructions-start -->"
+    END = "<!-- hgp-instructions-end -->"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    content = md_path.read_text() if md_path.exists() else ""
+    if START in content and END in content:
+        # replace existing block
+        before = content[: content.index(START)]
+        after = content[content.index(END) + len(END):]
+        new_content = before + _HGP_INSTRUCTIONS_BLOCK + after
+        if new_content == content:
+            return "already_current"
+        md_path.write_text(new_content)
+        return "updated"
+    # append
+    sep = "\n\n" if content and not content.endswith("\n\n") else ""
+    md_path.write_text(content + sep + _HGP_INSTRUCTIONS_BLOCK + "\n")
+    return "injected"
+
+
+def _edit_codex_toml(toml_path: Path, python: str) -> str:
+    """Write or update [mcp_servers.hgp] in a Codex config.toml.
+
+    Returns "written", "updated", or "already_current".
+    """
+    SECTION = "[mcp_servers.hgp]"
+    new_lines = [
+        SECTION,
+        f'command = "{python}"',
+        'args = ["-m", "hgp.server"]',
+    ]
+    new_block = "\n".join(new_lines)
+
+    toml_path.parent.mkdir(parents=True, exist_ok=True)
+    if not toml_path.exists():
+        toml_path.write_text(new_block + "\n")
+        return "written"
+
+    text = toml_path.read_text()
+    if SECTION not in text:
+        sep = "\n\n" if text and not text.endswith("\n\n") else ""
+        toml_path.write_text(text + sep + new_block + "\n")
+        return "written"
+
+    # replace the existing section up to the next section header
+    lines = text.splitlines(keepends=True)
+    start_idx = next(i for i, l in enumerate(lines) if l.strip() == SECTION)
+    end_idx = len(lines)
+    for i in range(start_idx + 1, len(lines)):
+        if lines[i].startswith("[") and not lines[i].startswith("[["):
+            end_idx = i
+            break
+    original_block = "".join(lines[start_idx:end_idx]).rstrip()
+    if original_block == new_block:
+        return "already_current"
+    new_text = "".join(lines[:start_idx]) + new_block + "\n" + "".join(lines[end_idx:])
+    toml_path.write_text(new_text)
+    return "updated"
+
+
+def _install_mcp(client: str, scope: str, python: str) -> tuple[bool, str]:
+    """Register HGP as an MCP server via the client CLI.
+
+    Returns (success, message).
+    """
+    import shutil
+    import subprocess
+    import sys
+
+    if client == "claude":
+        cli = shutil.which("claude")
+        if not cli:
+            return False, "claude CLI not found — skipping MCP registration"
+        mcp_scope = "user" if scope == "global" else "local"
+        cmd = [cli, "mcp", "add", f"--scope={mcp_scope}", "hgp", "--", python, "-m", "hgp.server"]
+    elif client == "gemini":
+        cli = shutil.which("gemini")
+        if not cli:
+            return False, "gemini CLI not found — skipping MCP registration"
+        mcp_scope = "user" if scope == "global" else "project"
+        cmd = [cli, "mcp", "add", f"--scope={mcp_scope}", "hgp", python, "-m", "hgp.server"]
+    elif client == "codex":
+        cli = shutil.which("codex")
+        if not cli:
+            return False, "codex CLI not found — skipping global MCP registration"
+        cmd = [cli, "mcp", "add", "hgp", "--", python, "-m", "hgp.server"]
+    else:
+        return False, f"unknown client: {client}"
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        return True, "registered"
+    stderr = result.stderr.strip()
+    # many CLI tools print "already exists" or similar on re-registration
+    if "already" in stderr.lower() or "exists" in stderr.lower():
+        return True, "already registered"
+    return False, f"CLI error: {stderr or result.stdout.strip()}"
+
+
+def _install(args: list[str]) -> None:
+    """Unified installer: MCP registration, hooks, and agent instructions."""
+    import sys
+
+    unknown = [a for a in args if a not in _VALID_INSTALL_ARGS]
+    if unknown:
+        print(f"hgp install: unknown flag(s): {' '.join(unknown)}", file=sys.stderr)
+        print(_INSTALL_USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    scope = "local" if "--local" in args else "global"
+    do_claude = not any(a in args for a in ("--claude", "--gemini", "--codex")) or "--claude" in args
+    do_gemini = not any(a in args for a in ("--claude", "--gemini", "--codex")) or "--gemini" in args
+    do_codex = not any(a in args for a in ("--claude", "--gemini", "--codex")) or "--codex" in args
+
+    python = sys.executable
+
+    # resolve project root for local scope
+    project_root: Path | None = None
+    if scope == "local" or do_codex:
+        try:
+            project_root = find_project_root(Path.cwd())
+        except ProjectRootError:
+            if scope == "local":
+                print(
+                    "hgp install --local: no git repository found from current directory.\n"
+                    "Run this command from inside a git repository.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    def _step(label: str, fn):
+        try:
+            result = fn()
+            if isinstance(result, tuple):
+                ok, msg = result
+                status = "✓" if ok else "✗"
+                print(f"  {status} {label}: {msg}")
+            else:
+                print(f"  ✓ {label}: {result}")
+        except Exception as exc:
+            print(f"  ✗ {label}: {exc}", file=sys.stderr)
+
+    if do_claude:
+        print("Claude Code:")
+        _step("MCP", lambda: _install_mcp("claude", scope, python))
+        if scope == "global":
+            hooks_dir = Path.home() / ".claude" / "hooks"
+            settings_path = Path.home() / ".claude" / "settings.json"
+            md_path = Path.home() / ".claude" / "CLAUDE.md"
+        else:
+            assert project_root is not None
+            hooks_dir = project_root / ".claude" / "hooks"
+            settings_path = project_root / ".claude" / "settings.json"
+            md_path = project_root / "CLAUDE.md"
+        _step("hooks files", lambda d=hooks_dir: f"installed {len(_install_hooks_files('claude', d))} file(s) → {d}")
+        _step("hooks settings", lambda: (_update_hooks_settings("claude", settings_path, hooks_dir, scope), "updated")[1])
+        _step("instructions", lambda p=md_path: _inject_instructions(p))
+
+    if do_gemini:
+        print("Gemini CLI:")
+        _step("MCP", lambda: _install_mcp("gemini", scope, python))
+        if scope == "global":
+            hooks_dir = Path.home() / ".gemini" / "hooks"
+            settings_path = Path.home() / ".gemini" / "settings.json"
+            md_path = Path.home() / ".gemini" / "GEMINI.md"
+        else:
+            assert project_root is not None
+            hooks_dir = project_root / ".gemini" / "hooks"
+            settings_path = project_root / ".gemini" / "settings.json"
+            md_path = project_root / "GEMINI.md"
+        _step("hooks files", lambda d=hooks_dir: f"installed {len(_install_hooks_files('gemini', d))} file(s) → {d}")
+        _step("hooks settings", lambda: (_update_hooks_settings("gemini", settings_path, hooks_dir, scope), "updated")[1])
+        _step("instructions", lambda p=md_path: _inject_instructions(p))
+
+    if do_codex:
+        print("Codex:")
+        if scope == "global":
+            _step("MCP", lambda: _install_mcp("codex", scope, python))
+            md_path = Path.home() / ".codex" / "AGENTS.md"
+        else:
+            assert project_root is not None
+            toml_path = project_root / ".codex" / "config.toml"
+            _step("MCP (config.toml)", lambda p=toml_path: _edit_codex_toml(p, python))
+            md_path = project_root / "AGENTS.md"
+        _step("instructions", lambda p=md_path: _inject_instructions(p))
+
 
 def _install_hooks(args: list[str]) -> None:
     """Install HGP hook files into .claude/hooks/ and/or .gemini/hooks/."""
@@ -1186,9 +1475,12 @@ def run() -> None:
 
     Usage:
         hgp                          # start MCP server (stdio)
-        hgp install-hooks            # install both Claude Code and Gemini CLI hooks
-        hgp install-hooks --claude   # Claude Code hooks only
-        hgp install-hooks --gemini   # Gemini CLI hooks only
+        hgp install                  # register MCP + install hooks + inject instructions
+        hgp install --claude         # Claude Code only
+        hgp install --gemini         # Gemini CLI only
+        hgp install --codex          # Codex only
+        hgp install --local          # project-local scope
+        hgp install-hooks            # (deprecated) install hook files only
         hgp hook-policy              # show current hook enforcement policy
         hgp hook-policy advisory     # warn only (default)
         hgp hook-policy block        # block native file tools
@@ -1196,7 +1488,13 @@ def run() -> None:
     import sys
 
     args = sys.argv[1:]
-    if args and args[0] == "install-hooks":
+    if args and args[0] == "install":
+        _install(args[1:])
+    elif args and args[0] == "install-hooks":
+        print(
+            "Warning: `hgp install-hooks` is deprecated. Use `hgp install` instead.",
+            file=sys.stderr,
+        )
         _install_hooks(args[1:])
     elif args and args[0] == "hook-policy":
         _hook_policy(args[1:])
