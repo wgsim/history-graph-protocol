@@ -119,9 +119,11 @@ def main() -> None:
     if matched is None:
         sys.exit(0)
 
-    # Write marker so AfterTool hook knows to run git status
+    # Write marker so AfterTool hook knows to run git status.
+    # Store the matched pattern so the AfterTool hook can include it in additionalContext.
     try:
-        open(_marker_path(), "w").close()
+        with open(_marker_path(), "w") as f:
+            f.write(matched)
     except OSError:
         pass  # /tmp not writable — skip gating, hook still warns
 

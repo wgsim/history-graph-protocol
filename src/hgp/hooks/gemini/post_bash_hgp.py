@@ -24,14 +24,15 @@ def _marker_path() -> str:
     return f"/tmp/.hgp_bash_mutating_{os.getppid()}"
 
 
-def _consume_marker() -> bool:
-    """Return True and remove marker if it exists, False otherwise."""
+def _consume_marker() -> str | None:
+    """Return marker contents (matched pattern) and remove marker, or None if absent."""
     path = _marker_path()
     try:
+        content = open(path).read().strip()
         os.unlink(path)
-        return True
+        return content or ""
     except FileNotFoundError:
-        return False
+        return None
 
 
 def _git_changed_files(cwd: str) -> list[str]:
@@ -61,20 +62,33 @@ def main() -> None:
     if event.get("tool_name") != "run_shell_command":
         sys.exit(0)
 
-    if not _consume_marker():
-        # No marker → BeforeTool hook didn't flag this as mutating; skip git status
+    matched = _consume_marker()
+    if matched is None:
+        # No marker → BeforeTool hook didn't flag this as mutating; skip
         sys.exit(0)
 
     cwd = os.getcwd()
     changed = _git_changed_files(cwd)
-    if not changed:
-        sys.exit(0)
 
-    lines_str = "\n  ".join(changed)
-    msg = (
-        f"[HGP] Bash command changed tracked files (use hgp_* tools for history):\n  {lines_str}"
-    )
-    print(json.dumps({"systemMessage": msg}))
+    # Build agent-facing advisory (additionalContext — reaches agent reasoning)
+    parts = [
+        f"[HGP] Bash command may mutate files (matched: {matched!r}). "
+        "If this writes or deletes tracked files, prefer hgp_* tools so the "
+        "operation is recorded in HGP history."
+    ]
+    if changed:
+        lines_str = "\n  ".join(changed)
+        parts.append(f"Changed tracked files:\n  {lines_str}")
+    additional_context = "\n".join(parts)
+
+    # Terminal message (systemMessage — user only)
+    terminal_msg = additional_context if changed else None
+
+    output: dict = {"hookSpecificOutput": {"additionalContext": additional_context}}
+    if terminal_msg:
+        output["systemMessage"] = terminal_msg
+
+    print(json.dumps(output))
     sys.exit(0)
 
 
