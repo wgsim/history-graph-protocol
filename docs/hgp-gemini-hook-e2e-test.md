@@ -15,28 +15,17 @@ in a real Gemini CLI session. Run all steps in order; record actual output for e
 HGP hooks warn agents to use `hgp_*` tools instead of native file tools. For those tools
 to actually be available in the session, HGP must be registered as an MCP server.
 
-Add the following to `~/.gemini/settings.json` (global) or `.gemini/settings.json`
-in the project root (per-project):
+Register HGP as a global MCP server using the Gemini CLI:
 
-```json
-{
-  "mcpServers": {
-    "hgp": {
-      "command": "python",
-      "args": ["-m", "hgp.server"],
-      "cwd": "/path/to/your/project"
-    }
-  }
-}
+```bash
+gemini mcp add --scope user hgp python -m hgp.server
 ```
 
-> **`cwd` is required.** Gemini CLI does not automatically set the working directory
-> to the project root when starting MCP servers. Without `cwd`, HGP cannot locate
-> the `.git` directory and will fail to connect (shows as disconnected in `/tools`).
-> Replace `/path/to/your/project` with the absolute path to this repo.
+> If `python` on your PATH does not have `history-graph-protocol` installed, use the
+> absolute path to the correct python (e.g. the venv python):
+> `gemini mcp add --scope user hgp /path/to/.venv/bin/python -m hgp.server`
 >
-> If using a virtual environment, use the venv python directly:
-> `"command": "/path/to/project/.venv/bin/python"`
+> For project-local scope, use `--scope project` instead of `--scope user`.
 
 Verify HGP tools are visible after launching Gemini CLI:
 
@@ -268,3 +257,6 @@ Fill in after running all tests:
 - `systemMessage` is displayed to the **user in the terminal** only. It does not appear in
   the agent's reasoning. Agent-side advisory warnings come from `post_tool_use_hgp.py` via
   `hookSpecificOutput.additionalContext`.
+- The `gemini mcp add` CLI does not support a `cwd` option. HGP determines the project root
+  from `Path.cwd()` at startup, so Gemini CLI must be launched from the project root for HGP
+  to locate `.git` correctly.
