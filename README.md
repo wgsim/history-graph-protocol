@@ -87,17 +87,51 @@ hgp
 python -m hgp.server
 ```
 
-### Installing hooks
+### MCP Client Configuration
 
-HGP ships hook scripts for Claude Code and Gemini CLI. Run once inside your project:
+Use `hgp install` to register HGP as an MCP server, install hooks, and inject agent instructions in one step:
 
 ```bash
-hgp install-hooks            # install both Claude Code and Gemini CLI hooks
-hgp install-hooks --claude   # Claude Code only
-hgp install-hooks --gemini   # Gemini CLI only
+hgp install            # Claude Code + Gemini CLI + Codex (global, recommended)
+hgp install --claude   # Claude Code only
+hgp install --gemini   # Gemini CLI only
+hgp install --codex    # Codex only
+hgp install --local    # project-local scope instead of global
 ```
 
-Hooks are installed into `<repo_root>/.claude/hooks/` and `<repo_root>/.gemini/hooks/`. The command must be run from inside a git repository.
+`hgp install` performs three steps per client:
+
+1. **MCP registration** — registers HGP as an MCP server via the client CLI
+2. **Hooks** — copies hook scripts and wires them into the client's settings
+3. **Agent instructions** — appends the HGP usage block to `CLAUDE.md` / `GEMINI.md` / `AGENTS.md`
+
+Or configure manually:
+
+**Claude Code:**
+
+```bash
+claude mcp add --scope user hgp -- python -m hgp.server
+```
+
+**Gemini CLI:**
+
+```bash
+gemini mcp add --scope user hgp python -m hgp.server
+```
+
+**Codex (project-local):** add to `.codex/config.toml`:
+
+```toml
+[mcp_servers.hgp]
+command = "python"
+args = ["-m", "hgp.server"]
+```
+
+> Use the python that has `history-graph-protocol` installed. If using a virtual
+> environment, replace `python` with the absolute path to the venv python
+> (e.g. `/path/to/.venv/bin/python`).
+
+After registering, restart the client and verify HGP tools are available.
 
 ### Hook enforcement policy
 
@@ -111,7 +145,7 @@ hgp hook-policy block        # block native Write/Edit/write_file/replace
 
 The policy is stored in `<repo_root>/.hgp/hook-policy`. The `HGP_HOOK_BLOCK` environment variable takes precedence over the file if set.
 
-> **Note:** If you installed hooks before this feature was added, run `hgp install-hooks` again to update them.
+> **Note:** If you installed hooks before this feature was added, run `hgp install` again to update them.
 
 ### Storage
 
@@ -124,37 +158,6 @@ HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gi
 | `HGP_PROJECT_ROOT` | _(auto)_ | Override project root (default: nearest `.git` from cwd, or `~/.hgp/` if not in a repo) |
 | `HGP_GLOBAL_MODE` | _(unset)_ | Set to `1` to force legacy global store at `~/.hgp/` (all projects share one DB) |
 | `HGP_HOOK_BLOCK` | `0` | Set to `1` to block native file tool calls (Write/Edit) instead of warning |
-
-### MCP Client Configuration
-
-Use `hgp install` to register HGP as an MCP server and install hooks in one step:
-
-```bash
-hgp install            # Claude Code + Gemini CLI (global, recommended)
-hgp install --claude   # Claude Code only
-hgp install --gemini   # Gemini CLI only
-hgp install --local    # project-local scope instead of global
-```
-
-Or configure manually:
-
-**Claude Code** (global: `~/.claude/mcp.json`, or via `claude mcp add --scope user`):
-
-```bash
-claude mcp add --scope user hgp -- python -m hgp.server
-```
-
-**Gemini CLI** (global: `~/.gemini/settings.json`, or via `gemini mcp add --scope user`):
-
-```bash
-gemini mcp add --scope user hgp python -m hgp.server
-```
-
-> Use the python that has `history-graph-protocol` installed. If using a virtual
-> environment, replace `python` with the absolute path to the venv python
-> (e.g. `/path/to/.venv/bin/python`).
-
-After registering, restart the client and verify HGP tools are available.
 
 ---
 
