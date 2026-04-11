@@ -1381,17 +1381,30 @@ def test_reconcile_advisory_returns_hgp_advisory(server_components):
 
 
 def test_reconcile_advisory_does_not_mutate(server_components):
-    """advisory mode: hgp_reconcile(dry_run=False) leaves stale PENDING ops untouched."""
+    """advisory mode: hgp_reconcile(dry_run=False) must not mutate real PENDING ops.
+
+    Inserts a file-tracking artifact op that is PENDING and old enough to be
+    processed by reconcile (age > PENDING_GRACE_PERIOD=5m, no blob → would become
+    STALE_PENDING in normal mode). Advisory gate must block the mutation.
+    """
     db = server_components["db"]
-    op = hgp_create_operation(op_type="artifact", agent_id="a")
-    op_id = op["op_id"]
-    # Force the op to STALE_PENDING so the reconciler would normally promote it
-    db.execute("UPDATE operations SET status = 'STALE_PENDING' WHERE op_id = ?", (op_id,))
+    # Insert a PENDING file-tracking op backdated 10 minutes (past the 5-min grace period).
+    # No object_hash → reconciler would demote to STALE_PENDING in normal mode.
+    db.execute(
+        "INSERT INTO operations "
+        "(op_id, op_type, agent_id, status, commit_seq, created_at, memory_tier, file_path) "
+        "VALUES (?, 'artifact', 'a', 'PENDING', NULL, "
+        "datetime('now', '-10 minutes'), 'short_term', '/tmp/phantom.txt')",
+        ("pending-advisory-001",),
+    )
 
     _set_mode(server_components, "advisory")
-    hgp_reconcile(dry_run=False)
+    result = hgp_reconcile(dry_run=False)
+    assert result.get("status") == "HGP_ADVISORY"
 
-    row = db.execute("SELECT status FROM operations WHERE op_id = ?", (op_id,)).fetchone()
-    assert row["status"] == "STALE_PENDING", (
-        "advisory mode must not change op status — reconcile was blocked"
+    row = db.execute(
+        "SELECT status FROM operations WHERE op_id = ?", ("pending-advisory-001",)
+    ).fetchone()
+    assert row["status"] == "PENDING", (
+        "advisory mode must not demote PENDING to STALE_PENDING — reconcile was blocked"
     )
