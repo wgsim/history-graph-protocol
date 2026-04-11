@@ -139,16 +139,23 @@ Read the file /tmp/hgp_test_gemini.txt and tell me its contents.
 Run this shell command: cp /tmp/hgp_test_gemini.txt /tmp/hgp_test_copy.txt
 ```
 
-**Expected behavior:**
-- `pre_bash_hgp.py` fires on the `run_shell_command` tool (not `shell` — Gemini CLI's
-  actual tool name is `run_shell_command`)
-- `systemMessage` warning appears in terminal: `[HGP] Bash command may mutate files`
-- The matched pattern is reported (e.g., `matched: '\\bcp\\b'`)
-- The command **still executes** (advisory mode)
-- `post_bash_hgp.py` may fire after the command and report changed tracked files via
-  `git status --porcelain` (files in `/tmp/` are untracked so they won't appear)
+**Expected behavior (two channels):**
 
-**Pass condition:** Pre-bash terminal warning appears; command executes.
+| Channel | Hook | When | Content |
+|---------|------|------|---------|
+| Terminal (user) | `pre_bash_hgp.py` (BeforeTool) | Before command runs | `[HGP] Bash command may mutate files (matched: '\\bcp\\b')…` via `systemMessage` |
+| Agent context | `post_bash_hgp.py` (AfterTool) | After command completes | Same advisory via `hookSpecificOutput.additionalContext` |
+
+- `pre_bash_hgp.py` fires on the `run_shell_command` tool (not `shell`)
+- The command **still executes** (advisory mode)
+- `post_bash_hgp.py` always emits `additionalContext` when the pre-bash marker exists,
+  so the agent receives the warning regardless of whether tracked files changed
+- `systemMessage` (terminal) is only added by `post_bash_hgp.py` when tracked-file
+  changes are present via `git status --porcelain` (files in `/tmp/` are untracked
+  so no `systemMessage` from the post hook for this specific test)
+
+**Pass condition:** Terminal warning appears (from `pre_bash_hgp.py`); agent receives
+`additionalContext` advisory (from `post_bash_hgp.py`); command executes.
 
 ---
 
@@ -244,7 +251,7 @@ Fill in after running all tests:
 | `pre_tool_use_hgp.py` | BeforeTool | `write_file`, `replace` | `systemMessage` (terminal only) | `decision: deny` (agent sees reason) |
 | `post_tool_use_hgp.py` | AfterTool | `write_file`, `replace` | `additionalContext` (agent context) | *(never fires — tool was denied)* |
 | `pre_bash_hgp.py` | BeforeTool | `run_shell_command` | `systemMessage` (terminal only) | *(advisory only, no block mode)* |
-| `post_bash_hgp.py` | AfterTool | `run_shell_command` | `systemMessage` with git diff | *(advisory only)* |
+| `post_bash_hgp.py` | AfterTool | `run_shell_command` | `additionalContext` (agent context, always) + `systemMessage` (terminal, only when tracked files changed) | *(advisory only)* |
 
 ---
 
@@ -255,8 +262,8 @@ Fill in after running all tests:
 - The marker file keyed to `ppid` means post-bash output only fires when Gemini CLI itself
   spawns the hook process as a child — this is the normal execution path in a real session.
 - `systemMessage` is displayed to the **user in the terminal** only. It does not appear in
-  the agent's reasoning. Agent-side advisory warnings come from `post_tool_use_hgp.py` via
-  `hookSpecificOutput.additionalContext`.
+  the agent's reasoning. Agent-side advisory warnings come from `post_tool_use_hgp.py` and
+  `post_bash_hgp.py` via `hookSpecificOutput.additionalContext`.
 - The `gemini mcp add` CLI does not support a `cwd` option. HGP determines the project root
   from `Path.cwd()` at startup, so Gemini CLI must be launched from the project root for HGP
   to locate `.git` correctly.

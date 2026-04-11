@@ -248,8 +248,26 @@ def test_gemini_post_bash_no_marker_silent():
     assert result.stdout.strip() == ""
 
 
+def test_gemini_post_bash_marker_no_changes_emits_additional_context_only(tmp_path):
+    """Marker present but no tracked-file changes → additionalContext only, no systemMessage."""
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+
+    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
+    marker.write_text(r"\bcp\b")
+    try:
+        result = _run_hook(_GEMINI_POST_HOOK, _gemini_shell_event("echo done"), cwd=str(tmp_path))
+        assert result.returncode == 0
+        assert result.stdout.strip(), "Expected JSON output"
+        data = json.loads(result.stdout.strip())
+        assert "hookSpecificOutput" in data
+        assert "[HGP]" in data["hookSpecificOutput"]["additionalContext"]
+        assert "systemMessage" not in data
+    finally:
+        marker.unlink(missing_ok=True)
+
+
 def test_gemini_post_bash_reports_changes_as_json(tmp_path):
-    """Gemini post hook emits JSON systemMessage when marker exists and files changed."""
+    """Marker present + tracked-file changes → both additionalContext and systemMessage."""
     # Init a minimal git repo with a tracked file
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t.com"],
@@ -266,14 +284,18 @@ def test_gemini_post_bash_reports_changes_as_json(tmp_path):
     tracked.write_text("modified")
 
     marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
-    marker.write_text("")
+    marker.write_text(r"\bcp\b")
     try:
         result = _run_hook(_GEMINI_POST_HOOK, _gemini_shell_event("echo done"), cwd=str(tmp_path))
         assert result.returncode == 0
         assert result.stdout.strip(), "Expected JSON output"
         data = json.loads(result.stdout.strip())
+        # agent channel
+        assert "hookSpecificOutput" in data
+        assert "[HGP]" in data["hookSpecificOutput"]["additionalContext"]
+        assert "tracked.txt" in data["hookSpecificOutput"]["additionalContext"]
+        # terminal channel
         assert "systemMessage" in data
-        assert "[HGP]" in data["systemMessage"]
         assert "tracked.txt" in data["systemMessage"]
     finally:
         marker.unlink(missing_ok=True)
