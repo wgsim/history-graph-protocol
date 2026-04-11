@@ -135,6 +135,8 @@ def hgp_create_operation(
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Create a new operation in the causal history DAG."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     if op_type not in _VALID_OP_TYPES:
         return {"error": "INVALID_OP_TYPE", "message": f"op_type must be one of {sorted(_VALID_OP_TYPES)}"}
 
@@ -312,6 +314,8 @@ def hgp_query_operations(
     file_path: str | None = None,
 ) -> dict[str, Any]:
     """Query operations with optional filters. By default excludes inactive-tier ops; pass include_inactive=True to include them."""
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     if status is not None and status not in _VALID_STATUSES:
         return {"error": "INVALID_STATUS", "message": f"status must be one of {sorted(_VALID_STATUSES)}"}
     limit = max(1, min(limit, _MAX_QUERY_LIMIT))
@@ -354,6 +358,8 @@ def hgp_file_history(
     limit: int = 50,
 ) -> dict[str, Any]:
     """Return operations recorded for a given file_path, most recent first."""
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     limit = max(1, min(limit, _MAX_QUERY_LIMIT))
     db = _get_context().db
     # Canonicalize query path so it matches stored canonical paths
@@ -378,6 +384,8 @@ def hgp_query_subgraph(
     include_invalidated: bool = False,
 ) -> dict[str, Any]:
     """Traverse the causal subgraph from root_op_id."""
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     max_depth = max(1, min(max_depth, _MAX_SUBGRAPH_DEPTH))
     db = _get_context().db
     # Use a single deferred transaction so chain_hash and ops come from the same snapshot.
@@ -406,6 +414,8 @@ def hgp_acquire_lease(
     ttl_seconds: int = 300,
 ) -> dict[str, Any]:
     """Acquire a lease on a subgraph for optimistic concurrency."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     ctx = _get_context()
     db = ctx.db
     lease_mgr = ctx.lease_mgr
@@ -430,6 +440,8 @@ def hgp_acquire_lease(
 @mcp.tool()
 def hgp_validate_lease(lease_id: str, extend: bool = True) -> dict[str, Any]:
     """Validate (PING) a lease token before LLM compute."""
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     lease_mgr = _get_context().lease_mgr
     return lease_mgr.validate(lease_id, extend=extend)
 
@@ -437,6 +449,8 @@ def hgp_validate_lease(lease_id: str, extend: bool = True) -> dict[str, Any]:
 @mcp.tool()
 def hgp_release_lease(lease_id: str) -> dict[str, Any]:
     """Release a lease token explicitly."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     ctx = _get_context()
     db = ctx.db
     lease_mgr = ctx.lease_mgr
@@ -452,6 +466,8 @@ def hgp_release_lease(lease_id: str) -> dict[str, Any]:
 @mcp.tool()
 def hgp_set_memory_tier(op_id: str, tier: str) -> dict[str, Any]:
     """Explicitly set the memory tier of an operation."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     valid = {"short_term", "long_term", "inactive"}
     if tier not in valid:
         return {"error": "INVALID_TIER", "valid_tiers": sorted(valid)}
@@ -466,6 +482,8 @@ def hgp_set_memory_tier(op_id: str, tier: str) -> dict[str, Any]:
 @mcp.tool()
 def hgp_get_artifact(object_hash: str) -> dict[str, Any]:
     """Retrieve blob content from CAS by hash."""
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     cas = _get_context().cas
     data = cas.read(object_hash)
     if data is None:
@@ -484,6 +502,8 @@ def hgp_anchor_git(
     repository: str | None = None,
 ) -> dict[str, Any]:
     """Link an HGP operation to a Git commit SHA."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     db = _get_context().db
     if not _GIT_SHA_RE.fullmatch(git_commit_sha):
         return {"error": "INVALID_SHA", "message": "git_commit_sha must be 40 lowercase hex chars"}
@@ -501,6 +521,8 @@ def hgp_anchor_git(
 @mcp.tool()
 def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
     """Run crash recovery reconciler."""
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     reconciler = _get_context().reconciler
     report = reconciler.reconcile(dry_run=dry_run)
     return report.model_dump()
@@ -509,6 +531,8 @@ def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
 @mcp.tool()
 def hgp_get_evidence(op_id: str) -> dict[str, Any]:
     """Return all operations that op_id cited as evidence."""
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     db = _get_context().db
     try:
         if not db.get_operation(op_id):
@@ -522,6 +546,8 @@ def hgp_get_evidence(op_id: str) -> dict[str, Any]:
 @mcp.tool()
 def hgp_get_citing_ops(op_id: str) -> dict[str, Any]:
     """Return all operations that cited op_id as evidence (reverse direction)."""
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     db = _get_context().db
     try:
         if not db.get_operation(op_id):
@@ -623,6 +649,8 @@ def hgp_write_file(
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Write (create or overwrite) a file and record it as an artifact operation."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     try:
         root = find_project_root(Path(file_path).parent)
         canonical = canonical_file_path(file_path, root)
@@ -679,6 +707,8 @@ def hgp_append_file(
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Append content to a file (creates it if absent) and record as artifact."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     try:
         root = find_project_root(Path(file_path).parent)
         canonical = canonical_file_path(file_path, root)
@@ -740,6 +770,8 @@ def hgp_edit_file(
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Replace the first (and only) occurrence of old_string with new_string."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     try:
         root = find_project_root(Path(file_path).parent)
         canonical = canonical_file_path(file_path, root)
@@ -804,6 +836,8 @@ def hgp_delete_file(
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Delete a file and record an invalidation operation."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     try:
         root = find_project_root(Path(file_path).parent)
         canonical = canonical_file_path(file_path, root)
@@ -893,6 +927,8 @@ def hgp_move_file(
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Move/rename a file: invalidates old path op, creates new artifact op."""
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     try:
         root = find_project_root(Path(old_path).parent)
         canonical_old = canonical_file_path(old_path, root)
@@ -1026,6 +1062,86 @@ def hgp_move_file(
         result.pop("object_hash", None)
         result.pop("chain_hash", None)
     return result
+
+
+_VALID_MODES = {"on", "advisory", "off"}
+
+_MODE_USAGE = (
+    "usage: hgp mode [on|advisory|off]\n"
+    "\n"
+    "  (no args)   show current mode (default: on)\n"
+    "  on          normal operation — all tools record to HGP\n"
+    "  advisory    mutation tools return HGP_ADVISORY instead of recording\n"
+    "  off         all tools return HGP_DISABLED\n"
+)
+
+
+def _read_mode() -> str:
+    """Return current HGP mode: 'on', 'advisory', or 'off'. Default: 'on'.
+
+    Reads <project_root>/.hgp/mode. Returns 'on' if absent or no project root.
+    """
+    try:
+        ctx = _get_context()
+        if ctx.project_root is None:
+            return "on"
+        mode_file = ctx.project_root / ".hgp" / "mode"
+        if mode_file.exists():
+            val = mode_file.read_text().strip()
+            return val if val in _VALID_MODES else "on"
+    except Exception:
+        pass
+    return "on"
+
+
+def _check_mode(mutation: bool = True) -> dict[str, Any] | None:
+    """Return an early-exit response if the current mode disables this call.
+
+    mutation=True  → advisory mode blocks (HGP_ADVISORY), off mode blocks (HGP_DISABLED)
+    mutation=False → advisory mode passes through, off mode blocks (HGP_DISABLED)
+
+    Returns None if the call should proceed normally.
+    """
+    mode = _read_mode()
+    if mode == "off":
+        return {"status": "HGP_DISABLED", "message": "HGP is disabled. Run `hgp mode on` to resume."}
+    if mode == "advisory" and mutation:
+        return {"status": "HGP_ADVISORY", "message": "HGP is in advisory mode. Recording skipped."}
+    return None
+
+
+def _mode(args: list[str]) -> None:
+    """Read or set the HGP mode (on / advisory / off)."""
+    import sys
+
+    if len(args) > 1 or (args and args[0] not in _VALID_MODES):
+        print(f"hgp mode: invalid argument: {' '.join(args)}", file=sys.stderr)
+        print(_MODE_USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp mode: no git repository found from current directory.\n"
+            "Run this command from inside a git repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    mode_file = project_root / ".hgp" / "mode"
+
+    if not args:
+        if mode_file.exists():
+            print(mode_file.read_text().strip())
+        else:
+            print("on")
+        return
+
+    new_mode = args[0]
+    mode_file.parent.mkdir(parents=True, exist_ok=True)
+    mode_file.write_text(new_mode)
+    print(f"HGP mode set to: {new_mode}")
 
 
 _INSTALL_HOOKS_USAGE = (
@@ -1497,6 +1613,8 @@ def run() -> None:
     args = sys.argv[1:]
     if args and args[0] == "install":
         _install(args[1:])
+    elif args and args[0] == "mode":
+        _mode(args[1:])
     elif args and args[0] == "install-hooks":
         print(
             "Warning: `hgp install-hooks` is deprecated. Use `hgp install` instead.",

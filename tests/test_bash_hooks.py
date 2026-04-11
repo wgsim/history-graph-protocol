@@ -299,3 +299,23 @@ def test_gemini_post_bash_reports_changes_as_json(tmp_path):
         assert "tracked.txt" in data["systemMessage"]
     finally:
         marker.unlink(missing_ok=True)
+
+
+# ── hgp mode bypass detection ─────────────────────────────────
+
+def test_pre_bash_warns_on_hgp_mode_claude():
+    """Claude pre_bash detects agent attempt to run `hgp mode` and warns via stderr."""
+    result = _run_hook(_PRE_HOOK, _bash_event("hgp mode off"))
+    assert result.returncode == 0
+    assert "[HGP]" in result.stderr
+    assert "Mode control is user-only" in result.stderr
+
+
+def test_pre_bash_warns_on_hgp_mode_gemini():
+    """Gemini pre_bash detects agent attempt to run `hgp mode` and warns via systemMessage."""
+    result = _run_hook(_GEMINI_PRE_HOOK, _gemini_shell_event("hgp mode off"))
+    assert result.returncode == 0
+    assert result.stdout.strip(), "Expected JSON output"
+    data = json.loads(result.stdout.strip())
+    assert "systemMessage" in data
+    assert "Mode control is user-only" in data["systemMessage"]

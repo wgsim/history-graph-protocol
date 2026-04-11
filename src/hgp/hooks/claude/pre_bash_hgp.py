@@ -81,6 +81,9 @@ _MEDIUM_PATTERNS = [
     re.compile(r"\bawk\b.*>"),           # awk with redirect
 ]
 
+# Detect agent attempts to change HGP mode via Bash
+_HGP_MODE_PATTERN = re.compile(r"\bhgp\s+mode\b")
+
 
 def _is_readonly(command: str) -> bool:
     stripped = command.lstrip()
@@ -114,6 +117,15 @@ def main() -> None:
     command: str = event.get("tool_input", {}).get("command", "")
     if not command or _is_readonly(command):
         sys.exit(0)
+
+    # Warn if agent tries to change HGP mode via Bash (mode control is user-only)
+    if _HGP_MODE_PATTERN.search(command):
+        print(
+            "[HGP] Agent attempted to change HGP mode via Bash. "
+            "Mode control is user-only (`hgp mode` in your terminal). "
+            "The command will run but is noted.",
+            file=sys.stderr,
+        )
 
     matched = _detect_mutating(command)
     if matched is None:
