@@ -653,6 +653,8 @@ def hgp_write_file(
     """Write (create or overwrite) a file and record it as an artifact operation."""
     if (early := _check_mode(mutation=True)) is not None:
         return early
+    if err := _check_hgp_dir(file_path):
+        return err
     try:
         root = find_project_root(Path(file_path).parent)
         canonical = canonical_file_path(file_path, root)
@@ -711,6 +713,8 @@ def hgp_append_file(
     """Append content to a file (creates it if absent) and record as artifact."""
     if (early := _check_mode(mutation=True)) is not None:
         return early
+    if err := _check_hgp_dir(file_path):
+        return err
     try:
         root = find_project_root(Path(file_path).parent)
         canonical = canonical_file_path(file_path, root)
@@ -774,6 +778,8 @@ def hgp_edit_file(
     """Replace the first (and only) occurrence of old_string with new_string."""
     if (early := _check_mode(mutation=True)) is not None:
         return early
+    if err := _check_hgp_dir(file_path):
+        return err
     try:
         root = find_project_root(Path(file_path).parent)
         canonical = canonical_file_path(file_path, root)
@@ -840,6 +846,8 @@ def hgp_delete_file(
     """Delete a file and record an invalidation operation."""
     if (early := _check_mode(mutation=True)) is not None:
         return early
+    if err := _check_hgp_dir(file_path):
+        return err
     try:
         root = find_project_root(Path(file_path).parent)
         canonical = canonical_file_path(file_path, root)
@@ -931,6 +939,8 @@ def hgp_move_file(
     """Move/rename a file: invalidates old path op, creates new artifact op."""
     if (early := _check_mode(mutation=True)) is not None:
         return early
+    if err := _check_hgp_dir(old_path) or _check_hgp_dir(new_path):
+        return err
     try:
         root = find_project_root(Path(old_path).parent)
         canonical_old = canonical_file_path(old_path, root)
@@ -1109,6 +1119,27 @@ def _check_mode(mutation: bool = True) -> dict[str, Any] | None:
         return {"status": "HGP_DISABLED", "message": "HGP is disabled. Run `hgp mode on` to resume."}
     if mode == "advisory" and mutation:
         return {"status": "HGP_ADVISORY", "message": "HGP is in advisory mode. Recording skipped."}
+    return None
+
+
+def _check_hgp_dir(file_path: str) -> dict[str, Any] | None:
+    """Return an error if file_path is inside the .hgp/ internal directory.
+
+    Agents must not write directly into .hgp/ — that directory is reserved for
+    HGP internals (database, content store, mode file, etc.).
+    """
+    try:
+        parts = Path(file_path).resolve().parts
+    except Exception:
+        parts = Path(file_path).parts
+    if ".hgp" in parts:
+        return {
+            "error": "HGP_INTERNAL_PATH",
+            "message": (
+                f"Writing to the .hgp/ directory is not allowed: {file_path}. "
+                "The .hgp/ directory is reserved for HGP internals."
+            ),
+        }
     return None
 
 

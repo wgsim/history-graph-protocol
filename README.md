@@ -258,7 +258,8 @@ HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gi
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HGP_PROJECT_ROOT` | _(auto)_ | Override project root (default: nearest `.git` from cwd) |
+| `HGP_PROJECT_ROOT` | _(auto)_ | Override project root (default: nearest `.git` from cwd, then `cwd`) |
+| `HGP_GLOBAL_MODE` | _(unset)_ | Set to `1` to force global store at `~/.hgp/` (all projects share one DB) |
 | `HGP_HOOK_BLOCK` | `0` | Set to `1` to block native file tool calls instead of warning |
 
 ---
