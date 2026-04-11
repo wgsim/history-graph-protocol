@@ -133,6 +133,23 @@ args = ["-m", "hgp.server"]
 
 After registering, restart the client and verify HGP tools are available.
 
+### HGP mode
+
+Control whether HGP records operations. Mode is stored in `<repo_root>/.hgp/mode` and is **user-only** — agents are blocked from changing it via Bash.
+
+```bash
+hgp mode              # show current mode (default: on)
+hgp mode on           # normal operation — all tools record to HGP
+hgp mode advisory     # mutation tools return HGP_ADVISORY instead of recording
+hgp mode off          # all tools return HGP_DISABLED
+```
+
+| Mode | Mutation tools | Query tools |
+|------|---------------|-------------|
+| `on` | execute normally | execute normally |
+| `advisory` | return `{"status": "HGP_ADVISORY"}` | execute normally |
+| `off` | return `{"status": "HGP_DISABLED"}` | return `{"status": "HGP_DISABLED"}` |
+
 ### Hook enforcement policy
 
 By default, hooks warn when native file tools are used instead of HGP equivalents. You can change this persistently with:

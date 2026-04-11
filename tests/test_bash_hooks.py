@@ -19,6 +19,11 @@ _POST_HOOK = str(_HOOKS_DIR / "post_bash_hgp.py")
 _GEMINI_PRE_HOOK = str(_GEMINI_HOOKS_DIR / "pre_bash_hgp.py")
 _GEMINI_POST_HOOK = str(_GEMINI_HOOKS_DIR / "post_bash_hgp.py")
 
+# Source hook paths — always present in git, used for tests that don't need installed hooks
+_SRC_HOOKS_DIR = Path(__file__).parent.parent / "src" / "hgp" / "hooks"
+_SRC_PRE_HOOK_CLAUDE = str(_SRC_HOOKS_DIR / "claude" / "pre_bash_hgp.py")
+_SRC_PRE_HOOK_GEMINI = str(_SRC_HOOKS_DIR / "gemini" / "pre_bash_hgp.py")
+
 
 def _run_hook(hook_path: str, payload: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -303,19 +308,19 @@ def test_gemini_post_bash_reports_changes_as_json(tmp_path):
 
 # ── hgp mode bypass detection ─────────────────────────────────
 
-def test_pre_bash_warns_on_hgp_mode_claude():
-    """Claude pre_bash detects agent attempt to run `hgp mode` and warns via stderr."""
-    result = _run_hook(_PRE_HOOK, _bash_event("hgp mode off"))
-    assert result.returncode == 0
+def test_pre_bash_blocks_hgp_mode_claude():
+    """Claude pre_bash blocks `hgp mode` via exit 2 so agents cannot change mode."""
+    result = _run_hook(_SRC_PRE_HOOK_CLAUDE, _bash_event("hgp mode off"))
+    assert result.returncode == 2
     assert "[HGP]" in result.stderr
-    assert "Mode control is user-only" in result.stderr
+    assert "Blocked" in result.stderr
 
 
-def test_pre_bash_warns_on_hgp_mode_gemini():
-    """Gemini pre_bash detects agent attempt to run `hgp mode` and warns via systemMessage."""
-    result = _run_hook(_GEMINI_PRE_HOOK, _gemini_shell_event("hgp mode off"))
+def test_pre_bash_blocks_hgp_mode_gemini():
+    """Gemini pre_bash blocks `hgp mode` via decision:deny so agents cannot change mode."""
+    result = _run_hook(_SRC_PRE_HOOK_GEMINI, _gemini_shell_event("hgp mode off"))
     assert result.returncode == 0
     assert result.stdout.strip(), "Expected JSON output"
     data = json.loads(result.stdout.strip())
-    assert "systemMessage" in data
-    assert "Mode control is user-only" in data["systemMessage"]
+    assert data.get("decision") == "deny"
+    assert "Blocked" in data.get("reason", "")

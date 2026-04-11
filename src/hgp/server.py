@@ -440,7 +440,7 @@ def hgp_acquire_lease(
 @mcp.tool()
 def hgp_validate_lease(lease_id: str, extend: bool = True) -> dict[str, Any]:
     """Validate (PING) a lease token before LLM compute."""
-    if (early := _check_mode(mutation=False)) is not None:
+    if (early := _check_mode(mutation=True)) is not None:
         return early
     lease_mgr = _get_context().lease_mgr
     return lease_mgr.validate(lease_id, extend=extend)
@@ -521,7 +521,7 @@ def hgp_anchor_git(
 @mcp.tool()
 def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
     """Run crash recovery reconciler."""
-    if (early := _check_mode(mutation=False)) is not None:
+    if (early := _check_mode(mutation=True)) is not None:
         return early
     reconciler = _get_context().reconciler
     report = reconciler.reconcile(dry_run=dry_run)

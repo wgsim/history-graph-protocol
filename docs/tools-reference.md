@@ -1099,6 +1099,23 @@ None (unknown paths return empty list).
 
 ---
 
+## Mode Response Statuses
+
+When `hgp mode` is set to `advisory` or `off`, tools return an early-exit response instead of executing normally. These are not error codes — they indicate the server is operating in a restricted mode.
+
+| Status | Mode | Affected tools | Meaning |
+|--------|------|---------------|---------|
+| `HGP_ADVISORY` | `advisory` | All mutation tools | Recording skipped. Query tools still execute normally. |
+| `HGP_DISABLED` | `off` | All tools | HGP is disabled. Run `hgp mode on` to resume. |
+
+**Mutation tools** (return `HGP_ADVISORY` in advisory, `HGP_DISABLED` in off):
+`hgp_create_operation`, `hgp_write_file`, `hgp_edit_file`, `hgp_append_file`, `hgp_delete_file`, `hgp_move_file`, `hgp_anchor_git`, `hgp_set_memory_tier`, `hgp_acquire_lease`, `hgp_release_lease`, `hgp_validate_lease`, `hgp_reconcile`
+
+**Query tools** (pass through in advisory, return `HGP_DISABLED` in off):
+`hgp_query_operations`, `hgp_query_subgraph`, `hgp_file_history`, `hgp_get_artifact`, `hgp_get_evidence`, `hgp_get_citing_ops`
+
+---
+
 ## Error Code Reference
 
 The following table consolidates all error codes across all tools.

@@ -118,14 +118,14 @@ def main() -> None:
     if not command or _is_readonly(command):
         sys.exit(0)
 
-    # Warn if agent tries to change HGP mode via Bash (mode control is user-only)
+    # Block agent attempts to change HGP mode via Bash (mode control is user-only)
     if _HGP_MODE_PATTERN.search(command):
         print(
-            "[HGP] Agent attempted to change HGP mode via Bash. "
-            "Mode control is user-only (`hgp mode` in your terminal). "
-            "The command will run but is noted.",
+            "[HGP] Blocked: `hgp mode` must be run by the user directly, not by the agent. "
+            "Use `!hgp mode <value>` in your terminal to change HGP mode.",
             file=sys.stderr,
         )
+        sys.exit(2)
 
     matched = _detect_mutating(command)
     if matched is None:
