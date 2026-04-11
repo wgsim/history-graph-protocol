@@ -12,17 +12,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-_HOOKS_DIR = Path(__file__).parent.parent / ".claude" / "hooks"
-_GEMINI_HOOKS_DIR = Path(__file__).parent.parent / ".gemini" / "hooks"
-_PRE_HOOK = str(_HOOKS_DIR / "pre_bash_hgp.py")
-_POST_HOOK = str(_HOOKS_DIR / "post_bash_hgp.py")
-_GEMINI_PRE_HOOK = str(_GEMINI_HOOKS_DIR / "pre_bash_hgp.py")
-_GEMINI_POST_HOOK = str(_GEMINI_HOOKS_DIR / "post_bash_hgp.py")
-
-# Source hook paths — always present in git, used for tests that don't need installed hooks
 _SRC_HOOKS_DIR = Path(__file__).parent.parent / "src" / "hgp" / "hooks"
-_SRC_PRE_HOOK_CLAUDE = str(_SRC_HOOKS_DIR / "claude" / "pre_bash_hgp.py")
-_SRC_PRE_HOOK_GEMINI = str(_SRC_HOOKS_DIR / "gemini" / "pre_bash_hgp.py")
+_PRE_HOOK = str(_SRC_HOOKS_DIR / "claude" / "pre_bash_hgp.py")
+_POST_HOOK = str(_SRC_HOOKS_DIR / "claude" / "post_bash_hgp.py")
+_GEMINI_PRE_HOOK = str(_SRC_HOOKS_DIR / "gemini" / "pre_bash_hgp.py")
+_GEMINI_POST_HOOK = str(_SRC_HOOKS_DIR / "gemini" / "post_bash_hgp.py")
+
+# Aliases kept for the mode-bypass tests (same paths, explicit names for clarity)
+_SRC_PRE_HOOK_CLAUDE = _PRE_HOOK
+_SRC_PRE_HOOK_GEMINI = _GEMINI_PRE_HOOK
 
 
 def _run_hook(hook_path: str, payload: dict, cwd: str | None = None) -> subprocess.CompletedProcess:

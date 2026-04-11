@@ -1332,3 +1332,66 @@ def test_create_operation_verbose_true_includes_hashes(server_components):
     result = hgp_create_operation(op_type="artifact", agent_id="a", verbose=True)
     assert "object_hash" in result
     assert "chain_hash" in result
+
+
+# ── advisory-mode regression: validate_lease and reconcile must be blocked ─────
+
+def _set_mode(server_components, mode: str) -> None:
+    """Write .hgp/mode for the injected project_root."""
+    project_root = server_module._ctx.project_root
+    mode_file = project_root / ".hgp" / "mode"
+    mode_file.parent.mkdir(parents=True, exist_ok=True)
+    mode_file.write_text(mode)
+
+
+def test_validate_lease_advisory_returns_hgp_advisory(server_components):
+    """advisory mode: hgp_validate_lease(extend=True) returns HGP_ADVISORY."""
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=op["op_id"])
+    _set_mode(server_components, "advisory")
+    result = hgp_validate_lease(lease["lease_id"], extend=True)
+    assert result.get("status") == "HGP_ADVISORY"
+
+
+def test_validate_lease_advisory_does_not_extend(server_components):
+    """advisory mode: hgp_validate_lease(extend=True) must not advance expires_at."""
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    lease = hgp_acquire_lease(agent_id="a", subgraph_root_op_id=op["op_id"])
+    db = server_components["db"]
+    original_expires = db.execute(
+        "SELECT expires_at FROM leases WHERE lease_id=?", (lease["lease_id"],)
+    ).fetchone()["expires_at"]
+
+    _set_mode(server_components, "advisory")
+    hgp_validate_lease(lease["lease_id"], extend=True)
+
+    after_expires = db.execute(
+        "SELECT expires_at FROM leases WHERE lease_id=?", (lease["lease_id"],)
+    ).fetchone()["expires_at"]
+    assert after_expires == original_expires, (
+        "advisory mode must not advance expires_at"
+    )
+
+
+def test_reconcile_advisory_returns_hgp_advisory(server_components):
+    """advisory mode: hgp_reconcile(dry_run=False) returns HGP_ADVISORY."""
+    _set_mode(server_components, "advisory")
+    result = hgp_reconcile(dry_run=False)
+    assert result.get("status") == "HGP_ADVISORY"
+
+
+def test_reconcile_advisory_does_not_mutate(server_components):
+    """advisory mode: hgp_reconcile(dry_run=False) leaves stale PENDING ops untouched."""
+    db = server_components["db"]
+    op = hgp_create_operation(op_type="artifact", agent_id="a")
+    op_id = op["op_id"]
+    # Force the op to STALE_PENDING so the reconciler would normally promote it
+    db.execute("UPDATE operations SET status = 'STALE_PENDING' WHERE op_id = ?", (op_id,))
+
+    _set_mode(server_components, "advisory")
+    hgp_reconcile(dry_run=False)
+
+    row = db.execute("SELECT status FROM operations WHERE op_id = ?", (op_id,)).fetchone()
+    assert row["status"] == "STALE_PENDING", (
+        "advisory mode must not change op status — reconcile was blocked"
+    )
