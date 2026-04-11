@@ -71,11 +71,13 @@ def _get_context() -> HGPContext:
             try:
                 project_root = find_project_root(Path.cwd())
             except ProjectRootError:
+                project_root = Path.cwd()
                 _log.warning(
-                    "No .git repository found from cwd; using global store ~/.hgp/. "
-                    "Set HGP_PROJECT_ROOT or run from inside a git repository for repo-local storage."
+                    "No .git repository found from cwd; using cwd-local store %s/.hgp/. "
+                    "Run from inside a git repository for repo-local storage, or set "
+                    "HGP_PROJECT_ROOT to specify a root explicitly.",
+                    project_root,
                 )
-                project_root = None
         hgp_dir = (project_root / ".hgp") if project_root else (Path.home() / ".hgp")
         hgp_content_dir = hgp_dir / ".hgp_content"
         db = Database(hgp_dir / "hgp.db")

@@ -252,7 +252,7 @@ hgp hook-policy block        # block native Write/Edit/MultiEdit/write_file/repl
 
 ### Storage
 
-HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gitignored). The server resolves the project root from the nearest `.git` directory at startup. If no git repo is found, it falls back to `~/.hgp/` as a global store. One server process is bound to one store.
+HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gitignored). The server resolves the project root from the nearest `.git` directory at startup. If no git repo is found, it falls back to `<cwd>/.hgp/` with a warning — set `HGP_PROJECT_ROOT` or run from inside a git repository to make the root explicit. One server process is bound to one store.
 
 ### Environment variables
 
