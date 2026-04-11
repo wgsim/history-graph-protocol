@@ -1394,7 +1394,7 @@ def test_reconcile_advisory_does_not_mutate(server_components):
         "INSERT INTO operations "
         "(op_id, op_type, agent_id, status, commit_seq, created_at, memory_tier, file_path) "
         "VALUES (?, 'artifact', 'a', 'PENDING', NULL, "
-        "datetime('now', '-10 minutes'), 'short_term', '/tmp/phantom.txt')",
+        "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes'), 'short_term', '/tmp/phantom.txt')",
         ("pending-advisory-001",),
     )
 
