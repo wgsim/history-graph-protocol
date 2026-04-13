@@ -853,6 +853,7 @@ Creates or overwrites a file and records the result as an `artifact` operation i
 
 | Code | Meaning |
 |------|---------|
+| `HGP_INTERNAL_PATH` | `file_path` contains a `.hgp` directory segment; writing to `.hgp/` internals is not allowed |
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `CROSS_REPO_OPERATION` | `file_path` belongs to a different repository than the one this server is bound to |
@@ -920,6 +921,7 @@ Same shape as `hgp_write_file`, including the same `verbose` behaviour: `op_id`,
 
 | Code | Meaning |
 |------|---------|
+| `HGP_INTERNAL_PATH` | `file_path` contains a `.hgp` directory segment; writing to `.hgp/` internals is not allowed |
 | `FILE_NOT_FOUND` | `file_path` does not exist |
 | `STRING_NOT_FOUND` | `old_string` not found in file |
 | `AMBIGUOUS_MATCH` | `old_string` found more than once |
@@ -981,6 +983,7 @@ Deletes a file and records an `invalidation` operation in HGP. Optionally marks 
 
 | Code | Meaning |
 |------|---------|
+| `HGP_INTERNAL_PATH` | `file_path` contains a `.hgp` directory segment; writing to `.hgp/` internals is not allowed |
 | `SYMLINK_NOT_SUPPORTED` | `file_path` is a symbolic link; HGP does not track symlinks |
 | `FILE_NOT_FOUND` | `file_path` does not exist |
 | `PATH_OUTSIDE_ROOT` | `file_path` is outside the project root |
@@ -1048,6 +1051,7 @@ If `previous_op_id` is omitted, the tool auto-resolves the most recent tracked o
 
 | Code | Meaning |
 |------|---------|
+| `HGP_INTERNAL_PATH` | `old_path` or `new_path` contains a `.hgp` directory segment; writing to `.hgp/` internals is not allowed |
 | `SYMLINK_NOT_SUPPORTED` | `old_path` is a symbolic link; HGP does not track symlinks |
 | `FILE_NOT_FOUND` | `old_path` does not exist |
 | `PATH_OUTSIDE_ROOT` | `old_path` or `new_path` is outside the project root |
@@ -1140,6 +1144,7 @@ The following table consolidates all error codes across all tools.
 | `SYMLINK_NOT_SUPPORTED` | `hgp_delete_file`, `hgp_move_file` | The path is a symbolic link; HGP does not track symlinks |
 | `STRING_NOT_FOUND` | `hgp_edit_file` | `old_string` not found in file |
 | `AMBIGUOUS_MATCH` | `hgp_edit_file` | `old_string` appears more than once |
+| `HGP_INTERNAL_PATH` | V4 file tools | Path contains a `.hgp` directory segment; any `.hgp/` location is reserved for HGP internals |
 | `PATH_OUTSIDE_ROOT` | V4 file tools | File path resolves outside the project root |
 | `PROJECT_ROOT_NOT_FOUND` | V4 file tools | No `.git` directory found and `HGP_PROJECT_ROOT` not set |
 | `CROSS_REPO_OPERATION` | V4 file tools | File belongs to a different repository than the one this server process is bound to; start a separate HGP server for that project |
