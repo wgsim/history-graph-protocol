@@ -46,6 +46,7 @@ packages = ["src/hgp"]
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.12"
+include = ["src/hgp"]
 
 [tool.ruff]
 target-version = "py312"
