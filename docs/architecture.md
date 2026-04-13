@@ -538,7 +538,7 @@ HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/`, wh
     .hgp_content/     ← CAS blob store (gitignored)
 ```
 
-This keeps durable project-level file history co-located with the project without introducing binary blob churn into git history. The project root is resolved at server startup via `find_project_root(Path.cwd())` (checks `HGP_PROJECT_ROOT` env var, then walks up to nearest `.git`).
+This keeps durable project-level file history co-located with the project without introducing binary blob churn into git history. The project root is resolved at server startup in order: (1) `HGP_PROJECT_ROOT` env var if set, (2) nearest `.git` walking up from cwd, (3) cwd itself as a fallback with a warning if no git repo is found.
 
 **WAL/SHM files** (`.db-wal`, `.db-shm`) are also gitignored — they are SQLite lock files meaningless outside an active connection.
 
