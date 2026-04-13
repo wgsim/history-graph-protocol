@@ -21,6 +21,8 @@ _GEMINI_POST_HOOK = str(_SRC_HOOKS_DIR / "gemini" / "post_bash_hgp.py")
 # Aliases kept for the mode-bypass tests (same paths, explicit names for clarity)
 _SRC_PRE_HOOK_CLAUDE = _PRE_HOOK
 _SRC_PRE_HOOK_GEMINI = _GEMINI_PRE_HOOK
+_CODEX_PRE_HOOK = str(_SRC_HOOKS_DIR / "codex" / "pre_tool_use_hgp.py")
+_CODEX_POST_HOOK = str(_SRC_HOOKS_DIR / "codex" / "post_tool_use_hgp.py")
 
 
 def _run_hook(hook_path: str, payload: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -322,3 +324,79 @@ def test_pre_bash_blocks_hgp_mode_gemini():
     data = json.loads(result.stdout.strip())
     assert data.get("decision") == "deny"
     assert "Blocked" in data.get("reason", "")
+
+
+# ── Codex PreToolUse hook ─────────────────────────────────────
+
+def test_codex_pre_tool_use_detects_mutating():
+    """Codex PreToolUse hook warns on mutating commands via JSON systemMessage."""
+    result = _run_hook(_CODEX_PRE_HOOK, _bash_event("cp foo bar"))
+    assert result.returncode == 0
+    assert result.stdout.strip(), "Expected JSON output"
+    data = json.loads(result.stdout.strip())
+    assert "systemMessage" in data
+    assert "[HGP]" in data["systemMessage"]
+
+
+def test_codex_pre_tool_use_passthrough_readonly():
+    """Codex PreToolUse hook is silent for read-only commands."""
+    result = _run_hook(_CODEX_PRE_HOOK, _bash_event("git status"))
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+def test_codex_pre_tool_use_blocks_hgp_mode():
+    """Codex PreToolUse blocks `hgp mode` via permissionDecision:deny."""
+    result = _run_hook(_CODEX_PRE_HOOK, _bash_event("hgp mode off"))
+    assert result.returncode == 0
+    assert result.stdout.strip(), "Expected JSON output"
+    data = json.loads(result.stdout.strip())
+    output = data.get("hookSpecificOutput", {})
+    assert output.get("permissionDecision") == "deny"
+    assert "Blocked" in output.get("permissionDecisionReason", "")
+
+
+def test_codex_pre_tool_use_ignores_non_bash():
+    """Codex PreToolUse hook ignores non-Bash tool events."""
+    result = _run_hook(_CODEX_PRE_HOOK, {"tool_name": "apply_patch", "tool_input": {"command": "rm -rf /"}})
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+# ── Codex PostToolUse hook ────────────────────────────────────
+
+def test_codex_post_tool_use_no_marker_passthrough():
+    """PostToolUse hook is silent when no marker file exists."""
+    # Ensure no stale marker from earlier pre-hook tests
+    import os
+    Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}").unlink(missing_ok=True)
+    result = _run_hook(_CODEX_POST_HOOK, _bash_event("echo done"))
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+def test_codex_post_tool_use_reports_changed_files(tmp_path):
+    """PostToolUse hook reports changed files via hookSpecificOutput.additionalContext."""
+    import os
+    # Create a tracked file change in a git repo
+    subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("original")
+    subprocess.run(["git", "add", str(tracked)], capture_output=True, cwd=str(tmp_path))
+    subprocess.run(["git", "commit", "-m", "init", "--allow-empty-message"], capture_output=True, cwd=str(tmp_path))
+    tracked.write_text("modified")
+
+    # Write marker as PreToolUse hook would
+    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
+    marker.write_text(r"\bcp\b")
+    try:
+        result = _run_hook(_CODEX_POST_HOOK, _bash_event("echo done"), cwd=str(tmp_path))
+        assert result.returncode == 0
+        assert result.stdout.strip(), "Expected JSON output"
+        data = json.loads(result.stdout.strip())
+        output = data.get("hookSpecificOutput", {})
+        assert output.get("hookEventName") == "PostToolUse"
+        assert "[HGP]" in output.get("additionalContext", "")
+        assert "tracked.txt" in output.get("additionalContext", "")
+    finally:
+        marker.unlink(missing_ok=True)

@@ -223,6 +223,46 @@ def test_update_hooks_settings_gemini_global(tmp_path):
     assert "AfterShell" in data["hooks"]
 
 
+def test_update_hooks_settings_codex_global(tmp_path):
+    settings = tmp_path / "hooks.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    _update_hooks_settings("codex", settings, hooks_dir, "global")
+    data = json.loads(settings.read_text())
+    assert "PreToolUse" in data["hooks"]
+    assert "PostToolUse" in data["hooks"]
+    pre_cmd = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "pre_tool_use_hgp.py" in pre_cmd
+
+
+def test_update_hooks_settings_codex_settings_match_installed_files(tmp_path):
+    """Every generated Codex hook command must reference a file that _install_hooks_files copies."""
+    import importlib.resources
+    settings = tmp_path / "hooks.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    _update_hooks_settings("codex", settings, hooks_dir, "global")
+
+    data = json.loads(settings.read_text())
+    referenced = set()
+    for entries in data["hooks"].values():
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                cmd = h.get("command", "")
+                if "_hgp.py" in cmd:
+                    referenced.add(cmd.split()[-1].split("/")[-1])
+
+    pkg_ref = importlib.resources.files("hgp.hooks.codex")
+    installed = {
+        item.name for item in pkg_ref.iterdir()
+        if item.name.endswith(".py") and not item.name.startswith("__")
+    }
+
+    assert referenced <= installed, (
+        f"Settings reference hook files not in the Codex package: {referenced - installed}"
+    )
+
+
 # ── _install_mcp ──────────────────────────────────────────────
 
 def _mock_subprocess_ok(*_args, **_kwargs):

@@ -1285,6 +1285,18 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
             "BeforeShell": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("pre_bash_hgp.py")}]}],
             "AfterShell": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("post_bash_hgp.py")}]}],
         }
+    elif client == "codex":
+        def _xdcmd(name: str) -> str:
+            p = hooks_dir / name
+            return f"python3 {p}" if scope == "global" else f"python3 .codex/hooks/{name}"
+
+        # Codex hooks.json format: list of hook entries per event name.
+        # PreToolUse/PostToolUse currently fire for Bash only; apply_patch support
+        # is a known Codex bug (github.com/openai/codex/issues/16732).
+        hook_specs = {
+            "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _xdcmd("pre_tool_use_hgp.py")}]}],
+            "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _xdcmd("post_tool_use_hgp.py")}]}],
+        }
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     existing: dict[str, Any] = {}
@@ -1489,12 +1501,18 @@ def _install(args: list[str]) -> None:
         print("Codex:")
         if scope == "global":
             _step("MCP", lambda: _install_mcp("codex", scope, python))
+            hooks_dir = Path.home() / ".codex" / "hooks"
+            hooks_json = Path.home() / ".codex" / "hooks.json"
             md_path = Path.home() / ".codex" / "AGENTS.md"
         else:
             assert project_root is not None
             toml_path = project_root / ".codex" / "config.toml"
             _step("MCP (config.toml)", lambda p=toml_path: _edit_codex_toml(p, python))
+            hooks_dir = project_root / ".codex" / "hooks"
+            hooks_json = project_root / ".codex" / "hooks.json"
             md_path = project_root / "AGENTS.md"
+        _step("hooks files", lambda d=hooks_dir: f"installed {len(_install_hooks_files('codex', d))} file(s) → {d}")
+        _step("hooks settings", lambda: (_update_hooks_settings("codex", hooks_json, hooks_dir, scope), "updated")[1])  # noqa: E501
         _step("instructions", lambda p=md_path: _inject_instructions(p))
 
 
