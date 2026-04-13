@@ -540,8 +540,6 @@ HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/`, wh
 
 This keeps durable project-level file history co-located with the project without introducing binary blob churn into git history. The project root is resolved at server startup via `find_project_root(Path.cwd())` (checks `HGP_PROJECT_ROOT` env var, then walks up to nearest `.git`).
 
-**Legacy mode:** Set `HGP_GLOBAL_MODE=1` to use `~/.hgp/` instead (single global store across all projects). This is retained for backward compatibility only.
-
 **WAL/SHM files** (`.db-wal`, `.db-shm`) are also gitignored — they are SQLite lock files meaningless outside an active connection.
 
 The `hgp_reconcile` tool handles crash-recovery for the case where the DB is in an inconsistent state after an unexpected shutdown.
