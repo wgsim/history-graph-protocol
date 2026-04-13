@@ -16,3 +16,8 @@ docs/reviews/
 .mcp.json
 .claude/
 .gemini/
+CLAUDE.md
+HGP_Master_Plan.md
+HGP_Technical_Design.md
+E2E_Test_Report.md
+hgp_test_*.txt
