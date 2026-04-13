@@ -42,7 +42,7 @@ def _git_changed_files(cwd: str) -> list[str]:
         )
         if result.returncode != 0:
             return []
-        lines = [l for l in result.stdout.splitlines() if l.strip()]
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
         return lines
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return []

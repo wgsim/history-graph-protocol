@@ -8,13 +8,19 @@ from pathlib import Path
 import pytest
 
 import hgp.server as server_module
-from hgp.server import HGPContext
-from hgp.db import Database
 from hgp.cas import CAS
+from hgp.db import Database
 from hgp.lease import LeaseManager
 from hgp.reconciler import Reconciler
-
-from hgp.server import hgp_write_file, hgp_append_file, hgp_edit_file, hgp_delete_file, hgp_move_file, hgp_file_history
+from hgp.server import (
+    HGPContext,
+    hgp_append_file,
+    hgp_delete_file,
+    hgp_edit_file,
+    hgp_file_history,
+    hgp_move_file,
+    hgp_write_file,
+)
 
 
 @pytest.fixture

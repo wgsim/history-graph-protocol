@@ -1,7 +1,13 @@
-import os
 from pathlib import Path
+
 import pytest
-from hgp.project import find_project_root, ProjectRootError, assert_within_root, PathOutsideRootError
+
+from hgp.project import (
+    PathOutsideRootError,
+    ProjectRootError,
+    assert_within_root,
+    find_project_root,
+)
 
 
 def test_find_root_via_git(tmp_path):

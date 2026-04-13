@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
-import pytest
 from pathlib import Path
+
+import pytest
+
 from hgp.cas import CAS
 from hgp.errors import PayloadTooLargeError
 

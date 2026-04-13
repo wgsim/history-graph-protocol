@@ -1,12 +1,24 @@
+import uuid
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from hgp.models import (
-    Operation, OpEdge, StoredObject, Lease, GitAnchor, ReconcileReport,
-    OpType, OpStatus, EdgeType, LeaseStatus, ObjectStatus,
-    EvidenceRelation, EvidenceRef, EvidenceRecord, CitingRecord,
+    CitingRecord,
+    EdgeType,
+    EvidenceRecord,
+    EvidenceRef,
+    EvidenceRelation,
+    Lease,
+    LeaseStatus,
+    ObjectStatus,
+    OpEdge,
+    Operation,
+    OpStatus,
+    OpType,
+    ReconcileReport,
+    StoredObject,
 )
-import uuid
-from datetime import datetime, timedelta, timezone
 
 
 def test_operation_defaults():

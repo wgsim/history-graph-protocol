@@ -7,28 +7,28 @@ bypassing the _get_context() lazy-init guard (_ctx is None check).
 from __future__ import annotations
 
 import base64
-import pytest
 from pathlib import Path
-from typing import Any
+
+import pytest
 
 import hgp.server as server_module
-from hgp.server import HGPContext
-from hgp.server import (
-    hgp_create_operation,
-    hgp_query_operations,
-    hgp_query_subgraph,
-    hgp_acquire_lease,
-    hgp_validate_lease,
-    hgp_release_lease,
-    hgp_get_artifact,
-    hgp_anchor_git,
-    hgp_reconcile,
-)
-from hgp.db import Database
 from hgp.cas import CAS
+from hgp.db import Database
 from hgp.lease import LeaseManager
 from hgp.reconciler import Reconciler
-from hgp.errors import ChainStaleError, InvalidationTargetNotFoundError, ParentNotFoundError, PayloadTooLargeError
+from hgp.server import (
+    HGPContext,
+    hgp_acquire_lease,
+    hgp_anchor_git,
+    hgp_create_operation,
+    hgp_get_artifact,
+    hgp_query_operations,
+    hgp_query_subgraph,
+    hgp_reconcile,
+    hgp_release_lease,
+    hgp_set_memory_tier,
+    hgp_validate_lease,
+)
 
 
 @pytest.fixture
@@ -433,7 +433,7 @@ def test_acquire_lease_ttl_capped_at_86400(server_components):
     row = db.execute(
         "SELECT expires_at, issued_at FROM leases ORDER BY issued_at DESC LIMIT 1"
     ).fetchone()
-    from datetime import datetime, timezone
+    from datetime import datetime
     issued = datetime.fromisoformat(row["issued_at"].replace("Z", "+00:00"))
     expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
     diff_seconds = (expires - issued).total_seconds()
@@ -519,10 +519,10 @@ def test_file_history_limit_clamped(server_components):
 
 def test_file_history_negative_limit_clamped(server_components):
     """hgp_file_history limit=-1 must not bypass the result cap."""
-    from hgp.server import hgp_file_history, hgp_write_file
-    import hgp.server as server_module
     import os
     import tempfile
+
+    from hgp.server import hgp_file_history, hgp_write_file
     # Write a few ops for the same file so there is history to return
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / ".git").mkdir()
@@ -615,8 +615,6 @@ def test_create_chain_stale_no_exception(server_components):
 
 
 # ── V2 Memory Tier Tests ─────────────────────────────────────
-
-from hgp.server import hgp_set_memory_tier
 
 
 def test_acquire_lease_promotes_to_short_term(server_components):
@@ -850,7 +848,6 @@ def test_create_operation_evidence_nonexistent_cited(server_components):
 
 def test_create_operation_duplicate_evidence_returns_error_dict(server_components):
     """Duplicate (citing, cited) pair must return error dict, not raise IntegrityError."""
-    from hgp.server import hgp_get_evidence
     cited = hgp_create_operation(op_type="artifact", agent_id="a")
     # First creation succeeds
     citing = hgp_create_operation(
@@ -1041,8 +1038,9 @@ def test_evidence_relation_refutes_round_trip(server_components):
 
 def test_evidence_created_at_is_iso8601(server_components):
     """created_at field in evidence records must be parseable ISO-8601 with ms precision."""
-    from hgp.server import hgp_get_evidence
     from datetime import datetime
+
+    from hgp.server import hgp_get_evidence
     cited = hgp_create_operation(op_type="artifact", agent_id="a")
     citing = hgp_create_operation(
         op_type="hypothesis", agent_id="a",

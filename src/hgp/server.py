@@ -11,12 +11,29 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from mcp.server.fastmcp import FastMCP
+from pydantic import ValidationError
+
+from hgp.cas import CAS
+from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
+from hgp.db import Database
+from hgp.errors import (
+    BlobWriteError,
+    PayloadTooLargeError,
+)
+from hgp.lease import LeaseManager
+from hgp.models import EvidenceRef
+from hgp.project import (
+    PathOutsideRootError,
+    ProjectRootError,
+    canonical_file_path,
+    find_project_root,
+)
+from hgp.reconciler import Reconciler
 
 _log = logging.getLogger(__name__)
-
-from pydantic import ValidationError
-from mcp.server.fastmcp import FastMCP
 
 _VALID_OP_TYPES = frozenset({"artifact", "hypothesis", "merge", "invalidation"})
 _VALID_STATUSES = frozenset({"PENDING", "COMPLETED", "INVALIDATED", "MISSING_BLOB", "STALE_PENDING"})
@@ -26,15 +43,6 @@ _MAX_TTL_SECONDS = 86400
 _MAX_EVIDENCE_REFS = 50
 _MAX_QUERY_LIMIT = 1000
 _MAX_SUBGRAPH_DEPTH = 500
-
-from hgp.cas import CAS
-from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
-from hgp.db import Database
-from hgp.errors import BlobWriteError, ChainStaleError, InvalidationTargetNotFoundError, ParentNotFoundError, PayloadTooLargeError
-from hgp.lease import LeaseManager
-from hgp.models import EvidenceRef
-from hgp.project import find_project_root, assert_within_root, canonical_file_path, ProjectRootError, PathOutsideRootError
-from hgp.reconciler import Reconciler
 
 # ── Server initialization ───────────────────────────────────
 
@@ -146,7 +154,7 @@ def hgp_create_operation(
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
         if len(evidence_refs) > _MAX_EVIDENCE_REFS:
-            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}  # noqa: E501
         try:
             parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
         except ValidationError as exc:
@@ -197,7 +205,10 @@ def hgp_create_operation(
             current = compute_chain_hash(db, root_op_id)
             if current != chain_hash:
                 db.rollback()
-                return {"error": "CHAIN_STALE", "message": f"CHAIN_STALE (under lock): expected {chain_hash}, got {current}"}
+                return {  # noqa: E501
+                    "error": "CHAIN_STALE",
+                    "message": f"CHAIN_STALE (under lock): expected {chain_hash}, got {current}",
+                }
 
         seq = db.next_commit_seq()
         db.insert_operation(
@@ -315,7 +326,10 @@ def hgp_query_operations(
     limit: int = 100,
     file_path: str | None = None,
 ) -> dict[str, Any]:
-    """Query operations with optional filters. By default excludes inactive-tier ops; pass include_inactive=True to include them."""
+    """Query operations with optional filters.
+
+    By default excludes inactive-tier ops; pass include_inactive=True to include them.
+    """
     if (early := _check_mode(mutation=False)) is not None:
         return early
     if status is not None and status not in _VALID_STATUSES:
@@ -577,7 +591,7 @@ def _record_file_op(
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
         if len(evidence_refs) > _MAX_EVIDENCE_REFS:
-            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}  # noqa: E501
         try:
             parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
         except ValidationError as exc:
@@ -965,7 +979,7 @@ def hgp_move_file(
     parsed_refs: list[EvidenceRef] = []
     if evidence_refs:
         if len(evidence_refs) > _MAX_EVIDENCE_REFS:
-            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}
+            return {"error": "TOO_MANY_EVIDENCE_REFS", "message": f"max {_MAX_EVIDENCE_REFS} evidence refs per operation"}  # noqa: E501
         try:
             parsed_refs = [EvidenceRef.model_validate(r) for r in evidence_refs]
         except ValidationError as exc:
@@ -1247,7 +1261,7 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
     """
     import sys
 
-    hook_specs: dict[str, list[dict]] = {}
+    hook_specs: dict[str, list[dict[str, Any]]] = {}
     if client == "claude":
         def _cmd(name: str) -> str:
             p = hooks_dir / name
@@ -1273,7 +1287,7 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
         }
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    existing: dict = {}
+    existing: dict[str, Any] = {}
     if settings_path.exists():
         try:
             existing = json.loads(settings_path.read_text())
@@ -1343,7 +1357,7 @@ def _edit_codex_toml(toml_path: Path, python: str) -> str:
 
     # replace the existing section up to the next section header
     lines = text.splitlines(keepends=True)
-    start_idx = next(i for i, l in enumerate(lines) if l.strip() == SECTION)
+    start_idx = next(i for i, line in enumerate(lines) if line.strip() == SECTION)
     end_idx = len(lines)
     for i in range(start_idx + 1, len(lines)):
         if lines[i].startswith("[") and not lines[i].startswith("[["):
@@ -1364,7 +1378,6 @@ def _install_mcp(client: str, scope: str, python: str) -> tuple[bool, str]:
     """
     import shutil
     import subprocess
-    import sys
 
     if client == "claude":
         cli = shutil.which("claude")
@@ -1427,13 +1440,14 @@ def _install(args: list[str]) -> None:
                 )
                 sys.exit(1)
 
-    def _step(label: str, fn):
+    def _step(label: str, fn: "Callable[[], Any]") -> None:
         try:
             result = fn()
             if isinstance(result, tuple):
-                ok, msg = result
-                status = "✓" if ok else "✗"
-                print(f"  {status} {label}: {msg}")
+                ok_val: Any = result[0]  # type: ignore[misc]
+                msg_val: Any = result[1]  # type: ignore[misc]
+                status = "✓" if ok_val else "✗"
+                print(f"  {status} {label}: {msg_val}")
             else:
                 print(f"  ✓ {label}: {result}")
         except Exception as exc:
@@ -1452,7 +1466,7 @@ def _install(args: list[str]) -> None:
             settings_path = project_root / ".claude" / "settings.json"
             md_path = project_root / "CLAUDE.md"
         _step("hooks files", lambda d=hooks_dir: f"installed {len(_install_hooks_files('claude', d))} file(s) → {d}")
-        _step("hooks settings", lambda: (_update_hooks_settings("claude", settings_path, hooks_dir, scope), "updated")[1])
+        _step("hooks settings", lambda: (_update_hooks_settings("claude", settings_path, hooks_dir, scope), "updated")[1])  # noqa: E501
         _step("instructions", lambda p=md_path: _inject_instructions(p))
 
     if do_gemini:
@@ -1468,7 +1482,7 @@ def _install(args: list[str]) -> None:
             settings_path = project_root / ".gemini" / "settings.json"
             md_path = project_root / "GEMINI.md"
         _step("hooks files", lambda d=hooks_dir: f"installed {len(_install_hooks_files('gemini', d))} file(s) → {d}")
-        _step("hooks settings", lambda: (_update_hooks_settings("gemini", settings_path, hooks_dir, scope), "updated")[1])
+        _step("hooks settings", lambda: (_update_hooks_settings("gemini", settings_path, hooks_dir, scope), "updated")[1])  # noqa: E501
         _step("instructions", lambda p=md_path: _inject_instructions(p))
 
     if do_codex:

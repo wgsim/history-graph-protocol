@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+from typing import Any
 
 _TIMEOUT_SECS = 2
 
@@ -47,7 +48,7 @@ def _git_changed_files(cwd: str) -> list[str]:
         )
         if result.returncode != 0:
             return []
-        lines = [l for l in result.stdout.splitlines() if l.strip()]
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
         return lines
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return []
@@ -84,7 +85,7 @@ def main() -> None:
     # Terminal message (systemMessage — user only)
     terminal_msg = additional_context if changed else None
 
-    output: dict = {"hookSpecificOutput": {"additionalContext": additional_context}}
+    output: dict[str, Any] = {"hookSpecificOutput": {"additionalContext": additional_context}}
     if terminal_msg:
         output["systemMessage"] = terminal_msg
 

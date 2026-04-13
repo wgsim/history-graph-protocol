@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from hgp.server import _check_mode, _mode, _read_mode
-
 
 # ── helpers ───────────────────────────────────────────────────
 
@@ -120,7 +118,7 @@ def test_check_mode_off_query_blocked(tmp_path):
 def _run(args: list[str], cwd: Path) -> tuple[int, str, str]:
     """Run _mode() and capture stdout/stderr + exit code."""
     import io
-    from contextlib import redirect_stdout, redirect_stderr
+    from contextlib import redirect_stderr, redirect_stdout
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
     exit_code = 0

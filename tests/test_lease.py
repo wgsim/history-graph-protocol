@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import pytest
-import time
 from datetime import datetime, timedelta
+
 from hgp.db import Database
-from hgp.dag import compute_chain_hash
 from hgp.lease import LeaseManager
-from hgp.errors import ChainStaleError, LeaseExpiredError
 
 
 def _setup(hgp_dirs: dict) -> tuple[Database, LeaseManager]:
@@ -58,7 +55,7 @@ def test_validate_expired_lease(hgp_dirs: dict):
     db, mgr = _setup(hgp_dirs)
     lease = mgr.acquire("agent-1", "root-op", ttl_seconds=300)
     # Manually backdate the lease to 1 second ago
-    from datetime import datetime, timezone, timedelta
+    from datetime import timezone
     past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
     db.execute("UPDATE leases SET expires_at = ? WHERE lease_id = ?", (past, lease.lease_id))
     db.commit()

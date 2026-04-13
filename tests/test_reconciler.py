@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import uuid
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from hgp.db import Database
+from pathlib import Path
+
 from hgp.cas import CAS
+from hgp.db import Database
 from hgp.reconciler import Reconciler
 
 
@@ -48,7 +49,7 @@ def test_rule3_orphan_blob_old(hgp_dirs: dict):
     hex_hash = obj_hash.removeprefix("sha256:")
     blob_path = hgp_dirs["content_dir"] / hex_hash[:2] / hex_hash[2:]
     old_time = (datetime.now() - timedelta(hours=1)).timestamp()
-    import os; os.utime(blob_path, (old_time, old_time))
+    os.utime(blob_path, (old_time, old_time))
 
     report = rec.reconcile()
     assert obj_hash in report.orphan_candidates
@@ -82,7 +83,7 @@ def test_staging_cleanup(hgp_dirs: dict):
 
 
 def test_reconcile_demotes_inactive_ops(hgp_dirs: dict):
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     db, cas, rec = _setup(hgp_dirs)
     db.begin_immediate()
     db.insert_operation("old-op", "artifact", "agent-1", 1, "sha256:x")
@@ -100,7 +101,7 @@ def test_reconcile_demotes_inactive_ops(hgp_dirs: dict):
 
 
 def test_reconcile_demote_dry_run(hgp_dirs: dict):
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     db, cas, rec = _setup(hgp_dirs)
     db.begin_immediate()
     db.insert_operation("old-op", "artifact", "agent-1", 1, "sha256:x")

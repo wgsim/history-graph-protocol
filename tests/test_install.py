@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,12 +13,9 @@ from hgp.server import (
     _edit_codex_toml,
     _inject_instructions,
     _install,
-    _install_hooks_files,
     _install_mcp,
     _update_hooks_settings,
-    _HGP_INSTRUCTIONS_BLOCK,
 )
-
 
 # ── _inject_instructions ──────────────────────────────────────
 
@@ -153,7 +149,10 @@ def test_update_hooks_settings_claude_settings_match_installed_files(tmp_path):
 
     # Collect basenames that _install_hooks_files would actually copy
     pkg_ref = importlib.resources.files("hgp.hooks.claude")
-    installed = {item.name for item in pkg_ref.iterdir() if item.name.endswith(".py") and not item.name.startswith("__")}
+    installed = {
+        item.name for item in pkg_ref.iterdir()
+        if item.name.endswith(".py") and not item.name.startswith("__")
+    }
 
     assert referenced <= installed, (
         f"Settings reference hook files not in the Claude package: {referenced - installed}"

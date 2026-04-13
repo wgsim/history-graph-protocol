@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import base64
+
 import pytest
-from pathlib import Path
-from hgp.db import Database
+
 from hgp.cas import CAS
 from hgp.dag import compute_chain_hash
+from hgp.db import Database
 from hgp.lease import LeaseManager
 from hgp.reconciler import Reconciler
 
@@ -23,7 +24,6 @@ def test_create_root_operation(hgp_dirs: dict):
     """Create a root artifact operation with no parents."""
     db, cas, mgr, rec = _make_components(hgp_dirs)
     payload = b"my first artifact"
-    encoded = base64.b64encode(payload).decode()
     obj_hash = cas.store(payload)
 
     db.begin_immediate()
@@ -97,7 +97,6 @@ def test_concurrent_chain_stale(hgp_dirs: dict):
     reflects op-a1's ancestor subgraph which changed from genesis alone to
     genesis + op-a1.
     """
-    import sqlite3 as _sqlite3
     db, cas, mgr, rec = _make_components(hgp_dirs)
 
     db.begin_immediate()
@@ -126,8 +125,8 @@ def test_concurrent_chain_stale(hgp_dirs: dict):
 def test_cas_failure_no_db_write(hgp_dirs: dict):
     """If CAS fails (payload too large), no DB record should be created."""
     db, cas, mgr, rec = _make_components(hgp_dirs)
+
     from hgp.errors import PayloadTooLargeError
-    import base64
 
     large_payload = base64.b64encode(b"x" * (11 * 1024 * 1024)).decode()
     with pytest.raises(PayloadTooLargeError):

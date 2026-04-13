@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import pytest
-from pathlib import Path
-from hgp.db import Database
 from hgp.dag import compute_chain_hash, get_ancestors, get_descendants
+from hgp.db import Database
 
 
 def _make_db(hgp_dirs: dict) -> Database:

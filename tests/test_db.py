@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import pytest
-from pathlib import Path
+
 from hgp.db import Database
-from hgp.models import OpType, OpStatus
+from hgp.models import OpStatus, OpType
 
 
 def test_schema_creation(hgp_dirs: dict):
@@ -65,7 +65,7 @@ def test_wal_mode_enabled(hgp_dirs: dict):
 
 def test_expire_leases(hgp_dirs: dict):
     """expire_leases() marks past-expiry ACTIVE leases as EXPIRED and returns count."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     db = Database(hgp_dirs["db_path"])
     db.initialize()
     db.begin_immediate()
@@ -100,7 +100,7 @@ def test_expire_leases(hgp_dirs: dict):
 
 def test_expire_leases_demotes_short_term_with_no_active_lease(hgp_dirs: dict):
     """expire_leases() demotes short_term root to long_term when its only active lease expires."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     db = Database(hgp_dirs["db_path"])
     db.initialize()
     db.begin_immediate()
@@ -219,7 +219,7 @@ def test_record_access_promotes_inactive(hgp_dirs: dict):
 
 def test_demote_inactive_relative_baseline(hgp_dirs: dict):
     """Ops not accessed for > threshold relative to project_pulse are demoted."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     db = Database(hgp_dirs["db_path"])
     db.initialize()
     db.begin_immediate()
@@ -241,7 +241,7 @@ def test_demote_inactive_relative_baseline(hgp_dirs: dict):
 
 def test_demote_inactive_hibernated_project(hgp_dirs: dict):
     """If all ops are old (hibernated project), none should be demoted."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     db = Database(hgp_dirs["db_path"])
     db.initialize()
     db.begin_immediate()
@@ -379,6 +379,7 @@ def test_insert_evidence_nonexistent_cited_op_raises(hgp_dirs: dict):
 
 def test_insert_evidence_duplicate_raises(hgp_dirs: dict):
     import sqlite3
+
     from hgp.models import EvidenceRef, EvidenceRelation
     db = Database(hgp_dirs["db_path"])
     db.initialize()
@@ -535,8 +536,8 @@ def test_get_evidence_zero_max_results_clamped_to_one(hgp_dirs: dict):
 
 def test_get_evidence_default_cap_enforced(hgp_dirs: dict):
     """Calling get_evidence with no max_results arg caps at _MAX_EVIDENCE_RESULTS."""
-    from hgp.models import EvidenceRef, EvidenceRelation
     from hgp.db import _MAX_EVIDENCE_RESULTS
+    from hgp.models import EvidenceRef, EvidenceRelation
     db = Database(hgp_dirs["db_path"])
     db.initialize()
     n = _MAX_EVIDENCE_RESULTS + 1
