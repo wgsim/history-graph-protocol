@@ -66,7 +66,7 @@ If uv is unavailable, use:
 
 ## Linting and Type Checking
 
-All code must pass linting and type checks before submission.
+All code must pass linting before submission. Type checking covers the production package only.
 
 ### Lint with Ruff
 
@@ -88,7 +88,7 @@ uv run ruff format src/ tests/
 uv run pyright
 ```
 
-Pyright runs in strict mode. All code must be type-safe.
+Pyright runs in strict mode and checks `src/hgp` only (configured via `include` in `pyproject.toml`). Test files are outside the default scope; they are validated by pytest but not required to be fully type-annotated.
 
 ### Pre-Submission Checklist
 
