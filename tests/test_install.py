@@ -441,6 +441,41 @@ def test_install_codex_local_uses_toml(tmp_path, capsys):
     mock_toml.assert_called_once()
 
 
+# ── Codex local install — E2E artifact check ─────────────────
+
+def test_install_codex_local_artifact_tree(tmp_path, capsys):
+    """_install --codex --local must produce all expected artifacts with correct content."""
+    repo = _make_git_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    with patch("hgp.server.find_project_root", return_value=repo), \
+         patch("pathlib.Path.home", return_value=home):
+        _install(["--codex", "--local"])
+
+    # config.toml — MCP section + feature flag
+    toml_path = repo / ".codex" / "config.toml"
+    assert toml_path.exists(), "config.toml not created"
+    toml_text = toml_path.read_text()
+    assert "[mcp_servers.hgp]" in toml_text
+    assert "codex_hooks = true" in toml_text
+
+    # hooks directory — at least one hook file copied
+    hooks_dir = repo / ".codex" / "hooks"
+    assert hooks_dir.is_dir(), ".codex/hooks/ not created"
+    hook_files = list(hooks_dir.glob("*_hgp.py"))
+    assert hook_files, "no hook files installed into .codex/hooks/"
+
+    # hooks.json — PreToolUse and PostToolUse registered
+    hooks_json = repo / ".codex" / "hooks.json"
+    assert hooks_json.exists(), "hooks.json not created"
+    data = json.loads(hooks_json.read_text())
+    assert "PreToolUse" in data["hooks"], "PreToolUse missing from hooks.json"
+    assert "PostToolUse" in data["hooks"], "PostToolUse missing from hooks.json"
+
+    # global home must NOT be touched for local install
+    assert not (home / ".codex").exists(), "global ~/.codex written during --local install"
+
+
 # ── install-hooks deprecation notice ─────────────────────────
 
 def test_install_hooks_deprecation_warning(capsys):
