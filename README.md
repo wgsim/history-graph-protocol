@@ -130,7 +130,7 @@ args = ["-m", "hgp.server"]
 codex_hooks = true   # enable lifecycle hooks (required for HGP hook support)
 ```
 
-Hooks are also installed to `.codex/hooks/` and registered in `.codex/hooks.json`. Currently Codex fires `PreToolUse`/`PostToolUse` hooks for Bash commands only; `apply_patch` (file edits) support is a [known upstream issue](https://github.com/openai/codex/issues/16732).
+To also install hook files (`.codex/hooks/`) and `hooks.json`, run `hgp install --codex` instead. Manual config covers MCP registration and feature flag only. Currently Codex fires `PreToolUse`/`PostToolUse` hooks for Bash commands only; `apply_patch` (file edits) support is a [known upstream issue](https://github.com/openai/codex/issues/16732).
 
 > Use the Python that has `history-graph-protocol` installed. If using a virtual environment, replace `python` with the absolute path to the venv Python (e.g. `/path/to/.venv/bin/python`).
 
