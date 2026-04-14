@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 
 # ── Read-only command prefixes — skip pattern matching for these ──────────────
 _READONLY_PREFIXES = (
@@ -91,6 +92,23 @@ _MEDIUM_PATTERNS = [
 _HGP_MODE_PATTERN = re.compile(r"\bhgp\s+mode\b")
 
 
+def _resolve_block_mode() -> bool:
+    """Check HGP_HOOK_BLOCK env var, then fall back to .hgp/hook-policy file."""
+    env = os.environ.get("HGP_HOOK_BLOCK")
+    if env is not None:
+        return env == "1"
+    for parent in [Path.cwd(), *Path.cwd().parents]:
+        policy_file = parent / ".hgp" / "hook-policy"
+        if policy_file.exists():
+            return policy_file.read_text().strip() == "block"
+        if (parent / ".git").exists():
+            break
+    return False
+
+
+BLOCK_MODE = _resolve_block_mode()
+
+
 def _is_readonly(command: str) -> bool:
     stripped = command.lstrip()
     return any(stripped.startswith(p) for p in _READONLY_PREFIXES)
@@ -154,7 +172,17 @@ def main() -> None:
         "If this writes or deletes tracked files, prefer hgp_* tools so the "
         "operation is recorded in HGP history."
     )
-    print(json.dumps({"systemMessage": msg}))
+
+    if BLOCK_MODE:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": msg,
+            },
+        }))
+    else:
+        print(json.dumps({"systemMessage": msg}))
     sys.exit(0)
 
 

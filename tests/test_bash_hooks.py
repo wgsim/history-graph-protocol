@@ -363,6 +363,35 @@ def test_codex_pre_tool_use_ignores_non_bash():
     assert result.stdout.strip() == ""
 
 
+def test_codex_pre_tool_use_block_mode_denies_mutating(tmp_path):
+    """Codex PreToolUse returns permissionDecision:deny in block mode."""
+    (tmp_path / ".git").mkdir()
+    policy_dir = tmp_path / ".hgp"
+    policy_dir.mkdir()
+    (policy_dir / "hook-policy").write_text("block")
+
+    result = _run_hook(_CODEX_PRE_HOOK, _bash_event("cp foo bar"), cwd=str(tmp_path))
+    assert result.returncode == 0
+    data = json.loads(result.stdout.strip())
+    output = data.get("hookSpecificOutput", {})
+    assert output.get("permissionDecision") == "deny"
+    assert "[HGP]" in output.get("permissionDecisionReason", "")
+
+
+def test_codex_pre_tool_use_advisory_mode_warns_mutating(tmp_path):
+    """Codex PreToolUse returns systemMessage in advisory mode."""
+    (tmp_path / ".git").mkdir()
+    policy_dir = tmp_path / ".hgp"
+    policy_dir.mkdir()
+    (policy_dir / "hook-policy").write_text("advisory")
+
+    result = _run_hook(_CODEX_PRE_HOOK, _bash_event("cp foo bar"), cwd=str(tmp_path))
+    assert result.returncode == 0
+    data = json.loads(result.stdout.strip())
+    assert "systemMessage" in data
+    assert "hookSpecificOutput" not in data
+
+
 # ── Codex PostToolUse hook ────────────────────────────────────
 
 def test_codex_post_tool_use_no_marker_passthrough():
