@@ -14,6 +14,7 @@ from hgp.server import (
     _inject_instructions,
     _install,
     _install_mcp,
+    _toml_set_key,
     _update_hooks_settings,
 )
 
@@ -69,6 +70,8 @@ def test_edit_codex_toml_creates_new(tmp_path):
     assert "[mcp_servers.hgp]" in text
     assert 'command = "/usr/bin/python3"' in text
     assert '"-m"' in text
+    # Hook activation flag must be present
+    assert "codex_hooks = true" in text
 
 
 def test_edit_codex_toml_appends_to_existing(tmp_path):
@@ -98,6 +101,36 @@ def test_edit_codex_toml_updates_existing_section(tmp_path):
     result = _edit_codex_toml(toml_path, "/new/python3")
     assert result == "updated"
     assert 'command = "/new/python3"' in toml_path.read_text()
+
+
+# ── _toml_set_key ─────────────────────────────────────────────
+
+def test_toml_set_key_creates_section_and_key(tmp_path):
+    toml_path = tmp_path / "config.toml"
+    result = _toml_set_key(toml_path, "features", "codex_hooks", "true")
+    assert result == "written"
+    text = toml_path.read_text()
+    assert "[features]" in text
+    assert "codex_hooks = true" in text
+
+
+def test_toml_set_key_appends_key_to_existing_section(tmp_path):
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text("[features]\nother = false\n")
+    result = _toml_set_key(toml_path, "features", "codex_hooks", "true")
+    assert result == "updated"
+    text = toml_path.read_text()
+    assert "other = false" in text
+    assert "codex_hooks = true" in text
+
+
+def test_toml_set_key_idempotent(tmp_path):
+    toml_path = tmp_path / "config.toml"
+    _toml_set_key(toml_path, "features", "codex_hooks", "true")
+    first = toml_path.read_text()
+    result = _toml_set_key(toml_path, "features", "codex_hooks", "true")
+    assert result == "already_current"
+    assert toml_path.read_text() == first
 
 
 # ── _update_hooks_settings ────────────────────────────────────

@@ -1343,8 +1343,59 @@ def _inject_instructions(md_path: Path) -> str:
     return "injected"
 
 
+def _toml_set_key(toml_path: Path, section: str, key: str, value: str) -> str:
+    """Ensure `key = value` exists inside `[section]` of a TOML file.
+
+    Creates the file / section if absent. Returns "written", "updated", or
+    "already_current".
+    """
+    toml_path.parent.mkdir(parents=True, exist_ok=True)
+    text = toml_path.read_text() if toml_path.exists() else ""
+    lines = text.splitlines(keepends=True)
+
+    # Locate existing section
+    section_header = f"[{section}]"
+    try:
+        start_idx = next(i for i, line in enumerate(lines) if line.strip() == section_header)
+    except StopIteration:
+        start_idx = None
+
+    entry_line = f"{key} = {value}\n"
+
+    if start_idx is None:
+        # Append new section + key
+        sep = "\n" if text and not text.endswith("\n") else ""
+        toml_path.write_text(text + sep + f"\n{section_header}\n{entry_line}")
+        return "written"
+
+    # Find end of section
+    end_idx = len(lines)
+    for i in range(start_idx + 1, len(lines)):
+        if lines[i].startswith("[") and not lines[i].startswith("[["):
+            end_idx = i
+            break
+
+    section_lines = lines[start_idx + 1:end_idx]
+    # Check if key already present with correct value
+    for i, line in enumerate(section_lines):
+        if line.split("=")[0].strip() == key:
+            if line.strip() == f"{key} = {value}".strip():
+                return "already_current"
+            # Update existing key
+            section_lines[i] = entry_line
+            new_text = "".join(lines[:start_idx + 1]) + "".join(section_lines) + "".join(lines[end_idx:])
+            toml_path.write_text(new_text)
+            return "updated"
+
+    # Key absent — insert at end of section
+    insert_at = end_idx
+    new_text = "".join(lines[:insert_at]) + entry_line + "".join(lines[insert_at:])
+    toml_path.write_text(new_text)
+    return "updated"
+
+
 def _edit_codex_toml(toml_path: Path, python: str) -> str:
-    """Write or update [mcp_servers.hgp] in a Codex config.toml.
+    """Write or update [mcp_servers.hgp] and enable hooks in a Codex config.toml.
 
     Returns "written", "updated", or "already_current".
     """
@@ -1359,28 +1410,36 @@ def _edit_codex_toml(toml_path: Path, python: str) -> str:
     toml_path.parent.mkdir(parents=True, exist_ok=True)
     if not toml_path.exists():
         toml_path.write_text(new_block + "\n")
-        return "written"
+        mcp_result = "written"
+    else:
+        text = toml_path.read_text()
+        if SECTION not in text:
+            sep = "\n\n" if text and not text.endswith("\n\n") else ""
+            toml_path.write_text(text + sep + new_block + "\n")
+            mcp_result = "written"
+        else:
+            # replace the existing section up to the next section header
+            lines = text.splitlines(keepends=True)
+            start_idx = next(i for i, line in enumerate(lines) if line.strip() == SECTION)
+            end_idx = len(lines)
+            for i in range(start_idx + 1, len(lines)):
+                if lines[i].startswith("[") and not lines[i].startswith("[["):
+                    end_idx = i
+                    break
+            original_block = "".join(lines[start_idx:end_idx]).rstrip()
+            if original_block == new_block:
+                mcp_result = "already_current"
+            else:
+                new_text = "".join(lines[:start_idx]) + new_block + "\n" + "".join(lines[end_idx:])
+                toml_path.write_text(new_text)
+                mcp_result = "updated"
 
-    text = toml_path.read_text()
-    if SECTION not in text:
-        sep = "\n\n" if text and not text.endswith("\n\n") else ""
-        toml_path.write_text(text + sep + new_block + "\n")
-        return "written"
+    # Enable Codex lifecycle hooks (experimental feature, off by default)
+    hooks_result = _toml_set_key(toml_path, "features", "codex_hooks", "true")
 
-    # replace the existing section up to the next section header
-    lines = text.splitlines(keepends=True)
-    start_idx = next(i for i, line in enumerate(lines) if line.strip() == SECTION)
-    end_idx = len(lines)
-    for i in range(start_idx + 1, len(lines)):
-        if lines[i].startswith("[") and not lines[i].startswith("[["):
-            end_idx = i
-            break
-    original_block = "".join(lines[start_idx:end_idx]).rstrip()
-    if original_block == new_block:
+    if mcp_result == "already_current" and hooks_result == "already_current":
         return "already_current"
-    new_text = "".join(lines[:start_idx]) + new_block + "\n" + "".join(lines[end_idx:])
-    toml_path.write_text(new_text)
-    return "updated"
+    return "written" if mcp_result == "written" else "updated"
 
 
 def _install_mcp(client: str, scope: str, python: str) -> tuple[bool, str]:
@@ -1501,6 +1560,8 @@ def _install(args: list[str]) -> None:
         print("Codex:")
         if scope == "global":
             _step("MCP", lambda: _install_mcp("codex", scope, python))
+            global_toml = Path.home() / ".codex" / "config.toml"
+            _step("hooks feature flag", lambda p=global_toml: _toml_set_key(p, "features", "codex_hooks", "true"))
             hooks_dir = Path.home() / ".codex" / "hooks"
             hooks_json = Path.home() / ".codex" / "hooks.json"
             md_path = Path.home() / ".codex" / "AGENTS.md"

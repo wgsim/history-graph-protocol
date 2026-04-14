@@ -125,7 +125,12 @@ gemini mcp add --scope user hgp python -m hgp.server
 [mcp_servers.hgp]
 command = "python"
 args = ["-m", "hgp.server"]
+
+[features]
+codex_hooks = true   # enable lifecycle hooks (required for HGP hook support)
 ```
+
+Hooks are also installed to `.codex/hooks/` and registered in `.codex/hooks.json`. Currently Codex fires `PreToolUse`/`PostToolUse` hooks for Bash commands only; `apply_patch` (file edits) support is a [known upstream issue](https://github.com/openai/codex/issues/16732).
 
 > Use the Python that has `history-graph-protocol` installed. If using a virtual environment, replace `python` with the absolute path to the venv Python (e.g. `/path/to/.venv/bin/python`).
 

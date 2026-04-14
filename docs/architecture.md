@@ -524,7 +524,7 @@ Layers 2c/2e use a marker-file gate: the Pre hook writes `/tmp/.hgp_bash_mutatin
 - Marker file gate depends on `ppid` linkage; in rare cases where the harness forks differently this may not fire correctly
 - `.gitignore`'d files are not reported by the Post-Bash git-status scan
 - External process changes triggered outside the agent's shell (background daemons, CI scripts) are not tracked
-- Codex CLI enforcement — `PreToolUse` in Codex only intercepts Bash (not file write tools) as of April 2026; only instruction files (`AGENTS.md`) apply for Codex
+- Codex CLI enforcement — Codex `PreToolUse`/`PostToolUse` hooks are supported (enabled via `features.codex_hooks = true` in `config.toml`) and installed to `.codex/hooks/`. As of April 2026, Codex fires these hooks for Bash commands only; `apply_patch` (file edits) does not trigger them ([upstream issue](https://github.com/openai/codex/issues/16732))
 - Binary files are out of scope (future work)
 
 ### Storage placement
