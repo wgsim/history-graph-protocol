@@ -118,6 +118,22 @@ def test_stale_hook_comment_no_false_negative(tmp_path: Path) -> None:
     assert "predate hook-policy support" in result.stderr
 
 
+def test_stale_codex_hook_triggers_warning(tmp_path: Path) -> None:
+    repo = _make_git_repo(tmp_path / "repo")
+    # install a stale Codex hook without _resolve_block_mode
+    codex_hooks = repo / ".codex" / "hooks"
+    codex_hooks.mkdir(parents=True)
+    (codex_hooks / "pre_tool_use_hgp.py").write_text(
+        "# old codex hook without _resolve_block_mode\n"
+        "import os\n"
+        "BLOCK_MODE = os.environ.get('HGP_HOOK_BLOCK', '0') == '1'\n"
+    )
+    result = _run(["hook-policy", "block"], cwd=repo)
+    assert result.returncode == 0
+    assert "predate hook-policy support" in result.stderr
+    assert ".codex/hooks/pre_tool_use_hgp.py" in result.stderr
+
+
 def test_fresh_hook_no_warning(tmp_path: Path) -> None:
     repo = _make_git_repo(tmp_path / "repo")
     # install a current hook containing _resolve_block_mode

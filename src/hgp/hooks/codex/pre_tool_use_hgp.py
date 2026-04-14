@@ -160,13 +160,6 @@ def main() -> None:
     if matched is None:
         sys.exit(0)
 
-    # Write marker so PostToolUse hook knows to run git status
-    try:
-        with open(_marker_path(), "w") as f:
-            f.write(matched)
-    except OSError:
-        pass  # /tmp not writable — skip marker, hook still warns
-
     msg = (
         f"[HGP] Bash command may mutate files (matched: {matched!r}). "
         "If this writes or deletes tracked files, prefer hgp_* tools so the "
@@ -182,6 +175,12 @@ def main() -> None:
             },
         }))
     else:
+        # Write marker so PostToolUse hook knows to run git status
+        try:
+            with open(_marker_path(), "w") as f:
+                f.write(matched)
+        except OSError:
+            pass  # /tmp not writable — skip marker, hook still warns
         print(json.dumps({"systemMessage": msg}))
     sys.exit(0)
 

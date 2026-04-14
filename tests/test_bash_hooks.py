@@ -378,6 +378,24 @@ def test_codex_pre_tool_use_block_mode_denies_mutating(tmp_path):
     assert "[HGP]" in output.get("permissionDecisionReason", "")
 
 
+def test_codex_pre_tool_use_block_mode_does_not_write_marker(tmp_path):
+    """Codex PreToolUse must NOT write a marker file when denying — denied commands
+    don't execute, so a marker would cause a false PostToolUse advisory on the
+    next Bash call."""
+    (tmp_path / ".git").mkdir()
+    policy_dir = tmp_path / ".hgp"
+    policy_dir.mkdir()
+    (policy_dir / "hook-policy").write_text("block")
+
+    # Clean up any stale marker left by earlier advisory-mode tests in this process
+    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
+    marker.unlink(missing_ok=True)
+
+    _run_hook(_CODEX_PRE_HOOK, _bash_event("cp foo bar"), cwd=str(tmp_path))
+
+    assert not marker.exists(), "marker must not be written when command is denied"
+
+
 def test_codex_pre_tool_use_advisory_mode_warns_mutating(tmp_path):
     """Codex PreToolUse returns systemMessage in advisory mode."""
     (tmp_path / ".git").mkdir()

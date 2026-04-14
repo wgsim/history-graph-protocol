@@ -1677,6 +1677,7 @@ def _hook_policy(args: list[str]) -> None:
     for hook_path in [
         project_root / ".claude" / "hooks" / "pre_tool_use_hgp.py",
         project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py",
+        project_root / ".codex" / "hooks" / "pre_tool_use_hgp.py",
     ]:
         if hook_path.exists() and not re.search(
                 r"^def\s+_resolve_block_mode\s*\(",
