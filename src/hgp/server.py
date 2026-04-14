@@ -1687,7 +1687,7 @@ def _hook_policy(args: list[str]) -> None:
             ):
             stale_policy.append((str(hook_path.relative_to(project_root)), flag))
     if stale_policy:
-        lines = "".join(f"  {p}  →  hgp install {flag}\n" for p, flag in stale_policy)
+        lines = "".join(f"  {p}  →  hgp install {flag} --local\n" for p, flag in stale_policy)
         print(
             "\nWarning: the following installed hook(s) predate hook-policy support\n"
             "and will not honor the advisory/block policy until reinstalled:\n"
