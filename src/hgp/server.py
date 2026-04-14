@@ -1673,24 +1673,26 @@ def _hook_policy(args: list[str]) -> None:
     print(f"Hook policy set to: {new_policy}")
 
     # warn if installed hooks predate hook-policy support (policy enforcement broken)
-    stale_policy: list[str] = []
-    for hook_path in [
-        project_root / ".claude" / "hooks" / "pre_tool_use_hgp.py",
-        project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py",
-        project_root / ".codex" / "hooks" / "pre_tool_use_hgp.py",
-    ]:
+    _hook_clients = [
+        (project_root / ".claude" / "hooks" / "pre_tool_use_hgp.py", "--claude"),
+        (project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py", "--gemini"),
+        (project_root / ".codex" / "hooks" / "pre_tool_use_hgp.py", "--codex"),
+    ]
+    stale_policy: list[tuple[str, str]] = []
+    for hook_path, flag in _hook_clients:
         if hook_path.exists() and not re.search(
                 r"^def\s+_resolve_block_mode\s*\(",
                 hook_path.read_text(),
                 re.MULTILINE,
             ):
-            stale_policy.append(str(hook_path.relative_to(project_root)))
+            stale_policy.append((str(hook_path.relative_to(project_root)), flag))
     if stale_policy:
+        lines = "".join(f"  {p}  →  hgp install {flag}\n" for p, flag in stale_policy)
         print(
             "\nWarning: the following installed hook(s) predate hook-policy support\n"
             "and will not honor the advisory/block policy until reinstalled:\n"
-            + "".join(f"  {p}\n" for p in stale_policy)
-            + "Run `hgp install-hooks` to update them.",
+            + lines
+            + "Run the indicated command to update each hook.",
             file=sys.stderr,
         )
     # warn if post_tool_use_hgp.py is missing (agent-context advisory degraded, not policy)
@@ -1700,7 +1702,7 @@ def _hook_policy(args: list[str]) -> None:
     post_tool_use = project_root / ".gemini" / "hooks" / "post_tool_use_hgp.py"
     gemini_pre = project_root / ".gemini" / "hooks" / "pre_tool_use_hgp.py"
     gemini_pre_stale = any(
-        ".gemini" in p for p in stale_policy
+        ".gemini" in p for p, _ in stale_policy
     )
     if gemini_pre.exists() and not post_tool_use.exists():
         if gemini_pre_stale:

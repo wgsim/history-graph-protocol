@@ -100,7 +100,8 @@ def test_stale_hook_triggers_warning(tmp_path: Path) -> None:
     result = _run(["hook-policy", "block"], cwd=repo)
     assert result.returncode == 0
     assert "predate hook-policy support" in result.stderr
-    assert "hgp install-hooks" in result.stderr
+    assert "hgp install --claude" in result.stderr
+    assert "hgp install-hooks" not in result.stderr
 
 
 def test_stale_hook_comment_no_false_negative(tmp_path: Path) -> None:
@@ -132,6 +133,8 @@ def test_stale_codex_hook_triggers_warning(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "predate hook-policy support" in result.stderr
     assert ".codex/hooks/pre_tool_use_hgp.py" in result.stderr
+    assert "hgp install --codex" in result.stderr
+    assert "hgp install-hooks" not in result.stderr
 
 
 def test_fresh_hook_no_warning(tmp_path: Path) -> None:
