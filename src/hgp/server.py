@@ -1781,7 +1781,7 @@ def _write_project_meta(hgp_dir: Path, project_root: Path) -> dict[str, Any]:
     """
     try:
         from importlib.metadata import version as _pkg_version
-        hgp_version: str = _pkg_version("hgp")
+        hgp_version: str = _pkg_version("history-graph-protocol")
     except Exception:
         hgp_version = "unknown"
 
@@ -1923,15 +1923,52 @@ def _restore_snapshot(source_dir: Path, repo_root: Path) -> None:
         shutil.rmtree(old_dir)
 
 
+def _validate_snapshot_source(source: Path, cmd: str) -> None:
+    """Exit with a user-facing error if source is not a valid HGP snapshot.
+
+    Called before any destructive swap so the existing .hgp/ is never touched
+    when the source is obviously wrong (a plain file, empty directory, etc.).
+    """
+    import sys
+
+    if not source.is_dir():
+        print(
+            f"hgp {cmd}: source is not a directory: {source}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not (source / "hgp.db").exists():
+        print(
+            f"hgp {cmd}: source does not look like an HGP snapshot "
+            f"(hgp.db not found in {source})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _remove_dest(path: Path) -> None:
+    """Remove path whether it is a directory, regular file, or symlink."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
 def _discover_backup(repo_root: Path) -> list[tuple[str, Path]]:
     """Scan ~/.hgp/projects/ for backups whose git_remote matches this repo.
 
     Returns list of (project_id, backup_dir) tuples.
+
+    If the current repo has no origin remote, auto-discovery is disabled to
+    prevent accidentally restoring an unrelated backup. The caller must supply
+    --project-id explicitly in that case.
     """
+    cur_remote = _get_git_remote(repo_root)
+    if not cur_remote:
+        return []
     projects_dir = _get_projects_dir()
     if not projects_dir.exists():
         return []
-    cur_remote = _get_git_remote(repo_root)
     matches: list[tuple[str, Path]] = []
     for entry in sorted(projects_dir.iterdir()):
         if not entry.is_dir():
@@ -1940,10 +1977,7 @@ def _discover_backup(repo_root: Path) -> list[tuple[str, Path]]:
         if meta is None:
             continue
         project_id = meta.get("project_id", entry.name)
-        if cur_remote and meta.get("git_remote") == cur_remote:
-            matches.append((project_id, entry))
-        elif not cur_remote:
-            # Cannot verify by remote; include all with a valid project_id.
+        if meta.get("git_remote") == cur_remote:
             matches.append((project_id, entry))
     return matches
 
@@ -1986,7 +2020,7 @@ def _hgp_backup(args: list[str]) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        shutil.rmtree(dest)
+        _remove_dest(dest)
 
     _copy_history_to(hgp_dir, dest)
     repo_name = meta.get("repo_name", project_root.name)
@@ -2062,6 +2096,8 @@ def _hgp_restore(args: list[str]) -> None:
                 sys.exit(1)
             backup_dir = candidates[0][1]
 
+    _validate_snapshot_source(backup_dir, "restore")
+
     # "already exists" guard first — protecting existing data takes priority.
     if hgp_dir.exists() and not force:
         print(
@@ -2135,7 +2171,7 @@ def _hgp_export(args: list[str]) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        shutil.rmtree(dest)
+        _remove_dest(dest)
 
     _copy_history_to(hgp_dir, dest)
     repo_name = meta.get("repo_name", project_root.name)
@@ -2157,6 +2193,7 @@ def _hgp_import(args: list[str]) -> None:
     if not source.exists():
         print(f"hgp import: source path does not exist: {source}", file=sys.stderr)
         sys.exit(1)
+    _validate_snapshot_source(source, "import")
 
     try:
         project_root = find_project_root(Path.cwd())

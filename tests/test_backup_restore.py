@@ -158,16 +158,17 @@ def _make_backup(repo: Path, projects: Path) -> str:
 
 
 def test_restore_compatible(tmp_path: Path) -> None:
-    """Restore into a fresh repo that has the same git remote as the backup."""
+    """Restore by project-id into a repo with no remote — requires --force (unverifiable)."""
     repo = _make_git_repo(tmp_path / "repo")
     projects = tmp_path / "projects"
-    _make_backup(repo, projects)
+    pid = _make_backup(repo, projects)
 
     # Remove .hgp/ to simulate a clean restore target
     shutil.rmtree(repo / ".hgp")
 
-    # Without a remote, compatibility is "unverifiable" — use --force
-    result = _run(["restore", "--force"], cwd=repo, projects_dir=projects)
+    # No remote → auto-discovery disabled; supply project-id explicitly.
+    # Compatibility is "unverifiable" (no remote in meta either) → --force required.
+    result = _run(["restore", "--project-id", pid, "--force"], cwd=repo, projects_dir=projects)
     assert result.returncode == 0, result.stderr
     assert (repo / ".hgp" / "hgp.db").exists()
 
@@ -195,14 +196,15 @@ def test_restore_overwrites_existing_requires_force(tmp_path: Path) -> None:
 
 
 def test_restore_unverifiable_requires_force(tmp_path: Path) -> None:
-    """No git remote → unverifiable → requires --force."""
+    """Backup with no git_remote in meta → unverifiable → requires --force."""
     repo = _make_git_repo(tmp_path / "repo")
     projects = tmp_path / "projects"
-    _make_backup(repo, projects)
+    pid = _make_backup(repo, projects)
 
     shutil.rmtree(repo / ".hgp")
 
-    result = _run(["restore"], cwd=repo, projects_dir=projects)
+    # No remote in backup meta (repo has no origin) → unverifiable without --force.
+    result = _run(["restore", "--project-id", pid], cwd=repo, projects_dir=projects)
     assert result.returncode != 0
     assert "force" in result.stderr.lower()
 
@@ -435,3 +437,134 @@ def test_import_preserves_operational_files(tmp_path: Path) -> None:
 
     assert (repo / ".hgp" / "mode").read_text() == "advisory"
     assert (repo / ".hgp" / "hook-policy").read_text() == "block"
+
+
+# ---------------------------------------------------------------------------
+# Regression: Fix 1 — invalid snapshot source validation
+# ---------------------------------------------------------------------------
+
+
+def test_import_from_regular_file_exits_nonzero(tmp_path: Path) -> None:
+    """Importing a plain file (not a directory) must fail before any swap."""
+    repo = _make_git_repo(tmp_path / "repo")
+    _seed_hgp(repo)
+    not_a_dir = tmp_path / "not_a_snapshot.txt"
+    not_a_dir.write_text("not a snapshot")
+
+    result = _run(["import", str(not_a_dir), "--force"], cwd=repo)
+    assert result.returncode != 0
+    assert "not a directory" in result.stderr.lower()
+    # Original .hgp/hgp.db must be untouched
+    assert (repo / ".hgp" / "hgp.db").exists()
+
+
+def test_import_from_empty_directory_exits_nonzero(tmp_path: Path) -> None:
+    """Importing an empty directory (no hgp.db) must fail before any swap."""
+    repo = _make_git_repo(tmp_path / "repo")
+    _seed_hgp(repo)
+    empty = tmp_path / "empty_snapshot"
+    empty.mkdir()
+
+    result = _run(["import", str(empty), "--force"], cwd=repo)
+    assert result.returncode != 0
+    assert "hgp.db" in result.stderr
+    assert (repo / ".hgp" / "hgp.db").exists()
+
+
+def test_restore_from_backup_missing_db_exits_nonzero(tmp_path: Path) -> None:
+    """Restore from a backup dir that lost hgp.db must fail safely."""
+    repo = _make_git_repo(tmp_path / "repo")
+    projects = tmp_path / "projects"
+    _make_backup(repo, projects)
+
+    meta = json.loads((repo / ".hgp" / "project-meta").read_text())
+    pid = meta["project_id"]
+    # Corrupt the backup by removing hgp.db
+    (projects / pid / "hgp.db").unlink()
+
+    result = _run(["restore", "--project-id", pid, "--force"], cwd=repo, projects_dir=projects)
+    assert result.returncode != 0
+    assert "hgp.db" in result.stderr
+    # Original .hgp/ must be intact
+    assert (repo / ".hgp" / "hgp.db").exists()
+
+
+# ---------------------------------------------------------------------------
+# Regression: Fix 2 — no-remote repo must not auto-restore arbitrary backups
+# ---------------------------------------------------------------------------
+
+
+def test_restore_no_remote_no_autodiscovery(tmp_path: Path) -> None:
+    """Repo with no origin remote must not auto-discover unrelated backups."""
+    repo_a = _make_git_repo(tmp_path / "repo_a")
+    repo_b = _make_git_repo(tmp_path / "repo_b")
+    projects = tmp_path / "projects"
+
+    # repo_a has a remote and a backup
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/org/repo-a.git"],
+        cwd=repo_a, capture_output=True,
+    )
+    _seed_hgp(repo_a)
+    _run(["backup"], cwd=repo_a, projects_dir=projects)
+
+    # repo_b has no remote at all → auto-discovery must refuse
+    result = _run(["restore", "--force"], cwd=repo_b, projects_dir=projects)
+    assert result.returncode != 0
+    assert "no backup" in result.stderr.lower() or "--project-id" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Regression: Fix 3 — --force overwrite handles regular-file destinations
+# ---------------------------------------------------------------------------
+
+
+def test_backup_force_when_dest_is_file(tmp_path: Path) -> None:
+    """backup --force must not crash when the backup slot is a regular file."""
+    repo = _make_git_repo(tmp_path / "repo")
+    projects = tmp_path / "projects"
+    _seed_hgp(repo)
+
+    _run(["backup"], cwd=repo, projects_dir=projects)
+    meta = json.loads((repo / ".hgp" / "project-meta").read_text())
+    pid = meta["project_id"]
+
+    # Replace the backup directory with a plain file
+    shutil.rmtree(projects / pid)
+    (projects / pid).write_text("not a dir")
+
+    result = _run(["backup", "--force"], cwd=repo, projects_dir=projects)
+    assert result.returncode == 0
+    assert (projects / pid / "hgp.db").exists()
+
+
+def test_export_force_when_dest_is_file(tmp_path: Path) -> None:
+    """export --force must not crash when destination is a regular file."""
+    repo = _make_git_repo(tmp_path / "repo")
+    _seed_hgp(repo)
+    dest = tmp_path / "export_out"
+
+    # Create dest as a regular file
+    dest.write_text("not a dir")
+
+    result = _run(["export", str(dest), "--force"], cwd=repo)
+    assert result.returncode == 0
+    assert (dest / "hgp.db").exists()
+
+
+# ---------------------------------------------------------------------------
+# Regression: Fix 4 — hgp_version must not be "unknown"
+# ---------------------------------------------------------------------------
+
+
+def test_backup_project_meta_hgp_version_is_known(tmp_path: Path) -> None:
+    """project-meta must record the real package version, not 'unknown'."""
+    repo = _make_git_repo(tmp_path / "repo")
+    projects = tmp_path / "projects"
+    _seed_hgp(repo)
+
+    _run(["backup"], cwd=repo, projects_dir=projects)
+
+    meta = json.loads((repo / ".hgp" / "project-meta").read_text())
+    assert meta.get("hgp_version") != "unknown"
+    assert meta.get("hgp_version")  # non-empty
