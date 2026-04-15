@@ -1,5 +1,9 @@
 # History Graph Protocol (HGP)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/history-graph-protocol)](https://pypi.org/project/history-graph-protocol/)
+[![CI](https://github.com/wgsim/history-graph-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/wgsim/history-graph-protocol/actions/workflows/ci.yml)
+
 **An MCP server that gives AI agents a permanent, append-only causal history.**
 
 HGP records what an agent *did and why* — every file write, every decision, every piece of evidence behind each action. Where memory systems store what an agent *knows*, HGP stores what an agent *did*. Think of other memory systems as working memory; HGP is the audit trail.
