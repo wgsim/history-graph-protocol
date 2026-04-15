@@ -1248,6 +1248,8 @@ def _install_hooks_files(pkg: str, dest_dir: Path) -> list[str]:
         if item.name.endswith(".py") and not item.name.startswith("__"):
             dest = dest_dir / item.name
             with importlib.resources.as_file(item) as src:
+                if dest.exists():
+                    dest.unlink()
                 shutil.copy2(src, dest)
             installed.append(str(dest))
     return installed
