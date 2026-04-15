@@ -11,10 +11,10 @@
 
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
-Report vulnerabilities by email to the maintainer via the address listed on the
-[GitHub profile](https://github.com/wgsim), or use
-[GitHub's private vulnerability reporting](https://github.com/wgsim/history-graph-protocol/security/advisories/new)
-if enabled on this repository.
+Report vulnerabilities via
+[GitHub's private vulnerability reporting](https://github.com/wgsim/history-graph-protocol/security/advisories/new),
+or by email to the maintainer via the address listed on the
+[GitHub profile](https://github.com/wgsim).
 
 Include:
 
