@@ -7,11 +7,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
@@ -1724,6 +1726,483 @@ def _hook_policy(args: list[str]) -> None:
             )
 
 
+# ── Backup / Restore / Export / Import ───────────────────────────────────────
+
+# Files that represent history data (backed up).
+_BACKUP_HISTORY_FILES = frozenset({"hgp.db", ".hgp_content", "project-meta"})
+# Files that represent operational/machine-local state (excluded from backup).
+_BACKUP_OPERATIONAL_FILES = frozenset({"mode", "hook-policy"})
+
+_BACKUP_USAGE = """\
+Usage:
+  hgp backup                          back up .hgp/ to ~/.hgp/projects/<id>/
+  hgp restore [--project-id <id>] [--force]
+                                       restore from local backup
+  hgp export <dest>                   export history snapshot to <dest>/
+  hgp import <source> [--force]       import a history snapshot
+"""
+
+
+def _get_projects_dir() -> Path:
+    """Return global HGP projects backup directory.
+
+    Overridable via HGP_PROJECTS_DIR env var for test isolation.
+    """
+    env = os.environ.get("HGP_PROJECTS_DIR")
+    return Path(env) if env else Path.home() / ".hgp" / "projects"
+
+
+def _sqlite_backup(src_db: Path, dst_db: Path) -> None:
+    """WAL-safe SQLite hot-backup: src_db → dst_db.
+
+    Uses sqlite3.Connection.backup() which holds an internal shared-cache lock
+    and produces a consistent snapshot regardless of WAL/SHM state.
+    """
+    dst_db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(src_db)) as src, sqlite3.connect(str(dst_db)) as dst:
+        src.backup(dst)
+
+
+def _read_project_meta(hgp_dir: Path) -> dict[str, Any] | None:
+    """Read project-meta JSON from hgp_dir. Returns None if absent or invalid."""
+    meta_file = hgp_dir / "project-meta"
+    if not meta_file.exists():
+        return None
+    try:
+        return json.loads(meta_file.read_text())  # type: ignore[no-any-return]
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_project_meta(hgp_dir: Path, project_root: Path) -> dict[str, Any]:
+    """Return existing project-meta or create a new one.
+
+    Preserves existing project_id. Refreshes git_remote and hgp_version.
+    """
+    try:
+        from importlib.metadata import version as _pkg_version
+        hgp_version: str = _pkg_version("hgp")
+    except Exception:
+        hgp_version = "unknown"
+
+    meta_file = hgp_dir / "project-meta"
+    existing = _read_project_meta(hgp_dir)
+    project_id: str = (existing or {}).get("project_id") or str(uuid.uuid4())
+
+    git_remote: str | None = None
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=project_root, capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            git_remote = result.stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    repo_name: str = (
+        git_remote.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+        if git_remote else project_root.name
+    )
+
+    meta: dict[str, Any] = {
+        "project_id": project_id,
+        "git_remote": git_remote,
+        "repo_name": repo_name,
+        "hgp_version": hgp_version,
+    }
+    hgp_dir.mkdir(parents=True, exist_ok=True)
+    meta_file.write_text(json.dumps(meta, indent=2))
+    return meta
+
+
+def _get_git_remote(repo_root: Path) -> str | None:
+    """Return git remote 'origin' URL for repo_root, or None."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_root, capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _check_compatibility(
+    source_meta: dict[str, Any] | None,
+    current_root: Path,
+) -> Literal["compatible", "mismatch", "unverifiable"]:
+    """Compare source snapshot metadata against the current repo.
+
+    Returns:
+        "compatible"   — git remote URLs match; safe to proceed automatically.
+        "mismatch"     — remote URLs differ; require --force.
+        "unverifiable" — one or both sides lack a remote URL, or source has no
+                         project-meta; require --force.
+    """
+    if source_meta is None:
+        return "unverifiable"
+    src_remote: str | None = source_meta.get("git_remote")
+    if not src_remote:
+        return "unverifiable"
+    cur_remote = _get_git_remote(current_root)
+    if not cur_remote:
+        return "unverifiable"
+    return "compatible" if src_remote == cur_remote else "mismatch"
+
+
+def _copy_history_to(hgp_dir: Path, dest_dir: Path) -> None:
+    """Copy history data (hgp.db via SQLite API, .hgp_content/, project-meta) to dest_dir.
+
+    Operational files (mode, hook-policy) are excluded.
+    dest_dir must not exist yet (caller responsibility).
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    src_db = hgp_dir / "hgp.db"
+    if src_db.exists():
+        _sqlite_backup(src_db, dest_dir / "hgp.db")
+
+    src_content = hgp_dir / ".hgp_content"
+    if src_content.exists():
+        shutil.copytree(src_content, dest_dir / ".hgp_content")
+
+    src_meta = hgp_dir / "project-meta"
+    if src_meta.exists():
+        shutil.copy2(src_meta, dest_dir / "project-meta")
+
+
+def _restore_snapshot(source_dir: Path, repo_root: Path) -> None:
+    """Atomically replace repo_root/.hgp/ with history data from source_dir.
+
+    Pattern:
+        1. Populate .hgp_restore_tmp/ (same filesystem → rename is atomic)
+        2. Rename existing .hgp/ → .hgp_old/
+        3. Rename .hgp_restore_tmp/ → .hgp/
+        4. Remove .hgp_old/
+
+    Operational files in the current .hgp/ (mode, hook-policy) are preserved:
+    they are copied from the existing .hgp/ into the new one after the rename.
+    """
+    hgp_dir = repo_root / ".hgp"
+    tmp_dir = repo_root / ".hgp_restore_tmp"
+    old_dir = repo_root / ".hgp_old"
+
+    # Clean up any leftover temp dirs from a previous failed attempt.
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    if old_dir.exists():
+        shutil.rmtree(old_dir)
+
+    # Preserve operational files from existing .hgp/ before swapping.
+    preserved: dict[str, str] = {}
+    if hgp_dir.exists():
+        for name in _BACKUP_OPERATIONAL_FILES:
+            f = hgp_dir / name
+            if f.exists():
+                preserved[name] = f.read_text()
+
+    # Build the new .hgp/ content in tmp_dir.
+    _copy_history_to(source_dir, tmp_dir)
+
+    # Write back preserved operational files into tmp_dir.
+    for name, content in preserved.items():
+        (tmp_dir / name).write_text(content)
+
+    # Atomic swap: existing → old, tmp → .hgp, remove old.
+    if hgp_dir.exists():
+        hgp_dir.rename(old_dir)
+    try:
+        tmp_dir.rename(hgp_dir)
+    except Exception:
+        # Roll back: restore the original .hgp/ if rename failed.
+        if old_dir.exists():
+            old_dir.rename(hgp_dir)
+        raise
+    if old_dir.exists():
+        shutil.rmtree(old_dir)
+
+
+def _discover_backup(repo_root: Path) -> list[tuple[str, Path]]:
+    """Scan ~/.hgp/projects/ for backups whose git_remote matches this repo.
+
+    Returns list of (project_id, backup_dir) tuples.
+    """
+    projects_dir = _get_projects_dir()
+    if not projects_dir.exists():
+        return []
+    cur_remote = _get_git_remote(repo_root)
+    matches: list[tuple[str, Path]] = []
+    for entry in sorted(projects_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        meta = _read_project_meta(entry)
+        if meta is None:
+            continue
+        project_id = meta.get("project_id", entry.name)
+        if cur_remote and meta.get("git_remote") == cur_remote:
+            matches.append((project_id, entry))
+        elif not cur_remote:
+            # Cannot verify by remote; include all with a valid project_id.
+            matches.append((project_id, entry))
+    return matches
+
+
+def _hgp_backup(args: list[str]) -> None:
+    """Back up .hgp/ history data to ~/.hgp/projects/<project_id>/."""
+    import sys
+
+    force = "--force" in args
+    extra = [a for a in args if a != "--force"]
+    if extra:
+        print(f"hgp backup: unexpected arguments: {' '.join(extra)}", file=sys.stderr)
+        print(_BACKUP_USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp backup: no git repository found from current directory.\n"
+            "Run this command from inside a git repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    hgp_dir = project_root / ".hgp"
+    if not hgp_dir.exists():
+        print("hgp backup: no .hgp/ directory found. Nothing to back up.", file=sys.stderr)
+        sys.exit(1)
+
+    meta = _write_project_meta(hgp_dir, project_root)
+    project_id: str = meta["project_id"]
+
+    dest = _get_projects_dir() / project_id
+    if dest.exists():
+        if not force:
+            print(
+                f"hgp backup: backup already exists at {dest}\n"
+                "Use --force to overwrite.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        shutil.rmtree(dest)
+
+    _copy_history_to(hgp_dir, dest)
+    repo_name = meta.get("repo_name", project_root.name)
+    print(f"Backed up '{repo_name}' → {dest}")
+
+
+def _hgp_restore(args: list[str]) -> None:
+    """Restore .hgp/ from a local backup in ~/.hgp/projects/."""
+    import sys
+
+    force = "--force" in args
+    remaining = [a for a in args if a != "--force"]
+
+    project_id: str | None = None
+    if "--project-id" in remaining:
+        idx = remaining.index("--project-id")
+        if idx + 1 >= len(remaining):
+            print("hgp restore: --project-id requires a value.", file=sys.stderr)
+            sys.exit(1)
+        project_id = remaining[idx + 1]
+        remaining = remaining[:idx] + remaining[idx + 2:]
+
+    if remaining:
+        print(f"hgp restore: unexpected arguments: {' '.join(remaining)}", file=sys.stderr)
+        print(_BACKUP_USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp restore: no git repository found from current directory.\n"
+            "Run this command from inside a git repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    hgp_dir = project_root / ".hgp"
+
+    # Determine backup_dir
+    if project_id:
+        backup_dir = _get_projects_dir() / project_id
+        if not backup_dir.exists():
+            print(f"hgp restore: no backup found for project-id '{project_id}'.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Try reading project_id from existing .hgp/project-meta
+        existing_meta = _read_project_meta(hgp_dir) if hgp_dir.exists() else None
+        local_id: str | None = (existing_meta or {}).get("project_id")
+        if local_id:
+            candidate = _get_projects_dir() / local_id
+            backup_dir = candidate if candidate.exists() else None  # type: ignore[assignment]
+        else:
+            backup_dir = None  # type: ignore[assignment]
+
+        if backup_dir is None:
+            # Auto-discover by git remote
+            candidates = _discover_backup(project_root)
+            if not candidates:
+                print(
+                    "hgp restore: no backup found for this repository.\n"
+                    "Run `hgp backup` first.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if len(candidates) > 1:
+                lines = "\n".join(f"  {pid}  ({d})" for pid, d in candidates)
+                print(
+                    "hgp restore: multiple backups found. Specify one with --project-id:\n"
+                    + lines,
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            backup_dir = candidates[0][1]
+
+    # "already exists" guard first — protecting existing data takes priority.
+    if hgp_dir.exists() and not force:
+        print(
+            f"hgp restore: .hgp/ already exists at {hgp_dir}\n"
+            "Use --force to overwrite.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    source_meta = _read_project_meta(backup_dir)
+    compat = _check_compatibility(source_meta, project_root)
+    if compat != "compatible" and not force:
+        if compat == "mismatch":
+            src_remote = (source_meta or {}).get("git_remote", "unknown")
+            cur_remote = _get_git_remote(project_root) or "none"
+            print(
+                f"hgp restore: git remote mismatch.\n"
+                f"  backup remote : {src_remote}\n"
+                f"  current remote: {cur_remote}\n"
+                "Use --force to restore anyway.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "hgp restore: cannot verify compatibility (missing git remote or project-meta).\n"
+                "Use --force to restore anyway.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    _restore_snapshot(backup_dir, project_root)
+    repo_name = (source_meta or {}).get("repo_name", project_root.name)
+    print(f"Restored '{repo_name}' from {backup_dir}")
+
+
+def _hgp_export(args: list[str]) -> None:
+    """Export .hgp/ history snapshot to a specified directory."""
+    import sys
+
+    force = "--force" in args
+    remaining = [a for a in args if a != "--force"]
+    if len(remaining) != 1:
+        print("hgp export: requires exactly one destination path.", file=sys.stderr)
+        print(_BACKUP_USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    dest = Path(remaining[0]).expanduser()
+
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp export: no git repository found from current directory.\n"
+            "Run this command from inside a git repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    hgp_dir = project_root / ".hgp"
+    if not hgp_dir.exists():
+        print("hgp export: no .hgp/ directory found. Nothing to export.", file=sys.stderr)
+        sys.exit(1)
+
+    meta = _write_project_meta(hgp_dir, project_root)
+
+    if dest.exists():
+        if not force:
+            print(
+                f"hgp export: destination already exists: {dest}\n"
+                "Use --force to overwrite.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        shutil.rmtree(dest)
+
+    _copy_history_to(hgp_dir, dest)
+    repo_name = meta.get("repo_name", project_root.name)
+    print(f"Exported '{repo_name}' → {dest}")
+
+
+def _hgp_import(args: list[str]) -> None:
+    """Import a history snapshot into the current repo's .hgp/."""
+    import sys
+
+    force = "--force" in args
+    remaining = [a for a in args if a != "--force"]
+    if len(remaining) != 1:
+        print("hgp import: requires exactly one source path.", file=sys.stderr)
+        print(_BACKUP_USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    source = Path(remaining[0]).expanduser()
+    if not source.exists():
+        print(f"hgp import: source path does not exist: {source}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp import: no git repository found from current directory.\n"
+            "Run this command from inside a git repository.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    source_meta = _read_project_meta(source)
+    compat = _check_compatibility(source_meta, project_root)
+    if compat != "compatible" and not force:
+        if compat == "mismatch":
+            src_remote = (source_meta or {}).get("git_remote", "unknown")
+            cur_remote = _get_git_remote(project_root) or "none"
+            print(
+                f"hgp import: git remote mismatch.\n"
+                f"  source remote : {src_remote}\n"
+                f"  current remote: {cur_remote}\n"
+                "Use --force to import anyway.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "hgp import: cannot verify compatibility (missing git remote or project-meta).\n"
+                "Use --force to import anyway.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    hgp_dir = project_root / ".hgp"
+    if hgp_dir.exists() and not force:
+        print(
+            f"hgp import: .hgp/ already exists at {hgp_dir}\n"
+            "Use --force to overwrite.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _restore_snapshot(source, project_root)
+    repo_name = (source_meta or {}).get("repo_name", project_root.name)
+    print(f"Imported '{repo_name}' from {source}")
+
+
 def run() -> None:
     """Entry point for `hgp` console script.
 
@@ -1738,6 +2217,10 @@ def run() -> None:
         hgp hook-policy              # show current hook enforcement policy
         hgp hook-policy advisory     # warn only (default)
         hgp hook-policy block        # block native file tools
+        hgp backup                   # back up .hgp/ to ~/.hgp/projects/<id>/
+        hgp restore                  # restore .hgp/ from local backup
+        hgp export <dest>            # export history snapshot to <dest>/
+        hgp import <source>          # import a history snapshot
     """
     import sys
 
@@ -1754,6 +2237,14 @@ def run() -> None:
         _install_hooks(args[1:])
     elif args and args[0] == "hook-policy":
         _hook_policy(args[1:])
+    elif args and args[0] == "backup":
+        _hgp_backup(args[1:])
+    elif args and args[0] == "restore":
+        _hgp_restore(args[1:])
+    elif args and args[0] == "export":
+        _hgp_export(args[1:])
+    elif args and args[0] == "import":
+        _hgp_import(args[1:])
     else:
         mcp.run()
 
