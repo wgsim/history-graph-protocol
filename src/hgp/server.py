@@ -573,13 +573,16 @@ def hgp_set_context(root_op_id: str, agent_id: str, session_id: str) -> dict[str
 
 
 @mcp.tool()
-def hgp_get_context(session_id: str) -> dict[str, Any]:
-    """Read the session root op stored by hgp_set_context.
+def hgp_get_context(session_id: str, consume_summaries: bool = True) -> dict[str, Any]:
+    """Read the session root op and any pending subagent summaries.
 
-    Returns {root_op_id, agent_id, age_seconds} or {status: "no_context"}.
+    Returns {root_op_id, agent_id, age_seconds, subagent_summaries} or
+    {status: "no_context"}.  When consume_summaries=True (default), summary
+    files are deleted after reading so they are not returned twice.
     """
     ctx = _get_context()
-    path = _context_file_path(_hgp_dir_from_ctx(ctx), session_id)
+    hgp_dir = _hgp_dir_from_ctx(ctx)
+    path = _context_file_path(hgp_dir, session_id)
     if not path.exists():
         return {"status": "no_context"}
     try:
@@ -587,12 +590,25 @@ def hgp_get_context(session_id: str) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         return {"error": "READ_ERROR", "message": str(exc)}
     age = time.time() - data.get("set_at", 0)
-    return {
+
+    summaries: list[dict[str, Any]] = []
+    for p in sorted(hgp_dir.glob(f"subagent-summary-{session_id}-*.json")):
+        try:
+            summaries.append(json.loads(p.read_text(encoding="utf-8")))
+            if consume_summaries:
+                p.unlink(missing_ok=True)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    result: dict[str, Any] = {
         "root_op_id": data["root_op_id"],
         "agent_id": data.get("agent_id", ""),
         "session_id": session_id,
         "age_seconds": int(age),
     }
+    if summaries:
+        result["subagent_summaries"] = summaries
+    return result
 
 
 @mcp.tool()
@@ -612,6 +628,18 @@ def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             age = now - data.get("set_at", 0)
+            if age > _CONTEXT_FILE_TTL_SECONDS:
+                if not dry_run:
+                    p.unlink(missing_ok=True)
+                removed.append(p.name)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Clean up stale subagent-summary-*.json files (same TTL)
+    for p in hgp_dir.glob("subagent-summary-*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            age = now - data.get("completed_at", 0)
             if age > _CONTEXT_FILE_TTL_SECONDS:
                 if not dry_run:
                     p.unlink(missing_ok=True)
@@ -1378,6 +1406,9 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
             ],
             "SubagentStart": [
                 {"matcher": "", "hooks": [{"type": "command", "command": _cmd("subagent_start_hgp.py")}]},
+            ],
+            "SubagentStop": [
+                {"matcher": "", "hooks": [{"type": "command", "command": _cmd("subagent_stop_hgp.py")}]},
             ],
         }
     elif client == "gemini":

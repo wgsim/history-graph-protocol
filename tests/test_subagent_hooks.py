@@ -1,4 +1,4 @@
-"""Tests for SubagentStart hook script and hgp_set_context / hgp_get_context."""
+"""Tests for SubagentStart/SubagentStop hooks and hgp_set_context / hgp_get_context."""
 
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ from hgp.server import (
     hgp_set_context,
 )
 
-HOOK_SCRIPT = Path(__file__).parent.parent / "src/hgp/hooks/claude/subagent_start_hgp.py"
+START_HOOK = Path(__file__).parent.parent / "src/hgp/hooks/claude/subagent_start_hgp.py"
+STOP_HOOK = Path(__file__).parent.parent / "src/hgp/hooks/claude/subagent_stop_hgp.py"
 
 
 @pytest.fixture
@@ -123,9 +124,11 @@ def test_reconcile_dry_run_does_not_remove(server_components):
 
 # ── SubagentStart hook script ────────────────────────────────────────────────
 
-def _run_hook(event: dict, cwd: Path) -> tuple[int, str, str]:
+def _run_hook(event: dict, cwd: Path, script: Path | None = None) -> tuple[int, str, str]:
+    if script is None:
+        script = START_HOOK
     result = subprocess.run(
-        [sys.executable, str(HOOK_SCRIPT)],
+        [sys.executable, str(script)],
         input=json.dumps(event),
         capture_output=True,
         text=True,
@@ -134,7 +137,7 @@ def _run_hook(event: dict, cwd: Path) -> tuple[int, str, str]:
     return result.returncode, result.stdout, result.stderr
 
 
-def test_hook_injects_context(tmp_path):
+def test_start_hook_injects_context(tmp_path):
     hgp_dir = tmp_path / ".hgp"
     hgp_dir.mkdir()
     (tmp_path / ".git").mkdir()
@@ -180,3 +183,119 @@ def test_hook_no_session_id_is_silent(tmp_path):
     rc, stdout, _ = _run_hook(event, cwd=tmp_path)
     assert rc == 0
     assert stdout.strip() == ""
+
+
+# ── SubagentStop hook script ─────────────────────────────────────────────────
+
+def _make_transcript(path: Path, hgp_op_names: list[str]) -> None:
+    """Write a minimal transcript JSONL with the given mcp__hgp__ tool_use entries."""
+    entries = []
+    for name in hgp_op_names:
+        entries.append(json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "tool_use", "name": name, "id": "x", "input": {}}]
+            }
+        }))
+    path.write_text("\n".join(entries) + "\n", encoding="utf-8")
+
+
+def test_stop_hook_writes_summary(tmp_path):
+    hgp_dir = tmp_path / ".hgp"
+    hgp_dir.mkdir()
+    (tmp_path / ".git").mkdir()
+
+    transcript = tmp_path / "agent.jsonl"
+    _make_transcript(transcript, ["mcp__hgp__hgp_write_file", "mcp__hgp__hgp_create_operation"])
+
+    event = {
+        "hook_event_name": "SubagentStop",
+        "session_id": "sess-stop-test",
+        "agent_id": "agent-abc",
+        "agent_type": "general-purpose",
+        "agent_transcript_path": str(transcript),
+        "cwd": str(tmp_path),
+    }
+    rc, stdout, _ = _run_hook(event, cwd=tmp_path, script=STOP_HOOK)
+    assert rc == 0
+    assert stdout.strip() == ""  # no additionalContext output
+
+    summaries = list(hgp_dir.glob("subagent-summary-sess-stop-test-*.json"))
+    assert len(summaries) == 1
+    data = json.loads(summaries[0].read_text())
+    assert data["hgp_op_count"] == 2
+    assert data["agent_type"] == "general-purpose"
+    assert data["session_id"] == "sess-stop-test"
+
+
+def test_stop_hook_zero_ops(tmp_path):
+    hgp_dir = tmp_path / ".hgp"
+    hgp_dir.mkdir()
+    (tmp_path / ".git").mkdir()
+
+    transcript = tmp_path / "agent.jsonl"
+    _make_transcript(transcript, [])  # no HGP ops
+
+    event = {
+        "hook_event_name": "SubagentStop",
+        "session_id": "sess-zero",
+        "agent_id": "agent-xyz",
+        "agent_type": "Explore",
+        "agent_transcript_path": str(transcript),
+        "cwd": str(tmp_path),
+    }
+    rc, _, _ = _run_hook(event, cwd=tmp_path, script=STOP_HOOK)
+    assert rc == 0
+    summaries = list(hgp_dir.glob("subagent-summary-sess-zero-*.json"))
+    assert len(summaries) == 1
+    assert json.loads(summaries[0].read_text())["hgp_op_count"] == 0
+
+
+def test_stop_hook_wrong_event_is_silent(tmp_path):
+    event = {"hook_event_name": "SubagentStart", "session_id": "x", "cwd": str(tmp_path)}
+    rc, stdout, _ = _run_hook(event, cwd=tmp_path, script=STOP_HOOK)
+    assert rc == 0
+    assert stdout.strip() == ""
+
+
+def test_get_context_returns_summaries(server_components):
+    hgp_dir: Path = server_components["hgp_dir"]
+    op = hgp_create_operation(op_type="hypothesis", agent_id="a")
+    hgp_set_context(root_op_id=op["op_id"], agent_id="a", session_id="sess-sum")
+
+    # Plant a summary file as the hook would
+    summary = {"agent_id": "ag1", "agent_type": "Explore", "session_id": "sess-sum",
+               "hgp_op_count": 3, "completed_at": time.time()}
+    (hgp_dir / "subagent-summary-sess-sum-1000.json").write_text(json.dumps(summary))
+
+    result = hgp_get_context(session_id="sess-sum", consume_summaries=True)
+    assert "subagent_summaries" in result
+    assert result["subagent_summaries"][0]["hgp_op_count"] == 3
+    # consumed — file should be gone
+    assert not (hgp_dir / "subagent-summary-sess-sum-1000.json").exists()
+
+
+def test_get_context_no_consume(server_components):
+    hgp_dir: Path = server_components["hgp_dir"]
+    op = hgp_create_operation(op_type="hypothesis", agent_id="a")
+    hgp_set_context(root_op_id=op["op_id"], agent_id="a", session_id="sess-noconsume")
+
+    summary = {"agent_id": "ag1", "agent_type": "Explore", "session_id": "sess-noconsume",
+               "hgp_op_count": 1, "completed_at": time.time()}
+    (hgp_dir / "subagent-summary-sess-noconsume-2000.json").write_text(json.dumps(summary))
+
+    hgp_get_context(session_id="sess-noconsume", consume_summaries=False)
+    assert (hgp_dir / "subagent-summary-sess-noconsume-2000.json").exists()
+
+
+def test_reconcile_removes_stale_summary(server_components):
+    hgp_dir: Path = server_components["hgp_dir"]
+    op = hgp_create_operation(op_type="hypothesis", agent_id="a")
+    hgp_set_context(root_op_id=op["op_id"], agent_id="a", session_id="sess-stale-sum")
+
+    stale = hgp_dir / "subagent-summary-sess-stale-sum-9000.json"
+    stale.write_text(json.dumps({"completed_at": time.time() - 90000}))
+
+    result = hgp_reconcile(dry_run=False)
+    assert stale.name in result.get("stale_context_files_removed", [])
+    assert not stale.exists()

@@ -167,10 +167,13 @@ def test_update_hooks_settings_claude_includes_bash_hooks(tmp_path):
     post_entries = data["hooks"]["PostToolUse"]
     assert post_entries[0]["matcher"] == "Bash"
     assert "post_bash_hgp.py" in post_entries[0]["hooks"][0]["command"]
-    # SubagentStart is registered
+    # SubagentStart and SubagentStop are registered
     assert "SubagentStart" in hook_events
     subagent_entries = data["hooks"]["SubagentStart"]
     assert any("subagent_start_hgp.py" in h["command"] for e in subagent_entries for h in e.get("hooks", []))
+    assert "SubagentStop" in hook_events
+    stop_entries = data["hooks"]["SubagentStop"]
+    assert any("subagent_stop_hgp.py" in h["command"] for e in stop_entries for h in e.get("hooks", []))
 
 
 def test_update_hooks_settings_claude_settings_match_installed_files(tmp_path):
