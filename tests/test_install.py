@@ -228,6 +228,39 @@ def test_update_hooks_settings_claude_cleans_up_legacy_prebash(tmp_path):
     assert "PostBash" not in hook_events
 
 
+def test_update_hooks_settings_claude_warns_on_mixed_legacy_prebash(tmp_path, capsys):
+    """Reinstall warns when custom (non-HGP) entries remain under deprecated PreBash/PostBash."""
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    settings.write_text(json.dumps({
+        "hooks": {
+            "PreBash": [
+                {"matcher": "", "hooks": [{"type": "command", "command": "my_custom_prebash.sh"}]},
+                {"matcher": "", "hooks": [{"type": "command", "command": "/path/pre_bash_hgp.py"}]},
+            ],
+            "PostBash": [
+                {"matcher": "", "hooks": [{"type": "command", "command": "my_custom_postbash.sh"}]},
+                {"matcher": "", "hooks": [{"type": "command", "command": "/path/post_bash_hgp.py"}]},
+            ],
+        }
+    }))
+    _update_hooks_settings("claude", settings, hooks_dir, "global")
+    data = json.loads(settings.read_text())
+    hook_events = set(data["hooks"].keys())
+    # deprecated keys preserved because custom entries remain
+    assert "PreBash" in hook_events
+    assert "PostBash" in hook_events
+    # only custom entries survive (HGP entries removed)
+    assert all("_hgp.py" not in h["command"] for e in data["hooks"]["PreBash"] for h in e["hooks"])
+    assert all("_hgp.py" not in h["command"] for e in data["hooks"]["PostBash"] for h in e["hooks"])
+    # warning emitted to stderr
+    stderr = capsys.readouterr().err
+    assert "PreBash" in stderr
+    assert "PostBash" in stderr
+    assert "migrate manually" in stderr
+
+
 def test_update_hooks_settings_preserves_non_hgp_hooks(tmp_path):
     settings = tmp_path / "settings.json"
     hooks_dir = tmp_path / "hooks"
