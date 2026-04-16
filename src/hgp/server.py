@@ -1271,12 +1271,16 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
             p = hooks_dir / name
             return f"python3 {p}" if scope == "global" else f"python3 .claude/hooks/{name}"
 
-        # Claude Code hooks: stderr from pre hooks reaches the agent directly,
-        # so no separate PostToolUse advisory hook is needed.
+        # Claude Code hooks: PreBash/PostBash were removed; Bash lifecycle is now
+        # handled via PreToolUse/PostToolUse with matcher="Bash".
         hook_specs = {
-            "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("pre_tool_use_hgp.py")}]}],
-            "PreBash": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("pre_bash_hgp.py")}]}],
-            "PostBash": [{"matcher": "", "hooks": [{"type": "command", "command": _cmd("post_bash_hgp.py")}]}],
+            "PreToolUse": [
+                {"matcher": "", "hooks": [{"type": "command", "command": _cmd("pre_tool_use_hgp.py")}]},
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": _cmd("pre_bash_hgp.py")}]},
+            ],
+            "PostToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": _cmd("post_bash_hgp.py")}]},
+            ],
         }
     elif client == "gemini":
         def _gcmd(name: str) -> str:
@@ -1312,6 +1316,20 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
             return
 
     existing_hooks = existing.get("hooks", {})
+
+    # Remove HGP entries from deprecated event names (Claude Code removed PreBash/PostBash).
+    if client == "claude":
+        for deprecated in ("PreBash", "PostBash"):
+            if deprecated in existing_hooks:
+                cleaned = [
+                    e for e in existing_hooks[deprecated]
+                    if not any("_hgp.py" in h.get("command", "") for h in e.get("hooks", []))
+                ]
+                if cleaned:
+                    existing_hooks[deprecated] = cleaned
+                else:
+                    del existing_hooks[deprecated]
+
     for event, hgp_entries in hook_specs.items():
         # Preserve non-HGP entries; replace HGP entries in place.
         non_hgp = [

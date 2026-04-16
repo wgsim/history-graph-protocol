@@ -154,12 +154,19 @@ def test_update_hooks_settings_claude_includes_bash_hooks(tmp_path):
     _update_hooks_settings("claude", settings, hooks_dir, "global")
     data = json.loads(settings.read_text())
     hook_events = set(data["hooks"].keys())
-    assert "PreBash" in hook_events
-    assert "PostBash" in hook_events
-    pre_bash_cmd = data["hooks"]["PreBash"][0]["hooks"][0]["command"]
-    assert "pre_bash_hgp.py" in pre_bash_cmd
-    # Claude has no post_tool_use hook — PostToolUse must not be generated
-    assert "PostToolUse" not in hook_events
+    # PreBash/PostBash removed; Bash hooks now use PreToolUse/PostToolUse with matcher
+    assert "PreBash" not in hook_events
+    assert "PostBash" not in hook_events
+    assert "PreToolUse" in hook_events
+    assert "PostToolUse" in hook_events
+    # PreToolUse has two entries: one for Write/Edit (empty matcher), one for Bash
+    pre_entries = data["hooks"]["PreToolUse"]
+    bash_entry = next(e for e in pre_entries if e.get("matcher") == "Bash")
+    assert "pre_bash_hgp.py" in bash_entry["hooks"][0]["command"]
+    # PostToolUse has one Bash entry
+    post_entries = data["hooks"]["PostToolUse"]
+    assert post_entries[0]["matcher"] == "Bash"
+    assert "post_bash_hgp.py" in post_entries[0]["hooks"][0]["command"]
 
 
 def test_update_hooks_settings_claude_settings_match_installed_files(tmp_path):
@@ -200,6 +207,25 @@ def test_update_hooks_settings_claude_local_uses_relative_path(tmp_path):
     data = json.loads(settings.read_text())
     cmd = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert cmd.startswith("python3 .claude/hooks/")
+
+
+def test_update_hooks_settings_claude_cleans_up_legacy_prebash(tmp_path):
+    """Re-running install removes deprecated PreBash/PostBash HGP entries."""
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    # Simulate old installation with PreBash/PostBash
+    settings.write_text(json.dumps({
+        "hooks": {
+            "PreBash": [{"matcher": "", "hooks": [{"type": "command", "command": "/path/pre_bash_hgp.py"}]}],
+            "PostBash": [{"matcher": "", "hooks": [{"type": "command", "command": "/path/post_bash_hgp.py"}]}],
+        }
+    }))
+    _update_hooks_settings("claude", settings, hooks_dir, "global")
+    data = json.loads(settings.read_text())
+    hook_events = set(data["hooks"].keys())
+    assert "PreBash" not in hook_events
+    assert "PostBash" not in hook_events
 
 
 def test_update_hooks_settings_preserves_non_hgp_hooks(tmp_path):
