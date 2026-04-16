@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -76,6 +77,24 @@ def test_get_context_no_file(server_components):
 def test_set_context_unknown_op(server_components):
     result = hgp_set_context(root_op_id="op-nonexistent", agent_id="a", session_id="sess-x")
     assert result["error"] == "OP_NOT_FOUND"
+
+
+def test_set_context_advisory_mode_blocked(server_components):
+    with patch("hgp.server._read_mode", return_value="advisory"):
+        result = hgp_set_context(root_op_id="op-x", agent_id="a", session_id="sess-adv")
+    assert result["status"] == "HGP_ADVISORY"
+
+
+def test_set_context_off_mode_blocked(server_components):
+    with patch("hgp.server._read_mode", return_value="off"):
+        result = hgp_set_context(root_op_id="op-x", agent_id="a", session_id="sess-off")
+    assert result["status"] == "HGP_DISABLED"
+
+
+def test_get_context_off_mode_blocked(server_components):
+    with patch("hgp.server._read_mode", return_value="off"):
+        result = hgp_get_context(session_id="sess-off")
+    assert result["status"] == "HGP_DISABLED"
 
 
 def test_concurrent_sessions_no_collision(server_components):
@@ -251,6 +270,31 @@ def test_stop_hook_zero_ops(tmp_path):
     assert json.loads(summaries[0].read_text())["hgp_op_count"] == 0
 
 
+def test_stop_hook_concurrent_no_collision(tmp_path):
+    """Two SubagentStop events in the same second must produce two distinct files."""
+    hgp_dir = tmp_path / ".hgp"
+    hgp_dir.mkdir()
+    (tmp_path / ".git").mkdir()
+
+    transcript = tmp_path / "agent.jsonl"
+    _make_transcript(transcript, [])
+
+    event = {
+        "hook_event_name": "SubagentStop",
+        "session_id": "sess-concurrent",
+        "agent_id": "agent-1",
+        "agent_type": "general-purpose",
+        "agent_transcript_path": str(transcript),
+        "cwd": str(tmp_path),
+    }
+    _run_hook(event, cwd=tmp_path, script=STOP_HOOK)
+    event2 = {**event, "agent_id": "agent-2"}
+    _run_hook(event2, cwd=tmp_path, script=STOP_HOOK)
+
+    summaries = list(hgp_dir.glob("subagent-summary-sess-concurrent-*.json"))
+    assert len(summaries) == 2, f"expected 2 summary files, got {len(summaries)}"
+
+
 def test_stop_hook_wrong_event_is_silent(tmp_path):
     event = {"hook_event_name": "SubagentStart", "session_id": "x", "cwd": str(tmp_path)}
     rc, stdout, _ = _run_hook(event, cwd=tmp_path, script=STOP_HOOK)
@@ -266,13 +310,14 @@ def test_get_context_returns_summaries(server_components):
     # Plant a summary file as the hook would
     summary = {"agent_id": "ag1", "agent_type": "Explore", "session_id": "sess-sum",
                "hgp_op_count": 3, "completed_at": time.time()}
-    (hgp_dir / "subagent-summary-sess-sum-1000.json").write_text(json.dumps(summary))
+    summary_file = hgp_dir / "subagent-summary-sess-sum-1000-abcd1234.json"
+    summary_file.write_text(json.dumps(summary))
 
     result = hgp_get_context(session_id="sess-sum", consume_summaries=True)
     assert "subagent_summaries" in result
     assert result["subagent_summaries"][0]["hgp_op_count"] == 3
     # consumed — file should be gone
-    assert not (hgp_dir / "subagent-summary-sess-sum-1000.json").exists()
+    assert not summary_file.exists()
 
 
 def test_get_context_no_consume(server_components):
@@ -282,10 +327,11 @@ def test_get_context_no_consume(server_components):
 
     summary = {"agent_id": "ag1", "agent_type": "Explore", "session_id": "sess-noconsume",
                "hgp_op_count": 1, "completed_at": time.time()}
-    (hgp_dir / "subagent-summary-sess-noconsume-2000.json").write_text(json.dumps(summary))
+    summary_file = hgp_dir / "subagent-summary-sess-noconsume-2000-deadbeef.json"
+    summary_file.write_text(json.dumps(summary))
 
     hgp_get_context(session_id="sess-noconsume", consume_summaries=False)
-    assert (hgp_dir / "subagent-summary-sess-noconsume-2000.json").exists()
+    assert summary_file.exists()
 
 
 def test_reconcile_removes_stale_summary(server_components):
@@ -293,7 +339,7 @@ def test_reconcile_removes_stale_summary(server_components):
     op = hgp_create_operation(op_type="hypothesis", agent_id="a")
     hgp_set_context(root_op_id=op["op_id"], agent_id="a", session_id="sess-stale-sum")
 
-    stale = hgp_dir / "subagent-summary-sess-stale-sum-9000.json"
+    stale = hgp_dir / "subagent-summary-sess-stale-sum-9000-cafebabe.json"
     stale.write_text(json.dumps({"completed_at": time.time() - 90000}))
 
     result = hgp_reconcile(dry_run=False)

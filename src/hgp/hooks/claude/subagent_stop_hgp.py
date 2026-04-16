@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, cast
 
@@ -81,7 +82,8 @@ def main() -> None:
     }
 
     ts = int(time.time())
-    summary_path = hgp_dir / f"subagent-summary-{session_id}-{ts}.json"
+    uid = uuid.uuid4().hex[:8]
+    summary_path = hgp_dir / f"subagent-summary-{session_id}-{ts}-{uid}.json"
     try:
         summary_path.write_text(json.dumps(summary), encoding="utf-8")
     except OSError:

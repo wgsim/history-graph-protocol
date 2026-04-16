@@ -557,6 +557,8 @@ def hgp_set_context(root_op_id: str, agent_id: str, session_id: str) -> dict[str
     Writes .hgp/context-{session_id}.json.  Safe under concurrent sessions —
     each session writes its own file.
     """
+    if (early := _check_mode(mutation=True)) is not None:
+        return early
     ctx = _get_context()
     if not ctx.db.get_operation(root_op_id):
         return {"error": "OP_NOT_FOUND", "message": f"root_op_id not found: {root_op_id!r}"}
@@ -580,6 +582,8 @@ def hgp_get_context(session_id: str, consume_summaries: bool = True) -> dict[str
     {status: "no_context"}.  When consume_summaries=True (default), summary
     files are deleted after reading so they are not returned twice.
     """
+    if (early := _check_mode(mutation=False)) is not None:
+        return early
     ctx = _get_context()
     hgp_dir = _hgp_dir_from_ctx(ctx)
     path = _context_file_path(hgp_dir, session_id)
