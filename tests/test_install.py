@@ -254,11 +254,13 @@ def test_update_hooks_settings_claude_warns_on_mixed_legacy_prebash(tmp_path, ca
     # only custom entries survive (HGP entries removed)
     assert all("_hgp.py" not in h["command"] for e in data["hooks"]["PreBash"] for h in e["hooks"])
     assert all("_hgp.py" not in h["command"] for e in data["hooks"]["PostBash"] for h in e["hooks"])
-    # warning emitted to stderr
+    # warning emitted to stderr with correct destination event per deprecated event
     stderr = capsys.readouterr().err
-    assert "PreBash" in stderr
-    assert "PostBash" in stderr
-    assert "migrate manually" in stderr
+    assert "PreBash" in stderr and "PreToolUse" in stderr
+    assert "PostBash" in stderr and "PostToolUse" in stderr
+    # PostBash must not incorrectly point to PreToolUse
+    post_bash_line = next(l for l in stderr.splitlines() if "PostBash" in l)
+    assert "PreToolUse" not in post_bash_line
 
 
 def test_update_hooks_settings_preserves_non_hgp_hooks(tmp_path):

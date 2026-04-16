@@ -1319,8 +1319,9 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
 
     # Remove HGP entries from deprecated event names (Claude Code removed PreBash/PostBash).
     # Warn if non-HGP custom entries remain — those are dead config that the user must migrate.
+    _deprecated_event_map = {"PreBash": "PreToolUse", "PostBash": "PostToolUse"}
     if client == "claude":
-        for deprecated in ("PreBash", "PostBash"):
+        for deprecated, replacement in _deprecated_event_map.items():
             if deprecated in existing_hooks:
                 cleaned = [
                     e for e in existing_hooks[deprecated]
@@ -1337,7 +1338,7 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
                     cmds_str = ", ".join(custom_cmds) if custom_cmds else f"{len(cleaned)} entry/entries"
                     print(
                         f"  ⚠ deprecated Claude hook event \"{deprecated}\" has {len(cleaned)} custom "
-                        f"entry/entries that Claude Code no longer fires — migrate manually to PreToolUse:\n"
+                        f"entry/entries that Claude Code no longer fires — migrate manually to {replacement}:\n"
                         f"    {cmds_str}",
                         file=sys.stderr,
                     )
