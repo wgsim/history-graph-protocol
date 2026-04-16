@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -536,14 +537,92 @@ def hgp_anchor_git(
     return {"anchored": True, "op_id": op_id, "git_commit_sha": git_commit_sha}
 
 
+_CONTEXT_FILE_TTL_SECONDS = 86400  # 24 hours
+
+
+def _context_file_path(hgp_dir: Path, session_id: str) -> Path:
+    return hgp_dir / f"context-{session_id}.json"
+
+
+def _hgp_dir_from_ctx(ctx: HGPContext) -> Path:
+    if ctx.project_root is not None:
+        return ctx.project_root / ".hgp"
+    return Path.home() / ".hgp"
+
+
+@mcp.tool()
+def hgp_set_context(root_op_id: str, agent_id: str, session_id: str) -> dict[str, Any]:
+    """Store a session root op so SubagentStart hooks can propagate it to subagents.
+
+    Writes .hgp/context-{session_id}.json.  Safe under concurrent sessions —
+    each session writes its own file.
+    """
+    ctx = _get_context()
+    if not ctx.db.get_operation(root_op_id):
+        return {"error": "OP_NOT_FOUND", "message": f"root_op_id not found: {root_op_id!r}"}
+    hgp_dir = _hgp_dir_from_ctx(ctx)
+    data = {
+        "root_op_id": root_op_id,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "set_at": time.time(),
+    }
+    path = _context_file_path(hgp_dir, session_id)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return {"status": "ok", "root_op_id": root_op_id, "session_id": session_id}
+
+
+@mcp.tool()
+def hgp_get_context(session_id: str) -> dict[str, Any]:
+    """Read the session root op stored by hgp_set_context.
+
+    Returns {root_op_id, agent_id, age_seconds} or {status: "no_context"}.
+    """
+    ctx = _get_context()
+    path = _context_file_path(_hgp_dir_from_ctx(ctx), session_id)
+    if not path.exists():
+        return {"status": "no_context"}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"error": "READ_ERROR", "message": str(exc)}
+    age = time.time() - data.get("set_at", 0)
+    return {
+        "root_op_id": data["root_op_id"],
+        "agent_id": data.get("agent_id", ""),
+        "session_id": session_id,
+        "age_seconds": int(age),
+    }
+
+
 @mcp.tool()
 def hgp_reconcile(dry_run: bool = False) -> dict[str, Any]:
-    """Run crash recovery reconciler."""
+    """Run crash recovery reconciler; also removes stale session context files (>24 h)."""
     if (early := _check_mode(mutation=True)) is not None:
         return early
-    reconciler = _get_context().reconciler
+    ctx = _get_context()
+    reconciler = ctx.reconciler
     report = reconciler.reconcile(dry_run=dry_run)
-    return report.model_dump()
+
+    # Clean up stale context-{session_id}.json files
+    hgp_dir = _hgp_dir_from_ctx(ctx)
+    now = time.time()
+    removed: list[str] = []
+    for p in hgp_dir.glob("context-*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            age = now - data.get("set_at", 0)
+            if age > _CONTEXT_FILE_TTL_SECONDS:
+                if not dry_run:
+                    p.unlink(missing_ok=True)
+                removed.append(p.name)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    result = report.model_dump()
+    if removed:
+        result["stale_context_files_removed"] = removed
+    return result
 
 
 @mcp.tool()
@@ -1232,6 +1311,22 @@ action and decision.
 
 Record `hypothesis` operations for decisions, `artifact` for outputs,
 `invalidation` when superseding prior work.
+
+## Session Context (Subagent Support)
+
+To propagate HGP context to spawned subagents, register a session root op at
+the start of each session:
+
+```
+root = hgp_create_operation(op_type="hypothesis", agent_id="claude-code",
+                            metadata={"description": "session root"})
+hgp_set_context(root_op_id=root["op_id"], agent_id="claude-code",
+                session_id="<session_id from SubagentStart/SubagentStop hook event>")
+```
+
+SubagentStart hooks will then inject the root op_id into every spawned
+subagent's context automatically. Subagents should use
+`parent_op_ids=[root_op_id]` for all `hgp_*` calls.
 <!-- hgp-instructions-end -->"""
 
 
@@ -1280,6 +1375,9 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
             ],
             "PostToolUse": [
                 {"matcher": "Bash", "hooks": [{"type": "command", "command": _cmd("post_bash_hgp.py")}]},
+            ],
+            "SubagentStart": [
+                {"matcher": "", "hooks": [{"type": "command", "command": _cmd("subagent_start_hgp.py")}]},
             ],
         }
     elif client == "gemini":
