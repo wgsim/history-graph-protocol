@@ -80,13 +80,27 @@ Given any decision, you can reconstruct exactly what evidence it was based on an
 
 ## Installation
 
-**Prerequisites:** Python ≥ 3.12, [uv](https://docs.astral.sh/uv/)
+**Prerequisites:** Python ≥ 3.12
 
 ```bash
 pip install history-graph-protocol
 ```
 
 > The PyPI package is `history-graph-protocol`; the installed CLI command is `hgp`.
+
+Verify the CLI is available before proceeding:
+
+```bash
+hgp --version
+```
+
+If the command is not found, the package was installed in a Python environment whose `bin/` is not on your `PATH`. Use the module form instead:
+
+```bash
+python -m hgp --version   # use the same Python that ran pip install
+```
+
+> If using a virtual environment, activate it first — all subsequent `hgp` commands must run in the same environment.
 
 ### One-command setup
 
@@ -104,9 +118,33 @@ hgp install --codex    # Codex only
 hgp install --local    # project-local scope instead of global
 ```
 
-After running, restart your client and verify HGP tools are available.
+`hgp install` prints a step-by-step report. Each line starts with `✓` (success) or `✗` (skipped/failed):
+
+```
+Claude Code:
+  ✓ MCP: registered
+  ✓ hooks files: installed 3 file(s) → /Users/you/.claude/hooks
+  ✓ hooks settings: updated
+  ✓ instructions: injected
+```
+
+A `✗` line includes a reason (e.g. `claude CLI not found — skipping MCP registration`). All `✓` lines mean the install succeeded for that client.
+
+**Verify config files were written** (no client restart needed for this check):
+
+| Client | Hooks dir | MCP config written by |
+|---|---|---|
+| Claude Code | `~/.claude/hooks/` | `claude mcp add` (via CLI) |
+| Gemini CLI | `~/.gemini/hooks/` | `gemini mcp add` (via CLI) |
+| Codex | `~/.codex/hooks/` | `~/.codex/config.toml` |
+
+For local scope (`--local`), paths are under `<repo_root>/.claude/`, `<repo_root>/.gemini/`, or `<repo_root>/.codex/` respectively.
+
+**Restart your client** to load the newly registered MCP server. This requires human action — an AI agent cannot restart its own host process. After restarting, the HGP tools (`hgp_write_file`, `hgp_create_operation`, etc.) will appear in the tool list.
 
 ### Manual setup
+
+> **Python path:** In all commands below, `python` must be the Python that has `history-graph-protocol` installed. Find the correct path with `python -c "import sys; print(sys.executable)"` (after activating your venv if applicable), then substitute it for `python` throughout.
 
 <details>
 <summary>Configure without hgp install</summary>
