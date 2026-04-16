@@ -259,7 +259,7 @@ def test_update_hooks_settings_claude_warns_on_mixed_legacy_prebash(tmp_path, ca
     assert "PreBash" in stderr and "PreToolUse" in stderr
     assert "PostBash" in stderr and "PostToolUse" in stderr
     # PostBash must not incorrectly point to PreToolUse
-    post_bash_line = next(l for l in stderr.splitlines() if "PostBash" in l)
+    post_bash_line = next(line for line in stderr.splitlines() if "PostBash" in line)
     assert "PreToolUse" not in post_bash_line
 
 
