@@ -88,17 +88,14 @@ pip install history-graph-protocol
 
 > The PyPI package is `history-graph-protocol`; the installed CLI command is `hgp`.
 
-Verify the CLI is available before proceeding:
+Verify the install before proceeding:
 
 ```bash
-hgp --version
+command -v hgp                                    # confirms hgp is on PATH
+python -c "import hgp; print(hgp.__version__)"   # confirms the package is importable
 ```
 
-If the command is not found, the package was installed in a Python environment whose `bin/` is not on your `PATH`. Use the module form instead:
-
-```bash
-python -m hgp --version   # use the same Python that ran pip install
-```
+If `command -v hgp` prints nothing, the package was installed in a Python environment whose `bin/` is not on your `PATH`. Activate the virtual environment first, then re-run the checks.
 
 > If using a virtual environment, activate it first — all subsequent `hgp` commands must run in the same environment.
 
