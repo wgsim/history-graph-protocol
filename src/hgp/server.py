@@ -1421,10 +1421,14 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
             return f"python3 {p}" if scope == "global" else f"python3 .gemini/hooks/{name}"
 
         hook_specs = {
-            "BeforeTool": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("pre_tool_use_hgp.py")}]}],
-            "AfterTool": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("post_tool_use_hgp.py")}]}],
-            "BeforeShell": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("pre_bash_hgp.py")}]}],
-            "AfterShell": [{"matcher": "", "hooks": [{"type": "command", "command": _gcmd("post_bash_hgp.py")}]}],
+            "BeforeTool": [{"matcher": "", "hooks": [
+                {"type": "command", "command": _gcmd("pre_tool_use_hgp.py")},
+                {"type": "command", "command": _gcmd("pre_bash_hgp.py")},
+            ]}],
+            "AfterTool": [{"matcher": "", "hooks": [
+                {"type": "command", "command": _gcmd("post_tool_use_hgp.py")},
+                {"type": "command", "command": _gcmd("post_bash_hgp.py")},
+            ]}],
         }
     elif client == "codex":
         def _xdcmd(name: str) -> str:

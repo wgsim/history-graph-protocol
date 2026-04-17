@@ -320,8 +320,14 @@ def test_update_hooks_settings_gemini_global(tmp_path):
     data = json.loads(settings.read_text())
     assert "BeforeTool" in data["hooks"]
     assert "AfterTool" in data["hooks"]
-    assert "BeforeShell" in data["hooks"]
-    assert "AfterShell" in data["hooks"]
+    assert "BeforeShell" not in data["hooks"]
+    assert "AfterShell" not in data["hooks"]
+    before_cmds = [h["command"] for h in data["hooks"]["BeforeTool"][0]["hooks"]]
+    assert any("pre_tool_use_hgp.py" in c for c in before_cmds)
+    assert any("pre_bash_hgp.py" in c for c in before_cmds)
+    after_cmds = [h["command"] for h in data["hooks"]["AfterTool"][0]["hooks"]]
+    assert any("post_tool_use_hgp.py" in c for c in after_cmds)
+    assert any("post_bash_hgp.py" in c for c in after_cmds)
 
 
 def test_update_hooks_settings_codex_global(tmp_path):
