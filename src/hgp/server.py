@@ -1482,6 +1482,21 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
                 else:
                     del existing_hooks[deprecated]
 
+    if client == "gemini":
+        # BeforeShell/AfterShell were never valid Gemini CLI event names; remove any
+        # stale HGP entries that may have been written by earlier versions of hgp install.
+        for invalid in ("BeforeShell", "AfterShell"):
+            if invalid not in existing_hooks:
+                continue
+            cleaned = [
+                e for e in existing_hooks[invalid]
+                if not any("_hgp.py" in h.get("command", "") for h in e.get("hooks", []))
+            ]
+            if cleaned:
+                existing_hooks[invalid] = cleaned
+            else:
+                del existing_hooks[invalid]
+
     for event, hgp_entries in hook_specs.items():
         # Preserve non-HGP entries; replace HGP entries in place.
         non_hgp = [

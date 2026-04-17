@@ -330,6 +330,26 @@ def test_update_hooks_settings_gemini_global(tmp_path):
     assert any("post_bash_hgp.py" in c for c in after_cmds)
 
 
+def test_update_hooks_settings_gemini_removes_stale_shell_events(tmp_path):
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    # Simulate stale settings written by an older hgp version
+    stale = {
+        "hooks": {
+            "BeforeShell": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 /x/pre_bash_hgp.py"}]}],
+            "AfterShell": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 /x/post_bash_hgp.py"}]}],
+        }
+    }
+    settings.write_text(json.dumps(stale))
+    _update_hooks_settings("gemini", settings, hooks_dir, "global")
+    data = json.loads(settings.read_text())
+    assert "BeforeShell" not in data["hooks"]
+    assert "AfterShell" not in data["hooks"]
+    assert "BeforeTool" in data["hooks"]
+    assert "AfterTool" in data["hooks"]
+
+
 def test_update_hooks_settings_codex_global(tmp_path):
     settings = tmp_path / "hooks.json"
     hooks_dir = tmp_path / "hooks"
