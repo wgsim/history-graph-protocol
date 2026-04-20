@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+from typing import cast
 
 # ── Read-only command prefixes — skip pattern matching for these ──────────────
 _READONLY_PREFIXES = (
@@ -111,11 +112,16 @@ def main() -> None:
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)
 
-    if event.get("tool_name") != "Bash":
+    if not isinstance(event, dict):
+        sys.exit(0)
+    event_typed = cast(dict[str, object], event)
+    if event_typed.get("tool_name") != "Bash":
         sys.exit(0)
 
-    tool_input = event.get("tool_input") or {}
-    command: str = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+    tool_input_raw = event_typed.get("tool_input")
+    tool_input = cast(dict[str, object], tool_input_raw) if isinstance(tool_input_raw, dict) else {}
+    cmd_raw = tool_input.get("command", "")
+    command: str = cmd_raw if isinstance(cmd_raw, str) else ""
     if not command or _is_readonly(command):
         sys.exit(0)
 
