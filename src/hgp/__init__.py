@@ -1,5 +1,8 @@
 """History Graph Protocol — crash-resilient semantic layer over MCP."""
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
-__version__ = version("history-graph-protocol")
+try:
+    __version__ = version("history-graph-protocol")
+except PackageNotFoundError:
+    __version__ = "unknown"
