@@ -1,6 +1,6 @@
 [project]
 name = "history-graph-protocol"
-version = "0.4.1"
+version = "0.4.2"
 description = "An MCP server that gives AI agents a permanent, append-only causal history"
 readme = "README.md"
 license = { text = "MIT" }

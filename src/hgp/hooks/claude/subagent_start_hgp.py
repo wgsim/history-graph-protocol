@@ -3,6 +3,8 @@
 Reads .hgp/context-{session_id}.json written by hgp_set_context, then outputs
 additionalContext so the subagent knows which parent_op_ids to use.
 """
+from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path

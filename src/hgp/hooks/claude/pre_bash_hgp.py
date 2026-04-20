@@ -9,6 +9,8 @@ Post-Bash hook can run 'git status' to report actual changes.
 
 Marker file: /tmp/.hgp_bash_mutating_<ppid>
 """
+from __future__ import annotations
+
 import json
 import os
 import re
