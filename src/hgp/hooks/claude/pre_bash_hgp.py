@@ -114,7 +114,8 @@ def main() -> None:
     if event.get("tool_name") != "Bash":
         sys.exit(0)
 
-    command: str = event.get("tool_input", {}).get("command", "")
+    tool_input = event.get("tool_input") or {}
+    command: str = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
     if not command or _is_readonly(command):
         sys.exit(0)
 
