@@ -58,25 +58,28 @@ We will update the core path resolver to understand Git Worktrees and Submodules
 #### [MODIFY] [project.py](../src/hgp/project.py)
 * Refactor `find_project_root()` and path verification helpers:
   * **Strict Path Canonicalization & Containment Check**:
-    * Any input path (relative or absolute) must be treated as untrusted and resolved using Python's `Path.resolve(strict=True)` to eliminate symlinks and directory traversal segments (`..`).
-    * **Dual Canonicalization**: Store the active `working_tree_root` as an absolute, canonical path at session initialization. Before comparing containment, resolve the target file path canonically as well.
+    * Any input path (relative or absolute) must be treated as untrusted.
+    * **Non-existent Target Path Resolution**: For existing paths, resolve strictly using Python's `Path.resolve(strict=True)`. For non-existent files (new target paths), resolve the existing parent chain strictly (`Path.parent.resolve(strict=True)`), validate containment of the resolved parent directory against `working_tree_root`, and join the final leaf filename without requiring the leaf to pre-exist.
+    * **Dual Canonicalization**: Store the active `working_tree_root` as an absolute, canonical path at session initialization. Before comparing containment, resolve the target file path (or its parent for new files) canonically as well.
     * **Prefix-Bypass Prevention (Boundary Check)**: Assert path containment using `os.path.commonpath([canonical_root, canonical_path]) == canonical_root` to prevent sibling directory bypasses.
-    * **Worktree Relative Storage**: Store all tracked file paths in the HGP database relative to the active `working_tree_root` (or as a `(worktree_id, relative_path)` tuple) to ensure database portability if the project is moved or renamed.
+    * **One Canonical File Identity Schema**: To ensure that cross-worktree history naturally converges, formally standardize on storing all tracked file paths in the HGP database as a **repo-relative path** (relative to the active `working_tree_root`). Do not key by `worktree_id`, as this would fragment file history across worktrees.
   * **Worktree Path Authority vs Storage Root Separation**:
     * Separate `storage_root` (the shared HGP database location, i.e. parent of the main `.git/` folder) from `working_tree_root` (the current active checkout directory).
     * Limit file mutations strictly to the active `working_tree_root` boundary, while merging and storing operation logs inside the shared `storage_root`.
   * **Symlink Escape Guard (`PATH_SYMLINK_ESCAPE`)**:
     * If a target path is inside the project root directory but resolves to a symlink pointing *outside* the root, mutating file operations must immediately fail and throw `PATH_SYMLINK_ESCAPE`.
+    * **TOCTOU Symlink Race Hardening**: All mutating writes must use the atomic `os.O_NOFOLLOW` flag during file handles/open operations to fail atomically if a symlink swap occurs at execution time.
   * **Git Pointer Verification (Relative Traversals)**:
     * When a `.git` path is found:
       * If it is a directory: Return the parent directory (standard repository root).
       * If it is a file (pointer):
         * Read and parse the `gitdir: ...` declaration.
-        * To prevent path traversal attacks inside the `.git` pointer, resolve the declared `gitdir` path relative to the pointer file's parent directory and canonically verify it.
-        * **Submodule Check**: If the resolved path contains `/modules/`, treat the directory containing the `.git` file as the project root (submodule boundary). Do not merge submodule history into the parent database. Parent operations cannot traverse across submodule boundaries (`PATH_CROSSES_SUBMODULE_BOUNDARY`).
-        * **Worktree Check**: If the resolved path contains `/worktrees/`:
+        * **Absolute Pointer Handling**: If the parsed `gitdir` is an absolute path, consume it as-is. If relative, resolve the `gitdir` path relative to the `.git` pointer file's parent directory and canonically verify it.
+        * **Structural Path Component Matching**: Do not use fragile substring tests (`/modules/` or `/worktrees/`). Instead, inspect canonical path components strictly using `Path.parts`.
+        * **Submodule Check**: A submodule is structurally detected if `'modules'` and `'.git'` are in the `gitdir_path.parts`. Treat the directory containing the `.git` file as the project root (submodule boundary). Do not merge submodule history into the parent database. Parent operations cannot traverse across submodule boundaries (`PATH_CROSSES_SUBMODULE_BOUNDARY`).
+        * **Worktree Check**: A worktree is structurally detected if the parsed pointer directory resides within the main repository's `.git/worktrees/` directory:
           * Read the `commondir` file inside the resolved `gitdir` directory.
-          * Parse and canonically resolve `commondir` (relative to `gitdir`) to locate the main `.git` directory, avoiding any directory traversals out of bounds.
+          * Parse and canonically resolve `commondir` (relative to `gitdir` if relative, or as-is if absolute) to locate the main `.git` directory, avoiding any directory traversals out of bounds.
           * The parent of the resolved main `.git` directory is the canonical main repository root. Return this as the HGP root.
         * Fall back gracefully to standard parent directory or throw `UNSUPPORTED_GIT_LAYOUT` if parsing fails.
 * Ensure all paths are validated against this resolved canonical main repository root.
@@ -91,8 +94,8 @@ We will rewrite the hook templates to be extremely lightweight, fail-open, and w
 > **Defensive Security Boundary & Guarantees**
 > - **Global Session Hooks (Advisory Observer Contract)**: These hooks act strictly as **best-effort, advisory observers**. Their job is to record environment context without interfering with the user's workflow. 
 >   * **Zero-Latency Fail-Open**: If a hook encounters a locked database, missing `.hgp/` folder, permission error, or syntax crash, it must silently swallow the error and `sys.exit(0)`.
->   * **Telemetry Dead-Letter Logging**: On failure, the hook will append a single-line error summary to `~/.hgp/hook_errors.log`. To prevent locking or freezing in degraded environment mounts (e.g. NFS/SMB home dirs), this append **must** use raw OS-level unbuffered writes (`os.open` with `os.O_WRONLY | os.O_CREAT | os.O_APPEND`) wrapped in a strict, non-blocking `try...except` block with a 5ms timeout. If this append fails or times out, the error is swallowed and the hook exits 0 immediately.
->   * **Log Size Bounding**: The HGP CLI will bound the growth of `hook_errors.log` (truncating it to a maximum of 1,000 lines or 1MB) during routine CLI commands.
+>   * **Telemetry Dead-Letter Logging**: On failure, the hook will append a single-line error summary to `~/.hgp/hook_errors.log`. To prevent locking or freezing in degraded environment mounts (e.g. NFS/SMB home dirs), this append **must** use raw OS-level unbuffered writes (`os.open` with `os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK`) wrapped in a strict, non-blocking `try...except` block with a short sleep-retry loop (3–5 attempts, 1ms sleep), falling back to silent discard after 10ms total execution time. If this append fails or times out, the error is swallowed and the hook exits 0 immediately.
+>   * **Log Size Bounding & Rotation Trigger**: Growth of `hook_errors.log` (truncating it to a maximum of 1,000 lines or 1MB) is checked and rotated during *any* CLI command that reads from or interacts with the project root (such as `hgp status`, `hgp init`, or tool invocations).
 > - **HGP Mutating Tools (Fail-Closed Contract)**: Standard file writing, editing, appending, and deleting tools (`hgp_write_file`, `hgp_edit_file`, etc.) must be **fail-closed**. If HGP is missing `.hgp/`, locked, or corrupt, these tools will raise explicit, typed exceptions (e.g. `HGP_NOT_INITIALIZED`) to prevent silent, untracked changes.
 
 #### [MODIFY] [pre_tool_use_hgp.py](../src/hgp/hooks/claude/pre_tool_use_hgp.py)
@@ -101,7 +104,7 @@ We will rewrite the hook templates to be extremely lightweight, fail-open, and w
 * Ensure only lightweight Python standard library packages are imported (`sys`, `os`, `json`, `pathlib`).
 * **Optimized Two-Step Check**:
   * Check 1: Verify if the resolved project root contains `.hgp/`. If missing, immediately `sys.exit(0)` (no-op).
-  * Check 2: If `.hgp/` exists, read `.hgp/hook-policy` to determine block/advisory settings.
+  * Check 2: If `.hgp/` exists, read `.hgp/hook-policy` (a strict JSON schema: `{ "block_mode": false, "telemetry_enabled": true }` created during `hgp init`) to determine block/advisory settings.
 * In the `except Exception` block, silently exit with `0` (fail-open) so the user's tool execution is never blocked.
 
 #### [MODIFY] [pre_bash_hgp.py](../src/hgp/hooks/claude/pre_bash_hgp.py)
@@ -127,17 +130,18 @@ We will modify the HGP server to prevent implicit database creation and robustly
 * Modify the `CROSS_REPO_OPERATION` check to allow files residing in separate Git Worktrees of the same common repository to share the same canonical HGP store.
 * **SQLite Concurrency & Safety Controls**:
   * **WAL (Write-Ahead Logging) Mode**: Enable WAL mode during database connection initialization.
-    * *NFS/SMB Preflight Write Test*: Some network filesystems fail only during actual write operations in WAL mode rather than the pragma command itself. HGP will execute a tiny write transaction immediately after requesting WAL mode. If this fails or raises `sqlite3.OperationalError`, the connection will immediately fall back to Rollback Journal mode (`PRAGMA journal_mode=TRUNCATE`).
-    * *Fallback Caching*: Upon fallback, HGP will write a local diagnostic flag (`.hgp/nfs_mode`) inside the storage directory. Subsequent connection bootstraps will check for this flag and bypass the WAL pragma attempt entirely, avoiding startup latency.
+    * *NFS/SMB Preflight Write Test*: Some network filesystems fail only during actual write operations in WAL mode rather than the pragma command itself. HGP will execute a tiny write transaction immediately after requesting WAL mode (specifically, a single INSERT of a sentinel row into a reserved `__hgp_wal_test__` table, followed by an immediate ROLLBACK on success). If this write test fails or raises `sqlite3.OperationalError`, the connection will immediately fall back to Rollback Journal mode (`PRAGMA journal_mode=TRUNCATE`).
+    * *Fallback Caching & 24-Hour Expiration*: Upon fallback, HGP will write a local diagnostic JSON cache file (`.hgp/nfs_mode` containing: `{ "journal_mode": "TRUNCATE", "timestamp": "ISO_TIMESTAMP", "project_root": "CANONICAL_PATH" }`) inside the `.hgp` directory. Subsequent connection bootstraps will check for this flag and bypass the WAL pragma attempt entirely. This cache will automatically expire and trigger a re-probe after 24 hours, if the project is relocated, or if manually cleared via HGP CLI.
   * **Transactional Safety**: Wrap all write operations (creating operations and recording edges) in atomic transactions using SQLite's `BEGIN IMMEDIATE` to prevent multi-worktree race conditions.
   * **C-Level Connection Queueing**: Set SQLite's native `PRAGMA busy_timeout = 2000` (2 seconds) to cleanly queue and serialize concurrent operations at the SQLite engine level before raising lock errors.
-  * **Retry-with-Backoff**: Use a jittered Python-level exponential backoff retry mechanism (retrying for up to 2 seconds) only as a last-resort fail-closed guard for extended deadlocks that exceed the native connection timeout.
+  * **Python Retry-with-Backoff Cap**: Use a jittered Python-level exponential backoff retry mechanism (capped at **1 second** total wait duration) only as a last-resort fail-closed guard for extended deadlocks that exceed the native 2-second SQLite timeout.
   * **SQL Identifier Allowlists**: Enforce strict compile-time white-lists (e.g. using `Tables` and `Columns` Python `Enum` values) for any dynamic SQL identifiers that cannot be parameterized.
 * **CAS (Blob Storage) Concurrency & Atomicity**:
   * **Atomic Write-Replace Pattern**: All tracked blob/artifact file mutations in `.hgp_content/` must be written atomically.
-    * *Same-Directory Temp Files*: Write blobs to a temporary file in the *exact same directory* as the target file, ensuring that the final `os.replace()` / `os.rename()` is a filesystem metadata atomic operation rather than a cross-device copy.
+    * *Same-Directory Temp Files & UUID Naming*: Write blobs to a temporary file named `[target_filename].hgp-[UUID]-temp` in the *exact same directory* as the target file, ensuring that the final `os.replace()` / `os.rename()` is a filesystem metadata atomic operation rather than a cross-device copy.
     * *Exclusive File Handles*: Open the temporary file using `os.open()` with `os.O_CREAT | os.O_EXCL | os.O_WRONLY` and tight permissions (`0o600` - readable only by owner) to prevent TOCTOU symlink races and unauthorized access.
-    * *Permission Cloning*: Copy the filesystem permissions (`os.chmod`) from the original file (if it exists) to the temporary file before the atomic rename to prevent privilege changes or permission degradation.
+    * *Permission Cloning & New File Fallbacks*: Copy the filesystem permissions (`os.chmod`) from the original file (if it exists) to the temporary file before the atomic rename. If it is a new file creation, use **`0o644`** (user read/write, group/other read) as the default fallback permission.
+    * *Stale Temp File Cleanup*: Stale temp files matching `*.hgp-*-temp` that are older than 24 hours will be scanned and cleaned up during any routine HGP CLI execution.
 * **Observability**:
   * Expose the active SQLite journal mode (WAL vs TRUNCATE) in `hgp status` to make file-system capability fallbacks transparent and easily inspectable.
 
@@ -157,8 +161,9 @@ We will update the system rules injected into the agent's context and establish 
     * If `No`: Append the project path to `~/.hgp/ignore_list` and disable HGP for the session.
 * **Onboarding & ignore_list Guardrails**:
   * **Critical Path Exclusions**: Explicitly forbid adding critical system paths (such as `.git/`, `.hgp/`, Git Hook scripts, HGP configuration homes, or ancestor folders thereof) to the `ignore_list`.
-  * **Absolute Canonical Storage**: All paths stored in `ignore_list` must be canonical absolute project paths (resolved via `Path.resolve()`), de-duplicated, and lowercase-normalized on case-insensitive filesystems.
-  * **Safe Concurrency & Locking**: Writing or updating the `ignore_list` must utilize a non-blocking `fcntl.flock` (using `LOCK_EX | LOCK_NB` on Unix, with a fallback atomic lock file on Windows) with a short 50ms retry loop. The update itself must follow the write-to-temp + atomic rename pattern to ensure the file is never corrupted under parallel bootstrapping sessions. If locking fails after 50ms, the hook must fail-open to prevent hanging the CLI session.
+  * **Case-Insensitive Filesystem Detection & Normalization**: Automatically detect case-insensitivity (using OS-specific checks, e.g. checking filesystem types via `pathconf` or executing a case-swapped write/read probe to a temporary file). On case-insensitive systems (like macOS/Windows), all paths written to or matched against `ignore_list` must be lowercase-normalized to prevent directory boundary bypasses due to case variance (e.g. `/Users/dev/` vs `/users/dev/`).
+  * **Absolute Canonical Storage**: All paths stored in `ignore_list` must be canonical absolute project paths (resolved via `Path.resolve()`), de-duplicated, and normalized.
+  * **Safe Concurrency, Windows Locking & Stale Overrides**: Writing or updating the `ignore_list` must utilize a non-blocking `fcntl.flock` (using `LOCK_EX | LOCK_NB` on Unix, or a fallback atomic lock file at `~/.hgp/ignore_list.lock` on Windows) with a short 50ms retry loop. The update itself must follow the write-to-temp + atomic rename pattern. On Windows, if `.hgp/ignore_list.lock` already exists, HGP will parse the recorded process ID (PID). If that PID is no longer running or active, the lock is safely overridden to prevent persistent deadlocks from crashed sessions. If locking fails after 50ms total, the boot sequence must fail-open to avoid hanging the terminal CLI session.
 
 ---
 
