@@ -25,7 +25,8 @@ Following the comprehensive audit of the Git Worktree and dynamic project isolat
 ### P1: Git Worktree Hook Integration & Storage Alignment
 - **Target Files**: All `pre_*_hgp.py` lifecycle hook templates under `src/hgp/hooks/`
 - **Action**:
-  - Align hook path resolution with the server's storage topology. Specifically, maintain identical `working_tree_root` and `storage_root` resolution rules across both hooks and server. 
+  - Define the canonical storage topology for Git Worktrees: Both server (`src/hgp/project.py`) and hooks must resolve storage to the shared main repository's `.hgp/` directory (`storage_root`), while limiting file mutation boundaries to the active checkout directory (`working_tree_root`).
+  - Modify the server's `find_project_root()` and path resolver alongside hooks to ensure they follow this exact shared topology, preventing split-brain advisory/block decisions.
   - Instead of looking up a physical `.hgp` parent directory, hooks must dynamically parse `.git` pointer files if the workspace is inside a Git Worktree.
   - Introduce a lightweight, zero-dependency helper to extract `gitdir` and `commondir` declarations, locating the shared `.hgp/` folder in the main repository root where `hook-policy` resides.
   - Target the existing parent traversal loop inside `_resolve_block_mode()` and hook body routines for this consolidation.
@@ -43,12 +44,12 @@ Following the comprehensive audit of the Git Worktree and dynamic project isolat
 - **Action**:
   - Wrap lease check-and-insert checks inside `LeaseManager.acquire()` in an immediate SQLite transaction block.
   - Implement an explicit DB schema migration path to safely backfill existing SQLite database instances with the new index constraint.
-  - Define the partial unique constraint explicitly as `UNIQUE(subgraph_root_op_id, agent_id) WHERE status = 'ACTIVE'`. This maintains database-level safety while preserving HGP's multi-agent model (where different agents can concurrently lease separate subgraphs on the same root).
+  - Define the partial unique constraint explicitly as `UNIQUE(subgraph_root_op_id) WHERE status = 'ACTIVE'`. This prevents duplicate active leases on the same subgraph root. If cross-agent concurrency is desired, document that same-agent reacquire races are mitigated while other agents are excluded, ensuring strict database-level safety.
 
 ### P2: Minor Hardening & Hook policy Compatibility
 - **DAG Chain Hash**: Fail and raise a clear exception if recursive DAG traversal depth exceeds 500 nodes.
-- **Hook Policy Format**: Standardize hook-policy files on a JSON schema (`{ "block_mode": false, "telemetry_enabled": true }`). Replace References to the non-existent `hgp init` command with actual onboarding entry points (e.g. `hgp setup` or user prompt initialization flows).
-- **Fallback Compatibility**: Maintain strict backward compatibility by resolving legacy plain-text `hook-policy` files (falling back to plain parsing) to prevent regressions on older repositories.
+- **Hook Policy Format**: Standardize hook-policy files on a JSON schema (`{ "block_mode": false, "telemetry_enabled": true }`). Replace references to the non-existent `hgp init` or `hgp setup` commands with actual onboarding hooks and interface commands (`hgp install` and `hgp hook-policy`).
+- **Fallback Compatibility**: Maintain strict backward compatibility by resolving legacy plain-text `hook-policy` files (falling back to plain text parsing) to prevent regressions on older repositories.
 - **Windows Portability**: Implement fallback file lock validation paths on Windows where POSIX directory descriptors are unavailable.
 
 ---
@@ -58,6 +59,9 @@ Following the comprehensive audit of the Git Worktree and dynamic project isolat
 ### Automated Tests
 - Introduce a mock concurrent test suite in `tests/test_concurrency.py` that spawns multiple parallel requests writing to the shared database.
 - Create tests for worktree hook resolution with simulated worktree pointers.
+- **Migration & Backward Compatibility Tests**:
+  - Add integration tests in `tests/test_migration.py` verifying that older databases migrate to the new `UNIQUE` lease index schema seamlessly.
+  - Add tests in `tests/test_hooks.py` validating that the hook telemetry resolves both legacy plain-text `hook-policy` files and the new JSON schemas without error.
 - Verify 100% test pass rate using `pytest`:
   ```bash
   uv run pytest tests/
