@@ -25,8 +25,8 @@ Following the comprehensive audit of the Git Worktree and dynamic project isolat
 ### P1: Git Worktree Hook Integration & Storage Alignment
 - **Target Files**: All `pre_*_hgp.py` lifecycle hook templates under `src/hgp/hooks/`, plus server-side policy and connection managers in `src/hgp/server.py`
 - **Action**:
-  - Define the canonical storage topology for Git Worktrees: Both server (`src/hgp/project.py`) and hooks must resolve storage to the shared main repository's `.hgp/` directory (`storage_root`). Crucially, we must **not** modify the server's `find_project_root()` write boundary resolver (which continues to return the active `working_tree_root` to prevent security escape regressions). Instead, introduce a distinct `find_storage_root()` resolver.
-  - Ensure all server-side callers that read/write the database or policy configuration (especially the `hgp hook-policy` command handler and server startup/context initializers in `src/hgp/server.py`) use `find_storage_root()` to prevent split-brain storage/policy states.
+  - Define the canonical storage topology for Git Worktrees: Both server (`src/hgp/project.py`) and hooks must resolve storage to the shared main repository's `.hgp/` directory (`storage_root`). Crucially, we must **not** modify the server's `find_project_root()` write boundary resolver (which continues to return the active `working_tree_root` to prevent security escape regressions). Instead, introduce an explicit **dual-root model** in the server's state context (`_get_context()` in `src/hgp/server.py` and `project.py`), exposing `project_root` for path safety limits, and a separate `storage_root` for HGP storage path construction.
+  - Ensure all server-side callers that read/write the database or policy configuration (especially the `hgp hook-policy` command handler in `src/hgp/server.py` and internal database path builders) use the `find_storage_root()` resolver for storage path construction only, preventing split-brain storage/policy states without modifying the write boundary.
   - Instead of looking up a physical `.hgp` parent directory, hooks must dynamically parse `.git` pointer files if the workspace is inside a Git Worktree.
   - Introduce a lightweight, zero-dependency helper in hooks to extract `gitdir` and `commondir` declarations, locating the shared `.hgp/` folder in the main repository root where `hook-policy` resides.
   - Target the existing parent traversal loop inside `_resolve_block_mode()` and hook body routines for this consolidation.
@@ -44,7 +44,7 @@ Following the comprehensive audit of the Git Worktree and dynamic project isolat
 - **Action**:
   - Wrap lease check-and-insert checks inside `LeaseManager.acquire()` in an immediate SQLite transaction block.
   - Implement an explicit DB schema migration path to safely backfill existing SQLite database instances with the new index constraint.
-  - Define the partial unique constraint explicitly as `UNIQUE(subgraph_root_op_id, agent_id) WHERE status = 'ACTIVE'`. This prevents duplicate active leases by the same agent on the same subgraph root (same-agent reacquire race mitigation), while strictly preserving HGP's multi-agent model (where different agents can concurrently lease different subgraphs on the same root).
+  - Define the partial unique constraint explicitly as `UNIQUE(subgraph_root_op_id, agent_id) WHERE status = 'ACTIVE'`. This prevents duplicate active leases by the same agent on the same subgraph root (same-agent reacquire race mitigation), while strictly preserving HGP's multi-agent model (where different agents can concurrently hold ACTIVE leases on the same `subgraph_root_op_id`).
 
 ### P2: Minor Hardening & Hook policy Compatibility
 - **DAG Chain Hash**: Fail and raise a clear exception if recursive DAG traversal depth exceeds 500 nodes.
@@ -61,7 +61,7 @@ Following the comprehensive audit of the Git Worktree and dynamic project isolat
 - Create tests for worktree hook resolution with simulated worktree pointers.
 - **Migration & Backward Compatibility Tests**:
   - Add integration tests in `tests/test_migration.py` verifying that older databases migrate to the new `UNIQUE` lease index schema seamlessly.
-  - Add integration tests in `tests/test_hook_policy.py` validating that the CLI policy writer (`hgp hook-policy`), pre-hook readers, and telemetry parser all resolve both legacy plain-text files and the new JSON schemas without error.
+  - Add integration tests in `tests/test_hook_policy.py` validating that the CLI policy writer (`hgp hook-policy`), pre-hook readers, and hook-policy verification helpers all resolve both legacy plain-text files and the new JSON schemas without error.
   - Add an integration test case verifying that `hgp hook-policy` invoked from a linked worktree successfully resolves and updates the shared main-repo `.hgp/hook-policy` file.
 - Verify 100% test pass rate using `pytest`:
   ```bash
