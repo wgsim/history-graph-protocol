@@ -20,15 +20,16 @@ Following the comprehensive audit of the Git Worktree and dynamic project isolat
   - Decouple the single global connection cached in the `Database` class.
   - Implement a **Connection-per-Request** (or thread-local connection) pattern where each database access session or server request opens its own SQLite handle and safely closes it upon transaction completion.
   - Enforce atomic serialization by wrapping all database write paths inside explicit SQLite `BEGIN IMMEDIATE` blocks.
-  - Utilize SQLite's native queueing mechanisms by standardizing on `PRAGMA busy_timeout = 2000` (2 seconds).
+  - Preserve the existing `PRAGMA busy_timeout = 5000` (5 seconds) as the default native timeout to prevent early lock failures, and specify benchmark-driven criteria for any future 2000ms threshold tuning.
 
-### P1: Git Worktree Hook Integration
+### P1: Git Worktree Hook Integration & Storage Alignment
 - **Target Files**: All `pre_*_hgp.py` lifecycle hook templates under `src/hgp/hooks/`
 - **Action**:
-  - Refactor the `_open_hgp_dir()` preflight helper to no longer rely purely on physical parent directory traversal.
-  - When `.git` is detected as a file (indicating a Git Worktree), parse the `gitdir:` and `commondir` declarations.
-  - Resolve paths canonically to locate the main repository's `.hgp/` folder to check for the active HGP project state and load `hook-policy`.
-  - Maintain absolute zero-dependency and execution overhead constraints (execution budget < 15ms).
+  - Align hook path resolution with the server's storage topology. Specifically, maintain identical `working_tree_root` and `storage_root` resolution rules across both hooks and server. 
+  - Instead of looking up a physical `.hgp` parent directory, hooks must dynamically parse `.git` pointer files if the workspace is inside a Git Worktree.
+  - Introduce a lightweight, zero-dependency helper to extract `gitdir` and `commondir` declarations, locating the shared `.hgp/` folder in the main repository root where `hook-policy` resides.
+  - Target the existing parent traversal loop inside `_resolve_block_mode()` and hook body routines for this consolidation.
+  - Maintain absolute zero-dependency constraints and ensure hook execution overhead remains strictly under 15ms.
 
 ### P1: File APIs TOCTOU Hardening
 - **Target File**: `src/hgp/server.py`
@@ -37,15 +38,17 @@ Following the comprehensive audit of the Git Worktree and dynamic project isolat
   - Open the validated project root directory once to lock down a file descriptor (`root_fd`).
   - Perform all subsequent file interactions using `dir_fd=root_fd` and `os.O_NOFOLLOW` (utilizing low-level POSIX functions) to prevent directory-swap symlink races during tool executions.
 
-### P1: Atomic Lease Acquisition
+### P1: Atomic Lease Acquisition & DB Migration
 - **Target File**: `src/hgp/lease.py`
 - **Action**:
-  - Wrap check-and-insert logic inside `LeaseManager.acquire()` in an immediate SQL transaction block.
-  - Add a database-level partial unique index constraint: `UNIQUE(agent_id, subgraph_root_op_id) WHERE status = 'ACTIVE'` to guarantee absolute mutual exclusion on the schema level.
+  - Wrap lease check-and-insert checks inside `LeaseManager.acquire()` in an immediate SQLite transaction block.
+  - Implement an explicit DB schema migration path to safely backfill existing SQLite database instances with the new index constraint.
+  - Define the partial unique constraint explicitly as `UNIQUE(subgraph_root_op_id, agent_id) WHERE status = 'ACTIVE'`. This maintains database-level safety while preserving HGP's multi-agent model (where different agents can concurrently lease separate subgraphs on the same root).
 
-### P2: Minor Hardening & Standardization
-- **DAG Chain Hash**: Fail and raise a clear exception if recursive traversals exceed 500 depth.
-- **Hook Policy Format**: Standardize hook-policy format on JSON for both initialization (`hgp init`) and hook checks.
+### P2: Minor Hardening & Hook policy Compatibility
+- **DAG Chain Hash**: Fail and raise a clear exception if recursive DAG traversal depth exceeds 500 nodes.
+- **Hook Policy Format**: Standardize hook-policy files on a JSON schema (`{ "block_mode": false, "telemetry_enabled": true }`). Replace References to the non-existent `hgp init` command with actual onboarding entry points (e.g. `hgp setup` or user prompt initialization flows).
+- **Fallback Compatibility**: Maintain strict backward compatibility by resolving legacy plain-text `hook-policy` files (falling back to plain parsing) to prevent regressions on older repositories.
 - **Windows Portability**: Implement fallback file lock validation paths on Windows where POSIX directory descriptors are unavailable.
 
 ---
