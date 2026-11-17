@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from hgp.cas import CAS
 from hgp.db import Database
 from hgp.models import ReconcileReport
+from hgp.project import find_storage_root
 
 _log = logging.getLogger(__name__)
 
@@ -52,16 +55,40 @@ class Reconciler:
         self._cas = cas
         self._staging_dir = content_dir / ".staging"
         self._project_root = project_root.resolve() if project_root is not None else None
+        # Root of this checkout as tagged on ops (metadata.hgp_checkout.root);
+        # None for the main checkout, whose ops carry no tag.
+        self._linked_root: str | None = None
+        if self._project_root is not None:
+            if find_storage_root(self._project_root).resolve() != self._project_root:
+                self._linked_root = str(self._project_root)
 
-    def _file_path_in_scope(self, file_path: str) -> bool:
+    @staticmethod
+    def _op_checkout_root(op: dict[str, Any]) -> str | None:
+        """Return the linked-worktree root an op was recorded from, if tagged."""
+        try:
+            meta = json.loads(op.get("metadata") or "null")
+        except (TypeError, ValueError):
+            return None
+        checkout = meta.get("hgp_checkout") if isinstance(meta, dict) else None
+        root = checkout.get("root") if isinstance(checkout, dict) else None
+        return root if isinstance(root, str) else None
+
+    def _op_in_scope(self, op: dict[str, Any], file_path: str) -> bool:
         """Return whether a pending file operation belongs to this checkout."""
         if self._project_root is None:
             return True
+        if self._op_checkout_root(op) != self._linked_root:
+            return False
         try:
             Path(file_path).resolve().relative_to(self._project_root)
             return True
         except (OSError, RuntimeError, ValueError):
             return False
+
+    def _op_orphaned(self, op: dict[str, Any]) -> bool:
+        """Return whether an op belongs to a linked worktree that no longer exists."""
+        root = self._op_checkout_root(op)
+        return root is not None and not Path(root).is_dir()
 
     def reconcile(self, dry_run: bool = False) -> ReconcileReport:
         report = ReconcileReport()
@@ -125,7 +152,13 @@ class Reconciler:
             if not file_path:
                 # Not a file-tracking op — skip
                 continue
-            if not self._file_path_in_scope(file_path):
+            if not self._op_in_scope(op, file_path):
+                # Another checkout's op: leave it to that checkout's reconciler,
+                # unless its worktree was removed and nobody will ever finish it.
+                if self._op_orphaned(op):
+                    if not dry_run:
+                        self._db.update_operation_status(op["op_id"], "STALE_PENDING")
+                    report.pending_orphaned += 1
                 continue
             op_type = op.get("op_type")
             op_id = op["op_id"]

@@ -32,6 +32,7 @@ from hgp.project import (
     PathOutsideRootError,
     ProjectRootError,
     canonical_file_path,
+    current_branch,
     find_project_root,
     find_storage_root,
 )
@@ -46,6 +47,7 @@ _MAX_TTL_SECONDS = 86400
 # Limits evidence refs per operation to cap O(N) existence checks inside BEGIN IMMEDIATE.
 _MAX_EVIDENCE_REFS = 50
 _MAX_QUERY_LIMIT = 1000
+_VALID_QUERY_SCOPES = frozenset({"checkout", "repo"})
 _MAX_SUBGRAPH_DEPTH = 500
 
 # ── Server initialization ───────────────────────────────────
@@ -133,6 +135,27 @@ def _check_file_project(file_root: Path, ctx: HGPContext) -> dict[str, Any] | No
             ),
         }
     return None
+
+
+# Reserved metadata key identifying the linked worktree an op was recorded from.
+# Absent for ops recorded from the main checkout (or outside any worktree).
+_CHECKOUT_META_KEY = "hgp_checkout"
+
+
+def _linked_checkout_root(ctx: HGPContext) -> Path | None:
+    """Return the active checkout root when it is a linked worktree, else None."""
+    if not isinstance(ctx.project_root, Path) or not isinstance(ctx.storage_root, Path):
+        return None
+    root = ctx.project_root.resolve()
+    return None if root == ctx.storage_root.resolve() else root
+
+
+def _with_checkout_meta(metadata: dict[str, Any] | None, ctx: HGPContext) -> dict[str, Any] | None:
+    """Tag metadata with the linked worktree (root, branch) the op comes from."""
+    root = _linked_checkout_root(ctx)
+    if root is None:
+        return metadata
+    return {**(metadata or {}), _CHECKOUT_META_KEY: {"root": str(root), "branch": current_branch(root)}}
 
 
 # ── MCP Tools ───────────────────────────────────────────────
@@ -226,7 +249,7 @@ def hgp_create_operation(
             commit_seq=seq,
             chain_hash="sha256:pending",
             object_hash=object_hash,
-            metadata=json.dumps(metadata) if metadata else None,
+            metadata=json.dumps(tagged) if (tagged := _with_checkout_meta(metadata, ctx)) else None,
             mime_type=mime_type,
         )
 
@@ -333,18 +356,25 @@ def hgp_query_operations(
     include_inactive: bool = False,
     limit: int = 100,
     file_path: str | None = None,
+    scope: str = "checkout",
 ) -> dict[str, Any]:
     """Query operations with optional filters.
 
     By default excludes inactive-tier ops; pass include_inactive=True to include them.
+    scope="checkout" (default) returns ops recorded from the active checkout only;
+    scope="repo" also returns ops from the repository's other linked worktrees.
+    Ignored when op_id or file_path is given.
     """
     if (early := _check_mode(mutation=False)) is not None:
         return early
     if status is not None and status not in _VALID_STATUSES:
         return {"error": "INVALID_STATUS", "message": f"status must be one of {sorted(_VALID_STATUSES)}"}
+    if scope not in _VALID_QUERY_SCOPES:
+        return {"error": "INVALID_SCOPE", "message": f"scope must be one of {sorted(_VALID_QUERY_SCOPES)}"}
     limit = max(1, min(limit, _MAX_QUERY_LIMIT))
 
-    db = _get_context().db
+    ctx = _get_context()
+    db = ctx.db
     if op_id:
         op = db.get_operation(op_id)
         if op:
@@ -367,11 +397,16 @@ def hgp_query_operations(
         except (ProjectRootError, PathOutsideRootError) as exc:
             _log.debug("hgp_query_operations: file_path canonicalization failed, using raw path: %s", exc)
             # Results may be empty or incomplete if raw path doesn't match stored canonical paths
+    # A file path already pins the checkout; global mode has no checkout to scope to.
+    scope_checkout = scope == "checkout" and file_path is None and isinstance(ctx.project_root, Path)
+    linked_root = _linked_checkout_root(ctx) if scope_checkout else None
     ops = db.query_operations(
         status=status, agent_id=agent_id, op_type=op_type,
         since_commit_seq=since_commit_seq,
         include_inactive=include_inactive, limit=limit,
         file_path=canonical_fp,
+        scope_checkout=scope_checkout,
+        checkout_root=str(linked_root) if linked_root else None,
     )
     return {"operations": ops}
 
@@ -733,7 +768,7 @@ def _record_file_op(
     except BlobWriteError as exc:
         return {"error": "BLOB_WRITE_ERROR", "message": str(exc)}
     op_id = str(uuid.uuid4())
-    metadata = json.dumps({"reason": reason})
+    metadata = json.dumps(_with_checkout_meta({"reason": reason}, ctx))
 
     db.begin_immediate()
     try:
@@ -1012,7 +1047,7 @@ def hgp_delete_file(
 
     op_id = str(uuid.uuid4())
     effective_reason = reason or f"DELETE {canonical}"
-    metadata = json.dumps({"reason": effective_reason})
+    metadata = json.dumps(_with_checkout_meta({"reason": effective_reason}, ctx))
 
     db.begin_immediate()
     try:
@@ -1138,7 +1173,9 @@ def hgp_move_file(
     try:
         # Insert invalidation op for old_path so hgp_file_history(old_path) records the move.
         inv_op_id = str(uuid.uuid4())
-        inv_metadata = json.dumps({"reason": f"MOVE {canonical_old} → {canonical_new}"})
+        inv_metadata = json.dumps(
+            _with_checkout_meta({"reason": f"MOVE {canonical_old} → {canonical_new}"}, ctx)
+        )
         db.insert_operation(
             op_id=inv_op_id, op_type="invalidation", agent_id=agent_id,
             commit_seq=db.next_commit_seq(), chain_hash="sha256:pending",
@@ -1153,7 +1190,7 @@ def hgp_move_file(
 
         # Insert artifact op for new_path, causally linked to the invalidation op.
         op_id = str(uuid.uuid4())
-        metadata = json.dumps({"reason": effective_reason})
+        metadata = json.dumps(_with_checkout_meta({"reason": effective_reason}, ctx))
         seq = db.next_commit_seq()
         db.insert_operation(
             op_id=op_id, op_type="artifact", agent_id=agent_id,
@@ -1376,6 +1413,33 @@ subagent's context automatically. Subagents should use
 <!-- hgp-instructions-end -->"""
 
 
+def _backup_modified_hook(src: Path, dest: Path) -> Path | None:
+    """Back up an existing hook file that differs from the bundled one.
+
+    Installing overwrites hook files in place; a locally customised hook (or
+    one from an older HGP release) is kept as ``<name>.bak-<timestamp>``.
+    Returns the backup path, or None when nothing needed saving.
+    """
+    import shutil
+    import sys
+
+    try:
+        if not dest.is_file() or dest.read_bytes() == src.read_bytes():
+            return None
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        backup = dest.with_name(f"{dest.name}.bak-{stamp}")
+        n = 1
+        while backup.exists():
+            backup = dest.with_name(f"{dest.name}.bak-{stamp}-{n}")
+            n += 1
+        shutil.copy2(dest, backup)
+    except OSError as exc:
+        print(f"  ! could not back up {dest}: {exc}", file=sys.stderr)
+        return None
+    print(f"  ! {dest} differed from the bundled hook; previous copy saved to {backup}", file=sys.stderr)
+    return backup
+
+
 def _install_hooks_files(pkg: str, dest_dir: Path) -> list[str]:
     """Copy hook .py files from hgp.hooks.<pkg> package to dest_dir.
 
@@ -1393,6 +1457,7 @@ def _install_hooks_files(pkg: str, dest_dir: Path) -> list[str]:
         if item.name.endswith(".py") and not item.name.startswith("__"):
             dest = dest_dir / item.name
             with importlib.resources.as_file(item) as src:
+                _backup_modified_hook(src, dest)
                 if dest.exists():
                     dest.unlink()
                 shutil.copy2(src, dest)
@@ -1817,6 +1882,7 @@ def _install_hooks(args: list[str]) -> None:
             if item.name.endswith(".py") and not item.name.startswith("__"):
                 dest = dest_dir / item.name
                 with importlib.resources.as_file(item) as src:
+                    _backup_modified_hook(src, dest)
                     shutil.copy2(src, dest)
                 installed.append(str(dest.relative_to(project_root)))
 
@@ -1938,10 +2004,14 @@ _BACKUP_OPERATIONAL_FILES = frozenset({"mode", "hook-policy"})
 _BACKUP_USAGE = """\
 Usage:
   hgp backup                          back up .hgp/ to ~/.hgp/projects/<id>/
-  hgp restore [--project-id <id>] [--force]
+  hgp restore [--project-id <id>] [--force] [--shared]
                                        restore from local backup
   hgp export <dest>                   export history snapshot to <dest>/
-  hgp import <source> [--force]       import a history snapshot
+  hgp import <source> [--force] [--shared]
+                                       import a history snapshot
+
+  Inside a linked git worktree, .hgp/ is shared with the main repository;
+  restore/import there require --shared to confirm.
 """
 
 
@@ -2148,6 +2218,25 @@ def _validate_snapshot_source(source: Path, cmd: str) -> None:
         sys.exit(1)
 
 
+def _require_shared_ack(cmd: str, shared_ok: bool, project_root: Path, storage_root: Path) -> None:
+    """Exit unless the user confirmed replacing history shared by all worktrees.
+
+    Only applies inside a linked worktree, where .hgp/ lives in the main repo.
+    """
+    import sys
+
+    if shared_ok or storage_root.resolve() == project_root.resolve():
+        return
+    print(
+        f"hgp {cmd}: {project_root} is a linked git worktree.\n"
+        f"Its HGP history is shared with the main repository at {storage_root / '.hgp'}.\n"
+        f"'hgp {cmd}' would replace history for every worktree of this repository.\n"
+        "Re-run with --shared to confirm.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _remove_dest(path: Path) -> None:
     """Remove path whether it is a directory, regular file, or symlink."""
     if path.is_dir() and not path.is_symlink():
@@ -2235,7 +2324,8 @@ def _hgp_restore(args: list[str]) -> None:
     import sys
 
     force = "--force" in args
-    remaining = [a for a in args if a != "--force"]
+    shared_ok = "--shared" in args
+    remaining = [a for a in args if a not in ("--force", "--shared")]
 
     project_id: str | None = None
     if "--project-id" in remaining:
@@ -2262,6 +2352,7 @@ def _hgp_restore(args: list[str]) -> None:
         sys.exit(1)
 
     storage_root = find_storage_root(project_root)
+    _require_shared_ack("restore", shared_ok, project_root, storage_root)
     hgp_dir = storage_root / ".hgp"
 
     # Determine backup_dir
@@ -2388,7 +2479,8 @@ def _hgp_import(args: list[str]) -> None:
     import sys
 
     force = "--force" in args
-    remaining = [a for a in args if a != "--force"]
+    shared_ok = "--shared" in args
+    remaining = [a for a in args if a not in ("--force", "--shared")]
     if len(remaining) != 1:
         print("hgp import: requires exactly one source path.", file=sys.stderr)
         print(_BACKUP_USAGE, file=sys.stderr)
@@ -2409,6 +2501,7 @@ def _hgp_import(args: list[str]) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    _require_shared_ack("import", shared_ok, project_root, find_storage_root(project_root))
 
     source_meta = _read_project_meta(source)
     compat = _check_compatibility(source_meta, project_root)

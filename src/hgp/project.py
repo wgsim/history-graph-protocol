@@ -43,6 +43,30 @@ def find_project_root(start: Path) -> Path:
     )
 
 
+def current_branch(checkout_root: Path) -> str | None:
+    """Return the branch checked out at ``checkout_root``.
+
+    Reads ``HEAD`` directly (no git subprocess). Returns None for a detached
+    HEAD or when the git metadata cannot be read.
+    """
+    git_path = checkout_root / ".git"
+    try:
+        if git_path.is_file():
+            pointer = git_path.read_text(encoding="utf-8").strip()
+            if not pointer.startswith("gitdir:"):
+                return None
+            gitdir = Path(pointer[len("gitdir:"):].strip())
+            if not gitdir.is_absolute():
+                gitdir = checkout_root / gitdir
+        else:
+            gitdir = git_path
+        head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    prefix = "ref: refs/heads/"
+    return head[len(prefix):] if head.startswith(prefix) else None
+
+
 def assert_within_root(file_path: Path, root: Path) -> None:
     """Raise PathOutsideRootError if file_path is not under root.
 

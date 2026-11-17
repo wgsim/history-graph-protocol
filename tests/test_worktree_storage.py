@@ -7,7 +7,9 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -19,7 +21,14 @@ from hgp.db import Database
 from hgp.hooks import hgp_paths
 from hgp.lease import LeaseManager
 from hgp.reconciler import Reconciler
-from hgp.server import HGPContext, hgp_create_operation, hgp_get_context, hgp_set_context
+from hgp.server import (
+    HGPContext,
+    hgp_create_operation,
+    hgp_get_context,
+    hgp_query_operations,
+    hgp_set_context,
+    hgp_write_file,
+)
 
 HOOKS = Path(__file__).parents[1] / "src" / "hgp" / "hooks"
 START_HOOK = HOOKS / "claude" / "subagent_start_hgp.py"
@@ -212,3 +221,212 @@ def test_get_context_ignores_summaries_of_prefixed_session(server_ctx: Path) -> 
     assert not own.exists()
     assert other.exists()
     assert [s["session_id"] for s in hgp_get_context("s1-x")["subagent_summaries"]] == ["s1-x"]
+
+
+# ── P2: one shared DB seen from the main checkout and a linked worktree ─────
+
+@pytest.fixture
+def shared_db(linked_worktree):
+    repo, worktree = linked_worktree
+    content = repo / ".hgp" / ".hgp_content"
+    content.mkdir(parents=True)
+    db = Database(repo / ".hgp" / "hgp.db")
+    db.initialize()
+    cas = CAS(content)
+
+    def ctx_for(root: Path) -> HGPContext:
+        return HGPContext(
+            db=db, cas=cas, lease_mgr=LeaseManager(db),
+            reconciler=Reconciler(db, cas, content, project_root=root),
+            project_root=root, storage_root=repo,
+        )
+
+    orig = server_module._ctx
+    yield repo, worktree, db, ctx_for
+    server_module._ctx = orig
+    db.close()
+
+
+def _git_branch(cwd: Path) -> str:
+    return subprocess.run(
+        ["git", "branch", "--show-current"], cwd=cwd, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_current_branch_reads_head(linked_worktree) -> None:
+    repo, worktree = linked_worktree
+    assert project.current_branch(worktree) == "feature"
+    assert project.current_branch(repo) == _git_branch(repo)
+    _git("checkout", "-q", "--detach", cwd=worktree)
+    assert project.current_branch(worktree) is None
+
+
+def test_ops_from_worktree_are_tagged_with_checkout(shared_db) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    server_module._ctx = ctx_for(worktree)
+    op = hgp_create_operation(op_type="hypothesis", agent_id="a", metadata={"k": 1})
+    written = hgp_write_file(file_path=str(worktree / "f.txt"), content="x", agent_id="a")
+    for op_id in (op["op_id"], written["op_id"]):
+        meta = json.loads(db.get_operation(op_id)["metadata"])
+        assert meta["hgp_checkout"] == {"root": str(worktree), "branch": "feature"}
+    assert json.loads(db.get_operation(op["op_id"])["metadata"])["k"] == 1
+
+    server_module._ctx = ctx_for(repo)
+    main_op = hgp_create_operation(op_type="hypothesis", agent_id="a")
+    assert db.get_operation(main_op["op_id"])["metadata"] is None  # main checkout: untagged
+
+
+def test_query_operations_scope(shared_db) -> None:
+    repo, worktree, _, ctx_for = shared_db
+    server_module._ctx = ctx_for(repo)
+    main_id = hgp_create_operation(op_type="hypothesis", agent_id="main")["op_id"]
+    server_module._ctx = ctx_for(worktree)
+    wt_id = hgp_create_operation(op_type="hypothesis", agent_id="wt")["op_id"]
+
+    def ids(result: dict) -> set[str]:
+        return {o["op_id"] for o in result["operations"]}
+
+    assert ids(hgp_query_operations()) == {wt_id}
+    assert ids(hgp_query_operations(scope="repo")) == {main_id, wt_id}
+    server_module._ctx = ctx_for(repo)
+    assert ids(hgp_query_operations()) == {main_id}
+    assert ids(hgp_query_operations(scope="repo")) == {main_id, wt_id}
+    assert hgp_query_operations(scope="bogus")["error"] == "INVALID_SCOPE"
+
+
+def _insert_old_pending(db: Database, op_id: str, file_path: Path, checkout_root: Path | None) -> None:
+    meta: dict = {"reason": "test"}
+    if checkout_root is not None:
+        meta["hgp_checkout"] = {"root": str(checkout_root), "branch": "x"}
+    db.begin_immediate()
+    seq = db.next_commit_seq()
+    db.insert_operation(
+        op_id=op_id, op_type="artifact", agent_id="a", commit_seq=seq,
+        chain_hash="sha256:" + "d" * 64, status="PENDING",
+        metadata=json.dumps(meta), file_path=str(file_path),
+    )
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    db.execute("UPDATE operations SET created_at = ? WHERE op_id = ?", (old_ts, op_id))
+    db.commit()
+
+
+def test_reconcile_retires_ops_of_removed_worktree(shared_db, tmp_path) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    gone = tmp_path / "removed-worktree"  # never created: worktree was deleted
+    _insert_old_pending(db, "op-gone", gone / "f.txt", gone)
+    _insert_old_pending(db, "op-live", worktree / "f.txt", worktree)
+    reconciler = ctx_for(repo).reconciler
+
+    dry = reconciler.reconcile(dry_run=True)
+    assert dry.pending_orphaned == 1
+    assert db.get_operation("op-gone")["status"] == "PENDING"
+
+    report = reconciler.reconcile()
+    assert report.pending_orphaned == 1
+    assert db.get_operation("op-gone")["status"] == "STALE_PENDING"
+    assert db.get_operation("op-live")["status"] == "PENDING"  # live worktree owns it
+
+
+def test_reconcile_skips_main_ops_when_run_from_worktree(shared_db) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    _insert_old_pending(db, "op-main", repo / "f.txt", None)
+    report = ctx_for(worktree).reconciler.reconcile()
+    assert report.pending_stale == 0 and report.pending_orphaned == 0
+    assert db.get_operation("op-main")["status"] == "PENDING"
+
+
+# ── P3: destructive CLI commands, installer, concurrency ────────────────────
+
+def _cli(*args: str, cwd: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "HGP_PROJECTS_DIR": str(tmp_path / "projects")}
+    return subprocess.run(
+        [sys.executable, "-m", "hgp.server", *args], cwd=cwd, capture_output=True, text=True, env=env,
+    )
+
+
+def test_restore_and_import_in_worktree_require_shared(linked_worktree, tmp_path) -> None:
+    repo, worktree = linked_worktree
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "hgp.db").write_bytes(b"")
+
+    for args in (["restore"], ["import", str(snapshot)]):
+        r = _cli(*args, cwd=worktree, tmp_path=tmp_path)
+        assert r.returncode == 1
+        assert "linked git worktree" in r.stderr and "--shared" in r.stderr
+        r = _cli(*args, "--shared", cwd=worktree, tmp_path=tmp_path)
+        assert "linked git worktree" not in r.stderr
+        r = _cli(*args, cwd=repo, tmp_path=tmp_path)  # main checkout: no extra flag
+        assert "linked git worktree" not in r.stderr
+
+
+def test_install_hooks_backs_up_modified_hook(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    hooks = repo / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "pre_tool_use_hgp.py").write_text("# locally customised hook\n")
+
+    r = _cli("install-hooks", "--claude", cwd=repo, tmp_path=tmp_path)
+    assert r.returncode == 0, r.stderr
+    backups = list(hooks.glob("pre_tool_use_hgp.py.bak-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "# locally customised hook\n"
+    assert "previous copy saved" in r.stderr
+    bundled = HOOKS / "claude" / "pre_tool_use_hgp.py"
+    assert (hooks / "pre_tool_use_hgp.py").read_bytes() == bundled.read_bytes()
+
+    _cli("install-hooks", "--claude", cwd=repo, tmp_path=tmp_path)  # unchanged → no new backup
+    assert len(list(hooks.glob("*.bak-*"))) == 1
+
+
+_WRITER = textwrap.dedent(
+    """
+    import sys
+    from pathlib import Path
+    import hgp.server as s
+    from hgp.cas import CAS
+    from hgp.db import Database
+    from hgp.lease import LeaseManager
+    from hgp.reconciler import Reconciler
+
+    root, count, agent = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+    content = root / ".hgp" / ".hgp_content"
+    db = Database(root / ".hgp" / "hgp.db")
+    db.initialize()
+    cas = CAS(content)
+    s._ctx = s.HGPContext(db=db, cas=cas, lease_mgr=LeaseManager(db),
+                          reconciler=Reconciler(db, cas, content), project_root=root)
+    for _ in range(count):
+        result = s.hgp_create_operation(op_type="hypothesis", agent_id=agent)
+        assert "op_id" in result, result
+    db.close()
+    """
+)
+
+
+def test_concurrent_server_processes_share_one_db(tmp_path) -> None:
+    content = tmp_path / ".hgp" / ".hgp_content"
+    content.mkdir(parents=True)
+    db = Database(tmp_path / ".hgp" / "hgp.db")
+    db.initialize()
+    db.close()
+
+    writers, per_writer = 3, 40
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _WRITER, str(tmp_path), str(per_writer), f"w{i}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for i in range(writers)
+    ]
+    for p in procs:
+        _, err = p.communicate(timeout=120)
+        assert p.returncode == 0, err
+
+    db = Database(tmp_path / ".hgp" / "hgp.db")
+    db.initialize()
+    rows = db.execute("SELECT COUNT(*), COUNT(DISTINCT commit_seq) FROM operations").fetchone()
+    db.close()
+    assert tuple(rows) == (writers * per_writer, writers * per_writer)

@@ -153,6 +153,7 @@ Queries operation records by one or more filter criteria. When `op_id` is suppli
 | `include_inactive` | `boolean` | No | `false` | Whether to include operations in the `inactive` memory tier |
 | `limit` | `integer` | No | `100` | Maximum number of results to return. Clamped to `[1, 1000]`; negative values are treated as `1`. |
 | `file_path` | `string` | No | `null` | Filter to operations recorded for this file path (canonicalized before matching) |
+| `scope` | `string` | No | `"checkout"` | `"checkout"`: only operations recorded from the active checkout. `"repo"`: also operations from the repository's other linked Git worktrees (they share one `.hgp/`). Ignored when `op_id` or `file_path` is given. Outside linked worktrees both values return the same results. Invalid values return `INVALID_SCOPE`. |
 
 ### Returns
 

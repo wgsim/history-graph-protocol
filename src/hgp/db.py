@@ -367,10 +367,24 @@ class Database:
         include_inactive: bool = False,
         limit: int = 1000,
         file_path: str | None = None,
+        scope_checkout: bool = False,
+        checkout_root: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Query operations.
+
+        With ``scope_checkout=True`` only ops recorded from ``checkout_root``
+        are returned, matched on ``metadata.hgp_checkout.root``; ``None`` selects
+        ops from the main checkout (no ``hgp_checkout`` tag).
+        """
         assert self._conn
         clauses: list[str] = []
         params: list[Any] = []
+        if scope_checkout:
+            clauses.append(
+                "(CASE WHEN json_valid(metadata) "
+                "THEN json_extract(metadata, '$.hgp_checkout.root') END) IS ?"
+            )
+            params.append(checkout_root)
         if status:
             clauses.append("status = ?")
             params.append(status)
