@@ -123,7 +123,7 @@ def _event_cwd(event: object) -> Path:
     return Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
 
 
-def _resolve_block_mode() -> bool:
+def _resolve_block_mode(start: Path) -> bool:
     """Check HGP_HOOK_BLOCK env var, then fall back to .hgp/hook-policy file."""
     env = os.environ.get("HGP_HOOK_BLOCK")
     if env is not None:
@@ -146,7 +146,7 @@ def _resolve_block_mode() -> bool:
                 return False
         return stripped == "block"
 
-    for parent in [Path.cwd(), *Path.cwd().parents]:
+    for parent in [start, *start.parents]:
         # Shared policy plus a checkout-local legacy one (written before storage
         # was shared): block if either says so, so upgrading never drops enforcement.
         candidates = dict.fromkeys([shared_hgp_dir(parent) / "hook-policy", parent / ".hgp" / "hook-policy"])
@@ -183,7 +183,8 @@ def _main() -> None:
         event = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)
-    if not _enabled(_event_cwd(event)):
+    start = _event_cwd(event)  # one directory for the gate and the policy
+    if not _enabled(start):
         sys.exit(0)
 
     if event.get("tool_name") != "Bash":
@@ -217,7 +218,7 @@ def _main() -> None:
         "operation is recorded in HGP history."
     )
 
-    if _resolve_block_mode():
+    if _resolve_block_mode(start):
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",

@@ -291,3 +291,42 @@ def test_init_rejects_arguments(tmp_path: Path) -> None:
     assert r.returncode == 1
     assert "usage: hgp init" in r.stderr
     assert not (repo / ".hgp").exists()
+
+
+# ── Final review fixes ──────────────────────────────────────────────────────
+
+def test_policy_follows_event_cwd_not_process_cwd(tmp_path: Path) -> None:
+    """The gate and the block policy must both come from the event's cwd."""
+    enabled = git_init(tmp_path / "enabled")
+    (enabled / ".hgp").mkdir()
+    (enabled / ".hgp" / "hook-policy").write_text("block")
+    other = git_init(tmp_path / "other")  # process cwd: not enabled, no policy
+    event = json.dumps({"tool_name": "Write", "cwd": str(enabled)})
+    assert _run_hook(HOOKS / "claude/pre_tool_use_hgp.py", event, other).returncode == 2
+
+
+def test_subagent_start_reads_context_from_event_cwd(tmp_path: Path) -> None:
+    enabled = git_init(tmp_path / "enabled")
+    (enabled / ".hgp").mkdir()
+    (enabled / ".hgp" / "context-s.json").write_text(json.dumps({"root_op_id": "op-1"}))
+    other = git_init(tmp_path / "other")
+    event = json.dumps({"hook_event_name": "SubagentStart", "session_id": "s", "cwd": str(enabled)})
+    r = _run_hook(HOOKS / "claude/subagent_start_hgp.py", event, other)
+    assert "op-1" in r.stdout
+
+
+def test_legacy_worktree_local_policy_still_enforced(linked: tuple[Path, Path]) -> None:
+    _repo, worktree = linked  # main repo has no .hgp/; worktree kept its pre-upgrade store
+    (worktree / ".hgp").mkdir()
+    (worktree / ".hgp" / "hook-policy").write_text("block")
+    r = _run_hook(HOOKS / "claude/pre_tool_use_hgp.py", '{"tool_name": "Write"}', worktree)
+    assert r.returncode == 2
+
+
+def test_legacy_worktree_local_store_enables_server(
+    unbound: None, linked: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, worktree = linked
+    (worktree / ".hgp").mkdir()
+    monkeypatch.chdir(worktree)
+    assert "op_id" in hgp_create_operation(op_type="hypothesis", agent_id="a")

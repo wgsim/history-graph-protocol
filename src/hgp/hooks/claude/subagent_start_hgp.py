@@ -41,12 +41,12 @@ def _event_cwd(event: object) -> Path:
     return Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
 
 
-def _find_hgp_dir() -> Path | None:
+def _find_hgp_dir(start: Path) -> Path | None:
     paths = _hgp_paths()
     if paths is not None:
-        return paths.find_hgp_dir(Path.cwd())
+        return paths.find_hgp_dir(start)
     # Fallback for partial installs without hgp_paths.py: worktree-local lookup.
-    for parent in [Path.cwd(), *Path.cwd().parents]:
+    for parent in [start, *start.parents]:
         candidate = parent / ".hgp"
         if candidate.is_dir():
             return candidate
@@ -60,7 +60,8 @@ def _main() -> None:
         event = json.loads(sys.stdin.read())
     except json.JSONDecodeError:
         sys.exit(0)
-    if not _enabled(_event_cwd(event)):
+    start = _event_cwd(event)  # one directory for the gate and the context lookup
+    if not _enabled(start):
         sys.exit(0)
 
     if event.get("hook_event_name") != "SubagentStart":
@@ -70,7 +71,7 @@ def _main() -> None:
     if not session_id:
         sys.exit(0)
 
-    hgp_dir = _find_hgp_dir()
+    hgp_dir = _find_hgp_dir(start)
     if hgp_dir is None:
         sys.exit(0)
 

@@ -1335,7 +1335,9 @@ def _check_initialized() -> dict[str, Any] | None:
     except ProjectRootError:
         root = Path.cwd()
     storage_root = find_storage_root(root)
-    if (storage_root / ".hgp").is_dir():
+    # A checkout-local legacy .hgp/ (a linked worktree's store from before storage
+    # was shared) also counts, so upgrading does not strand that worktree.
+    if (storage_root / ".hgp").is_dir() or (root / ".hgp").is_dir():
         return None
     return {
         "error": "HGP_NOT_INITIALIZED",

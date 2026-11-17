@@ -91,7 +91,8 @@ def _main() -> None:
         event = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)
-    if not _enabled(_event_cwd(event)):
+    start = _event_cwd(event)  # one directory for the gate and the git status
+    if not _enabled(start):
         sys.exit(0)
 
     if event.get("tool_name") != "Bash":
@@ -102,7 +103,7 @@ def _main() -> None:
         # No marker → PreToolUse hook didn't flag this as mutating; skip
         sys.exit(0)
 
-    cwd = os.getcwd()
+    cwd = str(start)
     changed = _git_changed_files(cwd)
 
     # Build agent-facing advisory (additionalContext — reaches agent reasoning)

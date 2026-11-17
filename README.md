@@ -304,7 +304,7 @@ HGP is opt-in per repository. Run this once inside the repository (or any of its
 hgp init     # creates .hgp/ and keeps it out of git via .git/info/exclude
 ```
 
-Until then, HGP tools return `HGP_NOT_INITIALIZED` and never create `.hgp/`, and the installed hooks do nothing in that repository. A repository that already has `.hgp/` (from an earlier version) stays enabled. To stop using HGP in a repository, run `hgp mode off`, or delete `.hgp/` (this deletes its history). Global mode (`HGP_GLOBAL_MODE`) is unaffected.
+Until then, HGP tools return `HGP_NOT_INITIALIZED` and never create `.hgp/`, and the installed hooks do nothing in that repository. A repository that already has `.hgp/` (from an earlier version) stays enabled, and so does a linked worktree that kept its own pre-upgrade `.hgp/`. To stop using HGP in a repository, delete `.hgp/` (this deletes its history). To pause it instead, run `hgp hook-policy advisory` first and then `hgp mode off`: hooks do not read `mode`, so under a `block` policy native file tools would stay blocked while HGP tools refuse to record. Global mode (`HGP_GLOBAL_MODE`) is unaffected.
 
 ### Storage
 

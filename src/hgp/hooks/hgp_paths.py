@@ -154,6 +154,16 @@ def find_hgp_dir(start: Path) -> Path | None:
 
 
 def hgp_enabled(start: Path) -> bool:
-    """Return whether HGP is enabled (its storage ``.hgp/`` exists) for ``start``."""
+    """Return whether HGP is enabled for ``start``.
+
+    Enabled when its storage ``.hgp/`` exists, or when the checkout itself has a
+    legacy ``.hgp/`` (a linked worktree's store from before storage was shared),
+    so upgrading never silently drops a worktree's policy.
+    """
     hgp_dir = find_hgp_dir(start)
-    return hgp_dir is not None and hgp_dir.is_dir()
+    if hgp_dir is not None and hgp_dir.is_dir():
+        return True
+    for parent in [start, *start.parents]:
+        if (parent / ".git").exists():
+            return (parent / ".hgp").is_dir()
+    return False
