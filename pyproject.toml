@@ -7,7 +7,7 @@ license = { text = "MIT" }
 authors = [{ name = "wgsim", email = "93395612+wgsim@users.noreply.github.com" }]
 requires-python = ">=3.12"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=1.30.0,<2",
     "pydantic>=2.0",
 ]
 classifiers = [
