@@ -215,7 +215,8 @@ HOOK_CASES = [
                  {"tool_name": "run_shell_command", "tool_input": _CP}, True, id="gemini-post_bash"),
     pytest.param("gemini/post_tool_use_hgp.py", {"tool_name": "write_file"}, False, id="gemini-post_tool_use"),
     pytest.param("codex/pre_tool_use_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, False, id="codex-pre_tool_use"),
-    pytest.param("codex/post_tool_use_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, True, id="codex-post_tool_use"),
+    pytest.param("codex/post_tool_use_hgp.py",
+                 {"tool_name": "Bash", "tool_input": _CP}, True, id="codex-post_tool_use"),
 ]
 
 

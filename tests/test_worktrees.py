@@ -321,11 +321,17 @@ def test_installed_hook_without_helper_degrades_safely(linked_worktree, tmp_path
     shutil.copy2(START_HOOK, dest / START_HOOK.name)
     script = HOOKS / "claude" / "pre_tool_use_hgp.py"
     shutil.copy2(script, dest / script.name)
-    # Old worktree-local behaviour: main-repo policy is not visible, but no crash.
-    r = _run(dest / script.name, {"tool_name": "Write"}, cwd=worktree)
-    assert r.returncode == 0
-    r = _run(dest / START_HOOK.name, {"hook_event_name": "SubagentStart", "session_id": "x"}, cwd=worktree)
-    assert r.returncode == 0 and r.stdout == ""
+    # -S: no site-packages, so neither hgp_paths beside the hooks nor the hgp package
+    # is importable. Old worktree-local behaviour: main-repo policy is not visible, no crash.
+    for name, event in (
+        (script.name, {"tool_name": "Write"}),
+        (START_HOOK.name, {"hook_event_name": "SubagentStart", "session_id": "x"}),
+    ):
+        r = subprocess.run(
+            [sys.executable, "-S", str(dest / name)], input=json.dumps(event),
+            cwd=worktree, capture_output=True, text=True,
+        )
+        assert r.returncode == 0 and r.stdout == "" and "Traceback" not in r.stderr
 
 
 # ── summary scoping in a shared .hgp/ ───────────────────────────────────────
