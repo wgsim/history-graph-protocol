@@ -296,11 +296,21 @@ hgp hook-policy block        # block native Write/Edit/MultiEdit/write_file/repl
 
 The policy is stored in `.hgp/hook-policy` as JSON (`{"block_mode": true}`; other keys are preserved when the CLI updates it). Legacy plain-text files containing `block` or `advisory` are still read; unrecognised content is treated as advisory. While any installed `pre_tool_use_hgp.py` (project-local or in `~/.claude`, `~/.gemini`, `~/.codex`) predates the JSON format, `hgp hook-policy` keeps writing the plain-text format so those hooks still enforce it, and tells you to reinstall them.
 
+### Enabling HGP per repository
+
+HGP is opt-in per repository. Run this once inside the repository (or any of its linked worktrees):
+
+```bash
+hgp init     # creates .hgp/ and keeps it out of git via .git/info/exclude
+```
+
+Until then, HGP tools return `HGP_NOT_INITIALIZED` and never create `.hgp/`, and the installed hooks do nothing in that repository. A repository that already has `.hgp/` (from an earlier version) stays enabled. To stop using HGP in a repository, run `hgp mode off`, or delete `.hgp/` (this deletes its history). Global mode (`HGP_GLOBAL_MODE`) is unaffected.
+
 ### Storage
 
 HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gitignored). The server resolves the active checkout from the nearest `.git` directory at startup. When running inside a linked Git worktree, it keeps file-safety checks scoped to that worktree but shares internal storage with the main repository through Git's `commondir`.
 
-- **Graph tools** (`hgp_create_operation`, queries, etc.): if no git repo is found, fall back to `<cwd>/.hgp/` with a warning.
+- **Graph tools** (`hgp_create_operation`, queries, etc.): outside a git repository they use `<cwd>/.hgp/` only if it already exists; otherwise they return `HGP_NOT_INITIALIZED`. To use HGP outside git, set `HGP_PROJECT_ROOT` and run `hgp init`, or use `HGP_GLOBAL_MODE`.
 - **File tools** (`hgp_write_file`, `hgp_edit_file`, etc.): always require a git repo or an explicit `HGP_PROJECT_ROOT`. Without one, they return `PROJECT_ROOT_NOT_FOUND`.
 
 The `.hgp/` directory is reserved for HGP internals. File tools reject any path that contains a `.hgp` directory segment — including nested paths like `sub/.hgp/file.txt` — and return `HGP_INTERNAL_PATH`. This applies across all `.hgp/` directories in a project tree, which is intentional for monorepo and nested-repo layouts.

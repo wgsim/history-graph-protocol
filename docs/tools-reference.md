@@ -1127,6 +1127,7 @@ The following table consolidates all error codes across all tools.
 
 | Error Code | Tool(s) | Condition |
 |---|---|---|
+| `HGP_NOT_INITIALIZED` | all tools | HGP is not enabled for the current repository (its `.hgp/` does not exist). Run `hgp init`. Nothing is created. |
 | `INVALID_OP_TYPE` | `hgp_create_operation` | `op_type` is not one of the four valid values |
 | `CHAIN_STALE` | `hgp_create_operation` | Supplied `chain_hash` does not match the current subgraph hash |
 | `INVALID_EVIDENCE_REF` | `hgp_create_operation` | One or more `evidence_refs` entries fail schema validation |

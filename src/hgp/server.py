@@ -1457,6 +1457,10 @@ action and decision.
 Record `hypothesis` operations for decisions, `artifact` for outputs,
 `invalidation` when superseding prior work.
 
+If an HGP tool returns `HGP_NOT_INITIALIZED`, HGP is not enabled for this
+repository: skip HGP for the session, use native tools, and do not run
+`hgp init` unless the user asks.
+
 ## Session Context (Subagent Support)
 
 To propagate HGP context to spawned subagents, register a session root op at
