@@ -24,3 +24,9 @@ HGP_Technical_Design.md
 E2E_Test_Report.md
 hgp_test_*.txt
 docs/hgp-*-e2e-test-results-*.md
+# Agent/tool working artifacts
+.antigravitycli/
+.cross_audit/
+conductor/
+docs/codex_reviews/
+docs/gemini_reviews/
