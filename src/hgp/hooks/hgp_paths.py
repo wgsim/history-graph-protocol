@@ -151,3 +151,9 @@ def find_hgp_dir(start: Path) -> Path | None:
         if candidate.is_dir():
             return candidate
     return None
+
+
+def hgp_enabled(start: Path) -> bool:
+    """Return whether HGP is enabled (its storage ``.hgp/`` exists) for ``start``."""
+    hgp_dir = find_hgp_dir(start)
+    return hgp_dir is not None and hgp_dir.is_dir()
