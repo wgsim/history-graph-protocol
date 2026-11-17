@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -192,6 +193,95 @@ def test_init_outside_git_fails(tmp_path: Path) -> None:
     assert r.returncode == 1
     assert "no git repository" in r.stderr
     assert not (plain / ".hgp").exists()
+
+
+# ── Task 4: hook preflight gate and fail-open ───────────────────────────────
+
+HOOKS = Path(__file__).parents[1] / "src" / "hgp" / "hooks"
+_CP = {"command": "cp a b"}
+# (script, event that makes the hook speak when HGP is enabled, needs bash marker)
+HOOK_CASES = [
+    pytest.param("claude/pre_tool_use_hgp.py", {"tool_name": "Write"}, False, id="claude-pre_tool_use"),
+    pytest.param("claude/pre_bash_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, False, id="claude-pre_bash"),
+    pytest.param("claude/post_bash_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, True, id="claude-post_bash"),
+    pytest.param("claude/subagent_start_hgp.py",
+                 {"hook_event_name": "SubagentStart", "session_id": "s"}, False, id="claude-subagent_start"),
+    pytest.param("claude/subagent_stop_hgp.py",
+                 {"hook_event_name": "SubagentStop", "session_id": "s"}, False, id="claude-subagent_stop"),
+    pytest.param("gemini/pre_tool_use_hgp.py", {"tool_name": "write_file"}, False, id="gemini-pre_tool_use"),
+    pytest.param("gemini/pre_bash_hgp.py",
+                 {"tool_name": "run_shell_command", "tool_input": _CP}, False, id="gemini-pre_bash"),
+    pytest.param("gemini/post_bash_hgp.py",
+                 {"tool_name": "run_shell_command", "tool_input": _CP}, True, id="gemini-post_bash"),
+    pytest.param("gemini/post_tool_use_hgp.py", {"tool_name": "write_file"}, False, id="gemini-post_tool_use"),
+    pytest.param("codex/pre_tool_use_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, False, id="codex-pre_tool_use"),
+    pytest.param("codex/post_tool_use_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, True, id="codex-post_tool_use"),
+]
+
+
+def _run_hook(script: Path, stdin: str, cwd: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+    env = {k: v for k, v in os.environ.items() if k != "HGP_HOOK_BLOCK"}
+    return subprocess.run(
+        [sys.executable, *flags, str(script)], input=stdin, cwd=cwd,
+        capture_output=True, text=True, env=env,
+    )
+
+
+@pytest.fixture
+def bash_marker() -> Iterator[Path]:
+    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
+    yield marker
+    marker.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("script,event,needs_marker", HOOK_CASES)
+def test_hooks_silent_without_hgp(
+    tmp_path: Path, bash_marker: Path, script: str, event: dict[str, object], needs_marker: bool,
+) -> None:
+    repo = git_init(tmp_path / "r")
+    (repo / "a").write_text("x")
+    if needs_marker:
+        bash_marker.write_text("cp")
+    r = _run_hook(HOOKS / script, json.dumps({**event, "cwd": str(repo)}), repo)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
+    assert not (repo / ".hgp").exists()
+
+
+def test_hooks_enabled_in_worktree(linked: tuple[Path, Path]) -> None:
+    repo, worktree = linked
+    (repo / ".hgp").mkdir()
+    r = _run_hook(HOOKS / "claude/pre_tool_use_hgp.py", '{"tool_name": "Write"}', worktree)
+    assert r.returncode == 0
+    assert "Native `Write` detected" in r.stderr
+
+
+@pytest.mark.parametrize("script,event,needs_marker", HOOK_CASES)
+def test_hooks_fail_open(tmp_path: Path, script: str, event: dict[str, object], needs_marker: bool) -> None:
+    repo = git_init(tmp_path / "r")
+    (repo / ".hgp").mkdir()
+    r = _run_hook(HOOKS / script, "not json{", repo)
+    assert r.returncode == 0
+    assert "Traceback" not in r.stderr
+
+
+def test_pre_tool_use_fail_open_on_unreadable_policy(tmp_path: Path) -> None:
+    repo = git_init(tmp_path / "r")
+    (repo / ".hgp" / "hook-policy").mkdir(parents=True)  # a directory: read_text() raises
+    r = _run_hook(HOOKS / "claude/pre_tool_use_hgp.py", '{"tool_name": "Write"}', repo)
+    assert r.returncode == 0
+    assert "Traceback" not in r.stderr
+
+
+def test_hook_without_helper_or_package(tmp_path: Path) -> None:
+    repo = git_init(tmp_path / "r")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "hook-policy").write_text("block")
+    lone = tmp_path / "installed"
+    lone.mkdir()
+    hook = lone / "pre_tool_use_hgp.py"
+    hook.write_bytes((HOOKS / "claude/pre_tool_use_hgp.py").read_bytes())
+    # -S: no site-packages, so neither hgp_paths beside the hook nor the hgp package exists.
+    assert _run_hook(hook, '{"tool_name": "Write"}', repo, "-S").returncode == 2
 
 
 def test_init_rejects_arguments(tmp_path: Path) -> None:
