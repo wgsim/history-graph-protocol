@@ -360,3 +360,30 @@ def test_stale_pre_and_missing_post_no_contradiction(tmp_path: Path) -> None:
     assert "post_tool_use_hgp.py" in result.stderr
     # no contradictory claim
     assert "Advisory/block policy enforcement still works" not in result.stderr
+
+
+@pytest.mark.parametrize("command_checkout", ["main", "worktree"])
+@pytest.mark.parametrize("legacy_checkout", ["main", "worktree", "sibling"])
+def test_shared_policy_preserves_legacy_hooks_in_other_checkouts(
+    tmp_path: Path, command_checkout: str, legacy_checkout: str,
+) -> None:
+    repo, worktree = _make_linked_worktree(tmp_path)
+    sibling = tmp_path / "sibling"
+    subprocess.run(
+        ["git", "worktree", "add", "-qb", "sibling", str(sibling)], cwd=repo, check=True,
+    )
+    roots = {"main": repo, "worktree": worktree, "sibling": sibling}
+    hook = roots[legacy_checkout] / ".claude" / "hooks" / "pre_tool_use_hgp.py"
+    hook.parent.mkdir(parents=True)
+    # Old policy consumers require the literal text 'block'. Exercise that contract
+    # against the shared file, independent of their older path-discovery mechanism.
+    policy = repo / ".hgp" / "hook-policy"
+    hook.write_text(
+        "import sys\nfrom pathlib import Path\n"
+        f"sys.exit(2 if Path({str(policy)!r}).read_text().strip() == 'block' else 0)\n"
+    )
+    result = _run(["hook-policy", "block"], cwd=roots[command_checkout])
+    assert result.returncode == 0, result.stderr
+    consumer = subprocess.run([sys.executable, str(hook)], capture_output=True, text=True)
+    assert consumer.returncode == 2, (policy.read_text(), result.stderr)
+    assert str(hook) in result.stderr

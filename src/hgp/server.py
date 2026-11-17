@@ -177,6 +177,16 @@ def _file_key(canonical: str, root: Path, ctx: HGPContext) -> str:
     return Path(canonical).relative_to(root.resolve()).as_posix()
 
 
+def _check_history_project(file_root: Path, ctx: HGPContext) -> dict[str, Any] | None:
+    """Allow history queries across shared checkouts, but not unrelated repos."""
+    if ctx.project_root is None:
+        return None  # global mode retains absolute file keys
+    storage_root = ctx.storage_root or find_storage_root(ctx.project_root)
+    if find_storage_root(file_root).resolve() == storage_root.resolve():
+        return None
+    return _check_file_project(file_root, ctx)
+
+
 def _present_ops(ops: list[dict[str, Any]], ctx: HGPContext) -> list[dict[str, Any]]:
     """Show repo-relative file keys as absolute paths in the active checkout."""
     if not isinstance(ctx.project_root, Path):
@@ -426,6 +436,8 @@ def hgp_query_operations(
     if file_path is not None:
         try:
             root = find_project_root(Path(file_path).parent)
+            if err := _check_history_project(root, ctx):
+                return err
             canonical_fp = _file_key(canonical_file_path(file_path, root), root, ctx)
         except (ProjectRootError, PathOutsideRootError) as exc:
             _log.debug("hgp_query_operations: file_path canonicalization failed, using raw path: %s", exc)
@@ -459,6 +471,8 @@ def hgp_file_history(
     # history recorded from any linked worktree of the repository is returned.
     try:
         root = find_project_root(Path(file_path).parent)
+        if err := _check_history_project(root, ctx):
+            return err
         query_path = canonical_file_path(file_path, root)
         key = _file_key(query_path, root, ctx)
     except (ProjectRootError, PathOutsideRootError):
@@ -1192,7 +1206,12 @@ def hgp_move_file(
     # Auto-resolve previous_op_id from DB if not supplied by caller
     resolved_previous_op_id = previous_op_id
     if resolved_previous_op_id is None:
-        latest = db.get_ops_by_file_path(_file_key(canonical_old, root, ctx), limit=1)
+        linked_root = _linked_checkout_root(ctx)
+        latest = db.get_ops_by_file_path(
+            _file_key(canonical_old, root, ctx), limit=1,
+            scope_checkout=ctx.project_root is not None,
+            checkout_root=str(linked_root) if linked_root else None,
+        )
         if latest:
             resolved_previous_op_id = dict(latest[0])["op_id"]
 
@@ -2055,10 +2074,24 @@ _HOOK_POLICY_USAGE = (
 
 
 def _installed_policy_hooks(project_root: Path) -> list[Path]:
-    """Hook scripts that read .hgp/hook-policy: project-local and user-global installs."""
+    """Find policy consumers across all checkouts sharing this repository's store."""
+    storage_root = find_storage_root(project_root)
+    roots = {project_root.resolve(), storage_root.resolve(), Path.home()}
+    worktrees_dir = storage_root / ".git" / "worktrees"
+    if worktrees_dir.is_dir():
+        for admin in worktrees_dir.iterdir():
+            try:
+                pointer = Path((admin / "gitdir").read_text(encoding="utf-8").strip())
+                if not pointer.is_absolute():
+                    pointer = admin / pointer
+                checkout = pointer.resolve().parent
+                if find_storage_root(checkout).resolve() == storage_root.resolve():
+                    roots.add(checkout)
+            except (OSError, UnicodeError, RuntimeError):
+                continue  # stale/pruned worktree registration
     return [
         base / client / "hooks" / "pre_tool_use_hgp.py"
-        for base in (project_root, Path.home())
+        for base in sorted(roots)
         for client in _HOOK_CLIENT_DIRS
     ]
 
