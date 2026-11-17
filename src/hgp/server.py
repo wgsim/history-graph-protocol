@@ -1320,6 +1320,29 @@ def _read_mode() -> str:
     return "on"
 
 
+def _check_initialized() -> dict[str, Any] | None:
+    """Return HGP_NOT_INITIALIZED unless HGP is enabled for the current checkout.
+
+    HGP is opt-in: it is enabled when the storage `.hgp/` exists (created by
+    `hgp init`). The server never creates it implicitly. A bound context or
+    global mode always passes. A negative result is not cached, so `hgp init`
+    takes effect on the next call.
+    """
+    if _ctx is not None or os.environ.get("HGP_GLOBAL_MODE"):
+        return None
+    try:
+        root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        root = Path.cwd()
+    storage_root = find_storage_root(root)
+    if (storage_root / ".hgp").is_dir():
+        return None
+    return {
+        "error": "HGP_NOT_INITIALIZED",
+        "message": f"HGP is not enabled for {storage_root}. Run `hgp init` to enable it.",
+    }
+
+
 def _check_mode(mutation: bool = True) -> dict[str, Any] | None:
     """Return an early-exit response if the current mode disables this call.
 
@@ -1328,6 +1351,8 @@ def _check_mode(mutation: bool = True) -> dict[str, Any] | None:
 
     Returns None if the call should proceed normally.
     """
+    if (not_initialized := _check_initialized()) is not None:
+        return not_initialized
     mode = _read_mode()
     if mode == "off":
         return {"status": "HGP_DISABLED", "message": "HGP is disabled. Run `hgp mode on` to resume."}
