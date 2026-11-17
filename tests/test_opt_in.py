@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -123,3 +125,78 @@ def test_global_mode_unaffected(unbound: None, tmp_path: Path, monkeypatch: pyte
     monkeypatch.setenv("HGP_GLOBAL_MODE", "1")
     assert "op_id" in hgp_create_operation(op_type="hypothesis", agent_id="a")
     assert (home / ".hgp").is_dir()
+
+
+# ── Task 3: hgp init ────────────────────────────────────────────────────────
+
+def _init(cwd: Path, tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {k: v for k, v in os.environ.items() if k not in ("HGP_PROJECT_ROOT", "HGP_GLOBAL_MODE")}
+    env["HOME"] = str(tmp_path / "home")
+    return subprocess.run(
+        [sys.executable, "-m", "hgp.server", "init", *args],
+        cwd=cwd, capture_output=True, text=True, env=env,
+    )
+
+
+def _exclude_lines(repo: Path) -> list[str]:
+    exclude = repo / ".git" / "info" / "exclude"
+    return exclude.read_text().splitlines() if exclude.exists() else []
+
+
+def _untracked(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout
+
+
+def test_init_creates_dir_and_excludes(tmp_path: Path) -> None:
+    repo = git_init(tmp_path / "r")
+    r = _init(repo, tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert (repo / ".hgp").is_dir()
+    assert ".hgp/" in _exclude_lines(repo)
+    assert ".hgp" not in _untracked(repo)
+    assert "HGP enabled" in r.stdout
+
+
+def test_init_idempotent(tmp_path: Path) -> None:
+    repo = git_init(tmp_path / "r")
+    _init(repo, tmp_path)
+    r = _init(repo, tmp_path)
+    assert r.returncode == 0
+    assert "already enabled" in r.stdout
+    assert _exclude_lines(repo).count(".hgp/") == 1
+
+
+def test_init_respects_existing_gitignore(tmp_path: Path) -> None:
+    repo = git_init(tmp_path / "r")
+    (repo / ".gitignore").write_text(".hgp/\n")
+    before = _exclude_lines(repo)
+    assert _init(repo, tmp_path).returncode == 0
+    assert _exclude_lines(repo) == before
+
+
+def test_init_from_worktree_enables_main(linked: tuple[Path, Path], tmp_path: Path) -> None:
+    repo, worktree = linked
+    assert _init(worktree, tmp_path).returncode == 0
+    assert (repo / ".hgp").is_dir()
+    assert not (worktree / ".hgp").exists()
+    assert ".hgp" not in _untracked(repo)
+
+
+def test_init_outside_git_fails(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    r = _init(plain, tmp_path)
+    assert r.returncode == 1
+    assert "no git repository" in r.stderr
+    assert not (plain / ".hgp").exists()
+
+
+def test_init_rejects_arguments(tmp_path: Path) -> None:
+    repo = git_init(tmp_path / "r")
+    r = _init(repo, tmp_path, "--bogus")
+    assert r.returncode == 1
+    assert "usage: hgp init" in r.stderr
+    assert not (repo / ".hgp").exists()

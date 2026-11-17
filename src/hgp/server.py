@@ -2742,11 +2742,70 @@ def _hgp_import(args: list[str]) -> None:
     print(f"Imported '{repo_name}' from {source}")
 
 
+_INIT_USAGE = (
+    "usage: hgp init\n"
+    "\n"
+    "  Enable HGP for the current git repository: create its .hgp/ store\n"
+    "  (the main repository's, when run inside a linked worktree) and keep\n"
+    "  .hgp/ out of git via .git/info/exclude unless it is already ignored.\n"
+)
+
+
+def _init(args: list[str]) -> None:
+    """`hgp init`: the only command whose purpose is to create a repository's .hgp/."""
+    import sys
+
+    if args:
+        print(_INIT_USAGE, file=sys.stderr, end="")
+        sys.exit(1)
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp init: no git repository found from current directory.\n"
+            "Run it inside a git repository, or set HGP_PROJECT_ROOT to enable HGP outside git.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    storage_root = find_storage_root(project_root)
+    hgp_dir = storage_root / ".hgp"
+    existed = hgp_dir.is_dir()
+    hgp_dir.mkdir(parents=True, exist_ok=True)
+    print(f"HGP {'already enabled' if existed else 'enabled'}: {hgp_dir}")
+
+    try:
+        ignored = subprocess.run(
+            ["git", "-C", str(storage_root), "check-ignore", "-q", ".hgp"],
+            capture_output=True,
+        ).returncode == 0
+        if ignored:
+            return
+        common = subprocess.run(
+            ["git", "-C", str(storage_root), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"hgp init: could not keep .hgp/ out of git ({exc}); add it to .gitignore yourself.",
+              file=sys.stderr)
+        return
+    common_dir = Path(common) if Path(common).is_absolute() else storage_root / common
+    exclude = common_dir / "info" / "exclude"
+    lines = exclude.read_text().splitlines() if exclude.exists() else []
+    if ".hgp/" not in lines:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "\n" if lines and not exclude.read_text().endswith("\n") else ""
+        with exclude.open("a", encoding="utf-8") as f:
+            f.write(f"{prefix}.hgp/\n")
+        print(f"Added .hgp/ to {exclude}")
+
+
 def run() -> None:
     """Entry point for `hgp` console script.
 
     Usage:
         hgp                          # start MCP server (stdio)
+        hgp init                     # enable HGP for this repository (creates .hgp/)
         hgp install                  # register MCP + install hooks + inject instructions
         hgp install --claude         # Claude Code only
         hgp install --gemini         # Gemini CLI only
@@ -2765,7 +2824,9 @@ def run() -> None:
     import sys
 
     args = sys.argv[1:]
-    if args and args[0] == "install":
+    if args and args[0] == "init":
+        _init(args[1:])
+    elif args and args[0] == "install":
         _install(args[1:])
     elif args and args[0] == "mode":
         _mode(args[1:])
