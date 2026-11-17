@@ -7,6 +7,29 @@ Set HGP_HOOK_BLOCK=1 to make the hook reject native file tool calls.
 import json
 import os
 import sys
+from typing import Any
+
+
+def _load_hgp_paths() -> Any:
+    """Load hgp_paths.py installed beside this hook (or from the package tree)."""
+    import importlib.util
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "hgp_paths.py", here.parent / "hgp_paths.py"):
+        if not candidate.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("_hgp_paths", candidate)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except Exception:
+            continue
+    return None
+
 
 HGP_TOOLS = {
     "Write": "hgp_write_file",
@@ -20,8 +43,16 @@ def _resolve_block_mode() -> bool:
     if env is not None:
         return env == "1"
     from pathlib import Path
+
+    paths = _load_hgp_paths()
+
+    def shared_hgp_dir(root: Path) -> Path:
+        if paths is not None:
+            return Path(paths.shared_hgp_dir(root))
+        return root / ".hgp"  # partial install without hgp_paths.py
+
     for parent in [Path.cwd(), *Path.cwd().parents]:
-        policy_file = parent / ".hgp" / "hook-policy"
+        policy_file = shared_hgp_dir(parent) / "hook-policy"
         if policy_file.exists():
             return policy_file.read_text().strip() == "block"
         if (parent / ".git").exists():

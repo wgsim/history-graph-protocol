@@ -33,6 +33,7 @@ from hgp.project import (
     ProjectRootError,
     canonical_file_path,
     find_project_root,
+    find_storage_root,
 )
 from hgp.reconciler import Reconciler
 
@@ -63,7 +64,8 @@ class HGPContext:
     cas: CAS
     lease_mgr: LeaseManager
     reconciler: Reconciler
-    project_root: Path | None  # None = global mode (~/.hgp/)
+    project_root: Path | None  # active checkout root; None = global mode
+    storage_root: Path | None = None  # shared repository root for .hgp/
 
 
 _ctx: HGPContext | None = None
@@ -78,18 +80,21 @@ def _get_context() -> HGPContext:
     if _ctx is None:
         if os.environ.get("HGP_GLOBAL_MODE"):
             project_root = None
+            storage_root = None
         else:
             try:
                 project_root = find_project_root(Path.cwd())
+                storage_root = find_storage_root(project_root)
             except ProjectRootError:
                 project_root = Path.cwd()
+                storage_root = project_root
                 _log.warning(
                     "No .git repository found from cwd; using cwd-local store %s/.hgp/. "
                     "Run from inside a git repository for repo-local storage, or set "
                     "HGP_PROJECT_ROOT to specify a root explicitly.",
                     project_root,
                 )
-        hgp_dir = (project_root / ".hgp") if project_root else (Path.home() / ".hgp")
+        hgp_dir = (storage_root / ".hgp") if storage_root else (Path.home() / ".hgp")
         hgp_content_dir = hgp_dir / ".hgp_content"
         db = Database(hgp_dir / "hgp.db")
         try:
@@ -98,7 +103,7 @@ def _get_context() -> HGPContext:
             db.initialize()
             cas = CAS(hgp_content_dir)
             lease_mgr = LeaseManager(db)
-            reconciler = Reconciler(db, cas, hgp_content_dir)
+            reconciler = Reconciler(db, cas, hgp_content_dir, project_root=project_root)
             db.expire_leases()
             db.commit()
             startup_report = reconciler.reconcile()
@@ -109,7 +114,7 @@ def _get_context() -> HGPContext:
             raise
         _ctx = HGPContext(
             db=db, cas=cas, lease_mgr=lease_mgr, reconciler=reconciler,
-            project_root=project_root,
+            project_root=project_root, storage_root=storage_root,
         )
     return _ctx
 
@@ -545,6 +550,8 @@ def _context_file_path(hgp_dir: Path, session_id: str) -> Path:
 
 
 def _hgp_dir_from_ctx(ctx: HGPContext) -> Path:
+    if isinstance(ctx.storage_root, Path):
+        return ctx.storage_root / ".hgp"
     if ctx.project_root is not None:
         return ctx.project_root / ".hgp"
     return Path.home() / ".hgp"
@@ -596,7 +603,12 @@ def hgp_get_context(session_id: str, consume_summaries: bool = True) -> dict[str
     age = time.time() - data.get("set_at", 0)
 
     summaries: list[dict[str, Any]] = []
+    # .hgp/ may be shared by several worktrees/sessions: the glob alone would also
+    # match a session id that merely starts with this one ("s1" vs "s1-x").
+    own_summary = re.compile(rf"subagent-summary-{re.escape(session_id)}-\d+-[0-9a-f]{{8}}\.json")
     for p in sorted(hgp_dir.glob(f"subagent-summary-{session_id}-*.json")):
+        if not own_summary.fullmatch(p.name):
+            continue
         try:
             summaries.append(json.loads(p.read_text(encoding="utf-8")))
             if consume_summaries:
@@ -1224,7 +1236,8 @@ def _read_mode() -> str:
         ctx = _get_context()
         if ctx.project_root is None:
             return "on"
-        mode_file = ctx.project_root / ".hgp" / "mode"
+        hgp_root = ctx.storage_root if isinstance(ctx.storage_root, Path) else ctx.project_root
+        mode_file = hgp_root / ".hgp" / "mode"
         if mode_file.exists():
             val = mode_file.read_text().strip()
             return val if val in _VALID_MODES else "on"
@@ -1289,7 +1302,8 @@ def _mode(args: list[str]) -> None:
         )
         sys.exit(1)
 
-    mode_file = project_root / ".hgp" / "mode"
+    storage_root = find_storage_root(project_root)
+    mode_file = storage_root / ".hgp" / "mode"
 
     if not args:
         if mode_file.exists():
@@ -1373,7 +1387,9 @@ def _install_hooks_files(pkg: str, dest_dir: Path) -> list[str]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     installed: list[str] = []
     pkg_ref = importlib.resources.files(f"hgp.hooks.{pkg}")
-    for item in pkg_ref.iterdir():
+    # hgp_paths.py is shared by all clients' hooks and loaded from beside them.
+    shared = importlib.resources.files("hgp.hooks") / "hgp_paths.py"
+    for item in [*pkg_ref.iterdir(), shared]:
         if item.name.endswith(".py") and not item.name.startswith("__"):
             dest = dest_dir / item.name
             with importlib.resources.as_file(item) as src:
@@ -1796,7 +1812,8 @@ def _install_hooks(args: list[str]) -> None:
     def _copy_hooks(pkg: str, dest_dir: Path) -> None:
         dest_dir.mkdir(parents=True, exist_ok=True)
         pkg_ref = importlib.resources.files(f"hgp.hooks.{pkg}")
-        for item in pkg_ref.iterdir():
+        shared = importlib.resources.files("hgp.hooks") / "hgp_paths.py"
+        for item in [*pkg_ref.iterdir(), shared]:
             if item.name.endswith(".py") and not item.name.startswith("__"):
                 dest = dest_dir / item.name
                 with importlib.resources.as_file(item) as src:
@@ -1846,7 +1863,7 @@ def _hook_policy(args: list[str]) -> None:
         )
         sys.exit(1)
 
-    policy_file = project_root / ".hgp" / "hook-policy"
+    policy_file = find_storage_root(project_root) / ".hgp" / "hook-policy"
 
     if not args:
         # read current policy
@@ -2188,7 +2205,8 @@ def _hgp_backup(args: list[str]) -> None:
         )
         sys.exit(1)
 
-    hgp_dir = project_root / ".hgp"
+    storage_root = find_storage_root(project_root)
+    hgp_dir = storage_root / ".hgp"
     if not hgp_dir.exists():
         print("hgp backup: no .hgp/ directory found. Nothing to back up.", file=sys.stderr)
         sys.exit(1)
@@ -2243,7 +2261,8 @@ def _hgp_restore(args: list[str]) -> None:
         )
         sys.exit(1)
 
-    hgp_dir = project_root / ".hgp"
+    storage_root = find_storage_root(project_root)
+    hgp_dir = storage_root / ".hgp"
 
     # Determine backup_dir
     if project_id:
@@ -2313,7 +2332,7 @@ def _hgp_restore(args: list[str]) -> None:
             )
         sys.exit(1)
 
-    _restore_snapshot(backup_dir, project_root)
+    _restore_snapshot(backup_dir, storage_root)
     repo_name = (source_meta or {}).get("repo_name", project_root.name)
     print(f"Restored '{repo_name}' from {backup_dir}")
 
@@ -2341,7 +2360,8 @@ def _hgp_export(args: list[str]) -> None:
         )
         sys.exit(1)
 
-    hgp_dir = project_root / ".hgp"
+    storage_root = find_storage_root(project_root)
+    hgp_dir = storage_root / ".hgp"
     if not hgp_dir.exists():
         print("hgp export: no .hgp/ directory found. Nothing to export.", file=sys.stderr)
         sys.exit(1)
@@ -2411,7 +2431,8 @@ def _hgp_import(args: list[str]) -> None:
             )
         sys.exit(1)
 
-    hgp_dir = project_root / ".hgp"
+    storage_root = find_storage_root(project_root)
+    hgp_dir = storage_root / ".hgp"
     if hgp_dir.exists() and not force:
         print(
             f"hgp import: .hgp/ already exists at {hgp_dir}\n"
@@ -2420,7 +2441,7 @@ def _hgp_import(args: list[str]) -> None:
         )
         sys.exit(1)
 
-    _restore_snapshot(source, project_root)
+    _restore_snapshot(source, storage_root)
     repo_name = (source_meta or {}).get("repo_name", project_root.name)
     print(f"Imported '{repo_name}' from {source}")
 

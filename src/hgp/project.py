@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# Re-exported: single implementation shared with the standalone hook scripts.
+from hgp.hooks.hgp_paths import find_storage_root as find_storage_root
+
 
 class ProjectRootError(RuntimeError):
     """Raised when no project root can be determined."""

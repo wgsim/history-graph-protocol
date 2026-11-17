@@ -22,6 +22,22 @@ def _make_git_repo(path: Path) -> Path:
     return path.resolve()
 
 
+def _make_linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = _make_git_repo(tmp_path / "repo")
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("initial")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=repo, check=True)
+    worktree = tmp_path / "worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", str(worktree), "-b", "feature"],
+        cwd=repo,
+        check=True,
+    )
+    return repo, worktree
+
+
 # ---------------------------------------------------------------------------
 # read policy
 # ---------------------------------------------------------------------------
@@ -40,6 +56,22 @@ def test_read_policy_after_set(tmp_path: Path) -> None:
     result = _run(["hook-policy"], cwd=repo)
     assert result.returncode == 0
     assert result.stdout.strip() == "block"
+
+
+def test_hook_reads_policy_from_main_repo_for_worktree(tmp_path: Path) -> None:
+    repo, worktree = _make_linked_worktree(tmp_path)
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "hook-policy").write_text("block")
+    hook = Path(__file__).parents[1] / "src" / "hgp" / "hooks" / "claude" / "pre_tool_use_hgp.py"
+    result = subprocess.run(
+        [sys.executable, str(hook)],
+        input='{"tool_name":"Write"}',
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "Native `Write` detected" in result.stderr
 
 
 # ---------------------------------------------------------------------------

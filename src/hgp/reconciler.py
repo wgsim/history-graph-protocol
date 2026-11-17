@@ -41,10 +41,27 @@ def _file_matches_hash(file_path: str, expected_hash: str) -> bool:
 
 
 class Reconciler:
-    def __init__(self, db: Database, cas: CAS, content_dir: Path) -> None:
+    def __init__(
+        self,
+        db: Database,
+        cas: CAS,
+        content_dir: Path,
+        project_root: Path | None = None,
+    ) -> None:
         self._db = db
         self._cas = cas
         self._staging_dir = content_dir / ".staging"
+        self._project_root = project_root.resolve() if project_root is not None else None
+
+    def _file_path_in_scope(self, file_path: str) -> bool:
+        """Return whether a pending file operation belongs to this checkout."""
+        if self._project_root is None:
+            return True
+        try:
+            Path(file_path).resolve().relative_to(self._project_root)
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
 
     def reconcile(self, dry_run: bool = False) -> ReconcileReport:
         report = ReconcileReport()
@@ -107,6 +124,8 @@ class Reconciler:
             file_path = op.get("file_path")
             if not file_path:
                 # Not a file-tracking op — skip
+                continue
+            if not self._file_path_in_scope(file_path):
                 continue
             op_type = op.get("op_type")
             op_id = op["op_id"]

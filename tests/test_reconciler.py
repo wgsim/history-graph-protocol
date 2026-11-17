@@ -227,6 +227,24 @@ def test_rule5_pending_artifact_stale_hash_mismatch(hgp_dirs: dict):
     assert db.get_operation(op_id)["status"] == "STALE_PENDING"
 
 
+def test_rule5_pending_file_outside_project_scope_is_untouched(hgp_dirs: dict):
+    """A scoped reconciler must not recover a pending file from another worktree."""
+    db, cas, _ = _setup(hgp_dirs)
+    other_root = hgp_dirs["root"].parent / "other-worktree"
+    other_root.mkdir()
+    target = other_root / "outside.txt"
+    content = b"belongs elsewhere"
+    target.write_bytes(content)
+    op_id = _insert_stale_pending_artifact(db, cas, str(target), content)
+
+    scoped = Reconciler(db, cas, hgp_dirs["content_dir"], project_root=hgp_dirs["root"])
+    report = scoped.reconcile()
+
+    assert report.pending_recovered == 0
+    assert report.pending_stale == 0
+    assert db.get_operation(op_id)["status"] == "PENDING"
+
+
 def test_rule5_pending_delete_recovered(hgp_dirs: dict):
     """PENDING invalidation where file is gone → COMPLETED."""
     db, cas, rec = _setup(hgp_dirs)

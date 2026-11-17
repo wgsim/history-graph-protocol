@@ -20,6 +20,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 # ── Read-only command prefixes — skip pattern matching for these ──────────────
 _READONLY_PREFIXES = (
@@ -92,13 +93,40 @@ _MEDIUM_PATTERNS = [
 _HGP_MODE_PATTERN = re.compile(r"\bhgp\s+mode\b")
 
 
+def _load_hgp_paths() -> Any:
+    """Load hgp_paths.py installed beside this hook (or from the package tree)."""
+    import importlib.util
+
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "hgp_paths.py", here.parent / "hgp_paths.py"):
+        if not candidate.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("_hgp_paths", candidate)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except Exception:
+            continue
+    return None
+
+
 def _resolve_block_mode() -> bool:
     """Check HGP_HOOK_BLOCK env var, then fall back to .hgp/hook-policy file."""
     env = os.environ.get("HGP_HOOK_BLOCK")
     if env is not None:
         return env == "1"
+    paths = _load_hgp_paths()
+
+    def shared_hgp_dir(root: Path) -> Path:
+        if paths is not None:
+            return Path(paths.shared_hgp_dir(root))
+        return root / ".hgp"  # partial install without hgp_paths.py
+
     for parent in [Path.cwd(), *Path.cwd().parents]:
-        policy_file = parent / ".hgp" / "hook-policy"
+        policy_file = shared_hgp_dir(parent) / "hook-policy"
         if policy_file.exists():
             return policy_file.read_text().strip() == "block"
         if (parent / ".git").exists():

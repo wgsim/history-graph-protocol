@@ -16,8 +16,32 @@ from pathlib import Path
 from typing import Any, cast
 
 
+def _load_hgp_paths() -> Any:
+    """Load hgp_paths.py installed beside this hook (or from the package tree)."""
+    import importlib.util
+
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "hgp_paths.py", here.parent / "hgp_paths.py"):
+        if not candidate.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("_hgp_paths", candidate)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except Exception:
+            continue
+    return None
+
+
 def _find_hgp_dir(cwd: str) -> Path | None:
     start = Path(cwd)
+    paths = _load_hgp_paths()
+    if paths is not None:
+        return paths.find_hgp_dir(start)
+    # Fallback for partial installs without hgp_paths.py: worktree-local lookup.
     for parent in [start, *start.parents]:
         candidate = parent / ".hgp"
         if candidate.is_dir():
