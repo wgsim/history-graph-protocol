@@ -10,6 +10,18 @@ from pathlib import Path
 
 import pytest
 
+HOOKS = Path(__file__).parents[1] / "src" / "hgp" / "hooks"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep the developer's own ~/.claude etc. hooks out of policy-format decisions."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("HGP_HOOK_BLOCK", raising=False)
+    return home
+
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -139,6 +151,68 @@ def test_hook_reads_json_and_legacy_policy(tmp_path: Path, content: str, blocked
         cwd=repo, capture_output=True, text=True, env=env,
     )
     assert (result.returncode == 2) is blocked
+
+
+_JSON_UNAWARE_HOOK = (
+    "def _resolve_block_mode():\n"
+    "    return open('.hgp/hook-policy').read().strip() == 'block'\n"
+)
+
+
+@pytest.mark.parametrize("where", ["local", "global"])
+def test_policy_written_as_legacy_text_while_json_unaware_hooks_installed(
+    tmp_path: Path, _isolated_home: Path, where: str,
+) -> None:
+    repo = _make_git_repo(tmp_path / "repo")
+    base = repo if where == "local" else _isolated_home
+    hooks = base / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "pre_tool_use_hgp.py").write_text(_JSON_UNAWARE_HOOK)
+
+    result = _run(["hook-policy", "block"], cwd=repo)
+    assert result.returncode == 0
+    assert (repo / ".hgp" / "hook-policy").read_text().strip() == "block"
+    assert "legacy plain-text format" in result.stderr
+
+    (hooks / "pre_tool_use_hgp.py").write_bytes((HOOKS / "claude" / "pre_tool_use_hgp.py").read_bytes())
+    _run(["hook-policy", "block"], cwd=repo)
+    assert json.loads((repo / ".hgp" / "hook-policy").read_text()) == {"block_mode": True}
+
+
+def _hook_blocks(hook: Path, cwd: Path) -> bool:
+    result = subprocess.run(
+        [sys.executable, str(hook)], input='{"tool_name":"Write"}',
+        cwd=cwd, capture_output=True, text=True,
+    )
+    return result.returncode == 2
+
+
+def test_hook_honors_legacy_worktree_local_block_policy(tmp_path: Path) -> None:
+    repo, worktree = _make_linked_worktree(tmp_path)
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "hook-policy").write_text('{"block_mode": false}')
+    (worktree / ".hgp").mkdir()
+    (worktree / ".hgp" / "hook-policy").write_text("block")  # written before storage was shared
+    for client in ("claude", "gemini"):
+        hook = HOOKS / client / "pre_tool_use_hgp.py"
+        if client == "gemini":
+            r = subprocess.run(
+                [sys.executable, str(hook)], input='{"tool_name":"write_file"}',
+                cwd=worktree, capture_output=True, text=True,
+            )
+            assert '"deny"' in r.stdout
+        else:
+            assert _hook_blocks(hook, worktree)
+
+
+def test_partial_install_hook_reads_json_policy(tmp_path: Path) -> None:
+    repo = _make_git_repo(tmp_path / "repo")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "hook-policy").write_text('{"block_mode": true}')
+    lone = tmp_path / "installed"
+    lone.mkdir()
+    (lone / "pre_tool_use_hgp.py").write_bytes((HOOKS / "claude" / "pre_tool_use_hgp.py").read_bytes())
+    assert _hook_blocks(lone / "pre_tool_use_hgp.py", repo)  # no hgp_paths.py beside it
 
 
 def test_set_policy_from_worktree_updates_main_repo(tmp_path: Path) -> None:

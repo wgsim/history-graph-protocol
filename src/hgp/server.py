@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, cast
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
@@ -1563,7 +1563,7 @@ def _hook_backups_cmd(args: list[str]) -> None:
     total = removed = 0
     for client in _HOOK_CLIENT_DIRS:
         hooks_dir = base_dir / client / "hooks"
-        for base, paths in _hook_backups(hooks_dir).items():
+        for paths in _hook_backups(hooks_dir).values():
             total += len(paths)
             doomed = paths[: max(len(paths) - keep, 0)] if prune else []
             for p in paths:
@@ -2054,6 +2054,15 @@ _HOOK_POLICY_USAGE = (
 )
 
 
+def _installed_policy_hooks(project_root: Path) -> list[Path]:
+    """Hook scripts that read .hgp/hook-policy: project-local and user-global installs."""
+    return [
+        base / client / "hooks" / "pre_tool_use_hgp.py"
+        for base in (project_root, Path.home())
+        for client in _HOOK_CLIENT_DIRS
+    ]
+
+
 def _hook_policy(args: list[str]) -> None:
     """Read or set the persistent hook enforcement policy."""
     import sys
@@ -2083,15 +2092,34 @@ def _hook_policy(args: list[str]) -> None:
 
     new_policy = args[0]
     # JSON schema {"block_mode": bool}; keep any other keys already present.
-    try:
-        data = json.loads(existing) if existing.strip().startswith("{") else {}
-    except ValueError:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    data: dict[str, Any] = {}
+    if existing.strip().startswith("{"):
+        try:
+            loaded: object = json.loads(existing)
+        except ValueError:
+            loaded = None
+        if isinstance(loaded, dict):
+            data = dict(cast(dict[str, Any], loaded))
     data["block_mode"] = new_policy == "block"
     policy_file.parent.mkdir(parents=True, exist_ok=True)
-    policy_file.write_text(json.dumps(data) + "\n")
+    # Installed hooks from before the JSON format compare the file to "block" and
+    # would read JSON as advisory (fail-open). While any are installed, keep the
+    # legacy plain-text format, which every hook version understands.
+    json_unaware = [
+        p for p in _installed_policy_hooks(project_root)
+        if p.is_file() and "parse_hook_policy" not in p.read_text(errors="replace")
+    ]
+    if json_unaware:
+        policy_file.write_text(new_policy + "\n")
+        print(
+            "Warning: these installed hook(s) do not read the JSON hook-policy format,\n"
+            "so the policy was written in the legacy plain-text format instead:\n"
+            + "".join(f"  {p}\n" for p in json_unaware)
+            + "Run `hgp install` (add --local for project hooks) to update them.",
+            file=sys.stderr,
+        )
+    else:
+        policy_file.write_text(json.dumps(data) + "\n")
     print(f"Hook policy set to: {new_policy}")
 
     # warn if installed hooks predate hook-policy support (policy enforcement broken)

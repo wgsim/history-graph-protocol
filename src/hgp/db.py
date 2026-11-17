@@ -234,8 +234,9 @@ class Database:
         When any row changes, the database is first copied to ``backup_path``.
         Returns the number of rows rewritten.
         """
-        import json
         import os
+
+        from hgp.hooks.hgp_paths import checkout_root_from_metadata
 
         assert self._conn
         name = "v6_relative_file_keys"
@@ -249,14 +250,8 @@ class Database:
             fp = row["file_path"]
             if not os.path.isabs(fp):
                 continue
-            base = main_root
-            try:
-                meta = json.loads(row["metadata"] or "null")
-            except ValueError:
-                meta = None
-            checkout = meta.get("hgp_checkout") if isinstance(meta, dict) else None
-            if isinstance(checkout, dict) and isinstance(checkout.get("root"), str):
-                base = Path(checkout["root"])
+            checkout_root = checkout_root_from_metadata(row["metadata"])
+            base = Path(checkout_root) if checkout_root else main_root
             try:
                 updates.append((Path(fp).relative_to(base).as_posix(), row["op_id"]))
             except ValueError:

@@ -53,13 +53,24 @@ def _resolve_block_mode() -> bool:
             return Path(paths.shared_hgp_dir(root))
         return root / ".hgp"  # partial install without hgp_paths.py
 
+    def is_block(text: str) -> bool:
+        if paths is not None:
+            return paths.parse_hook_policy(text) is True
+        stripped = text.strip()  # partial install without hgp_paths.py
+        if stripped.startswith("{"):
+            try:
+                return json.loads(stripped).get("block_mode") is True
+            except (ValueError, AttributeError):
+                return False
+        return stripped == "block"
+
     for parent in [Path.cwd(), *Path.cwd().parents]:
-        policy_file = shared_hgp_dir(parent) / "hook-policy"
-        if policy_file.exists():
-            text = policy_file.read_text()
-            if paths is not None:
-                return paths.parse_hook_policy(text) is True
-            return text.strip() == "block"  # legacy reader for partial installs
+        # Shared policy plus a checkout-local legacy one (written before storage
+        # was shared): block if either says so, so upgrading never drops enforcement.
+        candidates = dict.fromkeys([shared_hgp_dir(parent) / "hook-policy", parent / ".hgp" / "hook-policy"])
+        found = [p for p in candidates if p.exists()]
+        if found:
+            return any(is_block(p.read_text()) for p in found)
         if (parent / ".git").exists():
             break
     return False

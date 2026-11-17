@@ -294,7 +294,7 @@ hgp hook-policy block        # block native Write/Edit/MultiEdit/write_file/repl
 
 > If you installed hooks before this feature was added, run `hgp install` again to update them.
 
-The policy is stored in `.hgp/hook-policy` as JSON (`{"block_mode": true}`; other keys are preserved when the CLI updates it). Legacy plain-text files containing `block` or `advisory` are still read; unrecognised content is treated as advisory.
+The policy is stored in `.hgp/hook-policy` as JSON (`{"block_mode": true}`; other keys are preserved when the CLI updates it). Legacy plain-text files containing `block` or `advisory` are still read; unrecognised content is treated as advisory. While any installed `pre_tool_use_hgp.py` (project-local or in `~/.claude`, `~/.gemini`, `~/.codex`) predates the JSON format, `hgp hook-policy` keeps writing the plain-text format so those hooks still enforce it, and tells you to reinstall them.
 
 ### Storage
 
@@ -318,7 +318,7 @@ All worktrees of a repository share the main repository's `.hgp/` (database, blo
 - **Provenance**: operations recorded from a linked worktree carry `metadata.hgp_checkout = {"root": <worktree path>, "branch": <branch or null>}` (reserved key). It records where an operation came from; it is not part of the file identity. Operations from the main checkout are untagged.
 - **Queries**: `hgp_query_operations` returns the whole repository's history by default (`scope="repo"`); pass `scope="checkout"` to narrow to operations recorded from the active checkout. `hgp_file_history` returns a file's history from every worktree.
 - **Reconcile**: each checkout reconciles only its own pending file operations. Pending operations of a worktree whose directory no longer exists are marked `STALE_PENDING` (reported as `pending_orphaned`).
-- **Behaviour change**: a `.hgp/mode` or `.hgp/hook-policy` inside a linked worktree is no longer read; set them from any checkout and they apply to all.
+- **Behaviour change**: a `.hgp/mode` inside a linked worktree is no longer read; set it from any checkout and it applies to all. A legacy `.hgp/hook-policy` left inside a worktree is still honoured for `block` (hooks block if either the shared or the worktree-local policy says so), so upgrading never silently drops enforcement.
 - **Restore/import**: `hgp restore` and `hgp import` run inside a linked worktree replace history for every worktree, so they require `--shared` to confirm.
 - **Hooks**: `hgp install` / `hgp install-hooks` also install `hgp_paths.py` next to the hook scripts. A hook file that differs from the bundled one is backed up as `<name>.bak-<timestamp>` before being replaced. List them with `hgp hook-backups [--local]`; delete older ones with `hgp hook-backups --prune [--keep N] [--dry-run]` (keeps the newest per hook file by default; only backups of HGP's own hook files are touched).
 

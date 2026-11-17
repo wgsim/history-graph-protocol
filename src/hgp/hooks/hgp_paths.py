@@ -7,6 +7,7 @@ it by file path, and ``hgp.project`` re-exports :func:`find_storage_root`.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 
 def find_storage_root(project_root: Path) -> Path:
@@ -90,6 +91,23 @@ def find_storage_root(project_root: Path) -> Path:
         return project_root
 
 
+def checkout_root_from_metadata(raw: str | None) -> str | None:
+    """Return ``metadata.hgp_checkout.root`` from an op's JSON metadata, if present."""
+    import json
+
+    try:
+        meta: object = json.loads(raw or "null")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    checkout = cast(dict[str, Any], meta).get("hgp_checkout")
+    if not isinstance(checkout, dict):
+        return None
+    root = cast(dict[str, Any], checkout).get("root")
+    return root if isinstance(root, str) else None
+
+
 def parse_hook_policy(text: str) -> bool | None:
     """Return block mode from ``.hgp/hook-policy`` content, or None if unrecognised.
 
@@ -101,10 +119,12 @@ def parse_hook_policy(text: str) -> bool | None:
     stripped = text.strip()
     if stripped.startswith("{"):
         try:
-            data = json.loads(stripped)
+            data: object = json.loads(stripped)
         except ValueError:
             return None
-        block = data.get("block_mode") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        block = cast(dict[str, Any], data).get("block_mode")
         return block if isinstance(block, bool) else None
     if stripped in ("block", "advisory"):
         return stripped == "block"

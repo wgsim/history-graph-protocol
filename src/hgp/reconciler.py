@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -12,6 +11,7 @@ from typing import Any
 
 from hgp.cas import CAS
 from hgp.db import Database
+from hgp.hooks.hgp_paths import checkout_root_from_metadata
 from hgp.models import ReconcileReport
 from hgp.project import find_storage_root
 
@@ -65,13 +65,7 @@ class Reconciler:
     @staticmethod
     def _op_checkout_root(op: dict[str, Any]) -> str | None:
         """Return the linked-worktree root an op was recorded from, if tagged."""
-        try:
-            meta = json.loads(op.get("metadata") or "null")
-        except (TypeError, ValueError):
-            return None
-        checkout = meta.get("hgp_checkout") if isinstance(meta, dict) else None
-        root = checkout.get("root") if isinstance(checkout, dict) else None
-        return root if isinstance(root, str) else None
+        return checkout_root_from_metadata(op.get("metadata"))
 
     def _op_in_scope(self, op: dict[str, Any], file_path: str) -> bool:
         """Return whether a pending file operation belongs to this checkout."""
