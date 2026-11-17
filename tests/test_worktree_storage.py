@@ -381,6 +381,96 @@ def test_install_hooks_backs_up_modified_hook(tmp_path) -> None:
     assert len(list(hooks.glob("*.bak-*"))) == 1
 
 
+def _make_backups(hooks: Path, names: list[str]) -> None:
+    hooks.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (hooks / name).write_text(name)
+
+
+def _hook_backups(*args: str, cwd: Path, home: Path) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "HOME": str(home)}
+    return subprocess.run(
+        [sys.executable, "-m", "hgp.server", "hook-backups", *args],
+        cwd=cwd, capture_output=True, text=True, env=env,
+    )
+
+
+def test_hook_backups_lists_only_bundled_hook_backups(tmp_path) -> None:
+    hooks = tmp_path / "home" / ".claude" / "hooks"
+    _make_backups(hooks, [
+        "pre_tool_use_hgp.py.bak-20260101000000",
+        "my_own_hook.py.bak-20260101000000",   # not an HGP hook → ignored
+        "pre_tool_use_hgp.py.bak-manual",       # not our naming → ignored
+    ])
+    r = _hook_backups(cwd=tmp_path, home=tmp_path / "home")
+    assert r.returncode == 0, r.stderr
+    assert "pre_tool_use_hgp.py.bak-20260101000000" in r.stdout
+    assert "my_own_hook" not in r.stdout and "bak-manual" not in r.stdout
+
+
+def test_hook_backups_prune_keeps_newest(tmp_path) -> None:
+    home = tmp_path / "home"
+    hooks = home / ".gemini" / "hooks"
+    names = [
+        "pre_tool_use_hgp.py.bak-20260101000000",
+        "pre_tool_use_hgp.py.bak-20260301000000",
+        "pre_tool_use_hgp.py.bak-20260301000000-1",  # same second, later copy
+        "post_bash_hgp.py.bak-20260101000000",
+    ]
+    _make_backups(hooks, names)
+
+    r = _hook_backups("--prune", "--dry-run", cwd=tmp_path, home=home)
+    assert r.returncode == 0, r.stderr
+    assert "Would delete 2 of 4" in r.stdout
+    assert all((hooks / n).exists() for n in names)
+
+    r = _hook_backups("--prune", cwd=tmp_path, home=home)
+    assert "Deleted 2 of 4" in r.stdout
+    assert sorted(p.name for p in hooks.iterdir()) == [
+        "post_bash_hgp.py.bak-20260101000000",
+        "pre_tool_use_hgp.py.bak-20260301000000-1",
+    ]
+
+    r = _hook_backups("--prune", "--keep", "0", cwd=tmp_path, home=home)
+    assert "Deleted 2 of 2" in r.stdout
+    assert list(hooks.iterdir()) == []
+    assert "No hook backups found." in _hook_backups(cwd=tmp_path, home=home).stdout
+
+
+def test_hook_backups_local_scope(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    _make_backups(repo / ".claude" / "hooks", [
+        "pre_tool_use_hgp.py.bak-20260101000000",
+        "pre_tool_use_hgp.py.bak-20260201000000",
+    ])
+    global_hooks = tmp_path / "home" / ".claude" / "hooks"
+    _make_backups(global_hooks, ["pre_tool_use_hgp.py.bak-20260101000000"])
+
+    r = _hook_backups("--local", "--prune", cwd=repo, home=tmp_path / "home")
+    assert "Deleted 1 of 2" in r.stdout
+    assert (global_hooks / "pre_tool_use_hgp.py.bak-20260101000000").exists()  # global untouched
+
+
+@pytest.mark.parametrize("args", [["--keep", "1"], ["--dry-run"], ["--prune", "--keep", "-1"], ["--bogus"]])
+def test_hook_backups_rejects_bad_args(tmp_path, args) -> None:
+    r = _hook_backups(*args, cwd=tmp_path, home=tmp_path)
+    assert r.returncode == 1
+
+
+def test_install_hints_prune_when_backups_pile_up(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    hooks = repo / ".claude" / "hooks"
+    _make_backups(hooks, [f"pre_tool_use_hgp.py.bak-2026010{i}000000" for i in range(1, 4)])
+    (hooks / "pre_tool_use_hgp.py").write_text("# customised\n")
+    r = _cli("install-hooks", "--claude", cwd=repo, tmp_path=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "hgp hook-backups --prune" in r.stderr
+
+
 _WRITER = textwrap.dedent(
     """
     import sys

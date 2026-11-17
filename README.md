@@ -307,7 +307,7 @@ All worktrees of a repository share the main repository's `.hgp/` (database, blo
 - **Reconcile**: each checkout reconciles only its own pending file operations. Pending operations of a worktree whose directory no longer exists are marked `STALE_PENDING` (reported as `pending_orphaned`).
 - **Behaviour change**: a `.hgp/mode` or `.hgp/hook-policy` inside a linked worktree is no longer read; set them from any checkout and they apply to all.
 - **Restore/import**: `hgp restore` and `hgp import` run inside a linked worktree replace history for every worktree, so they require `--shared` to confirm.
-- **Hooks**: `hgp install` / `hgp install-hooks` also install `hgp_paths.py` next to the hook scripts. A hook file that differs from the bundled one is backed up as `<name>.bak-<timestamp>` before being replaced.
+- **Hooks**: `hgp install` / `hgp install-hooks` also install `hgp_paths.py` next to the hook scripts. A hook file that differs from the bundled one is backed up as `<name>.bak-<timestamp>` before being replaced. List them with `hgp hook-backups [--local]`; delete older ones with `hgp hook-backups --prune [--keep N] [--dry-run]` (keeps the newest per hook file by default; only backups of HGP's own hook files are touched).
 
 - **Graph tools** (`hgp_create_operation`, queries, etc.): if no git repo is found, fall back to `<cwd>/.hgp/` with a warning.
 - **File tools** (`hgp_write_file`, `hgp_edit_file`, etc.): always require a git repo or an explicit `HGP_PROJECT_ROOT`. Without one, they return `PROJECT_ROOT_NOT_FOUND`.

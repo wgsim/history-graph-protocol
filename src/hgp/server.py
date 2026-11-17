@@ -1437,7 +1437,114 @@ def _backup_modified_hook(src: Path, dest: Path) -> Path | None:
         print(f"  ! could not back up {dest}: {exc}", file=sys.stderr)
         return None
     print(f"  ! {dest} differed from the bundled hook; previous copy saved to {backup}", file=sys.stderr)
+    if len(_hook_backups(dest.parent).get(dest.name, [])) > _HOOK_BACKUP_HINT_THRESHOLD:
+        print(
+            f"  ! {dest.parent} holds several backups of {dest.name}; "
+            "run `hgp hook-backups --prune` to clean up",
+            file=sys.stderr,
+        )
     return backup
+
+
+_HOOK_BACKUP_RE = re.compile(r"(?P<base>[A-Za-z0-9_]+\.py)\.bak-\d{14}(?:-\d+)?")
+_HOOK_BACKUP_HINT_THRESHOLD = 3
+_HOOK_CLIENT_DIRS = (".claude", ".gemini", ".codex")
+
+_HOOK_BACKUPS_USAGE = (
+    "usage: hgp hook-backups [--local] [--prune [--keep N] [--dry-run]]\n"
+    "\n"
+    "  (no flags)   list hook backups (<hook>.py.bak-<timestamp>) made by hgp install\n"
+    "  --local      project-local hook dirs (default: ~/.claude, ~/.gemini, ~/.codex)\n"
+    "  --prune      delete older backups, keeping the newest N per hook file\n"
+    "  --keep N     backups to keep per hook file with --prune (default: 1; 0 = all)\n"
+    "  --dry-run    with --prune: show what would be deleted\n"
+)
+
+
+def _bundled_hook_names() -> set[str]:
+    """File names hgp install writes into hook dirs (backups of others are left alone)."""
+    import importlib.resources
+
+    names = {"hgp_paths.py"}
+    for pkg in ("claude", "gemini", "codex"):
+        for item in importlib.resources.files(f"hgp.hooks.{pkg}").iterdir():
+            if item.name.endswith(".py") and not item.name.startswith("__"):
+                names.add(item.name)
+    return names
+
+
+def _hook_backups(hooks_dir: Path) -> dict[str, list[Path]]:
+    """Return {hook file name: backups oldest→newest} for backups of bundled hooks."""
+    if not hooks_dir.is_dir():
+        return {}
+    bundled = _bundled_hook_names()
+    found: dict[str, list[Path]] = {}
+    for p in hooks_dir.iterdir():
+        m = _HOOK_BACKUP_RE.fullmatch(p.name)
+        if m and m["base"] in bundled and p.is_file():
+            found.setdefault(m["base"], []).append(p)
+
+    def order(p: Path) -> tuple[str, int]:
+        stamp, _, n = p.name.rpartition(".bak-")[2].partition("-")
+        return stamp, int(n or 0)
+
+    return {base: sorted(paths, key=order) for base, paths in sorted(found.items())}
+
+
+def _hook_backups_cmd(args: list[str]) -> None:
+    """List or prune hook backups created by `hgp install`."""
+    import sys
+
+    local = "--local" in args
+    prune = "--prune" in args
+    dry_run = "--dry-run" in args
+    remaining = [a for a in args if a not in ("--local", "--prune", "--dry-run")]
+    keep = 1
+    if "--keep" in remaining:
+        idx = remaining.index("--keep")
+        try:
+            keep = int(remaining[idx + 1])
+            if keep < 0:
+                raise ValueError
+        except (IndexError, ValueError):
+            print("hgp hook-backups: --keep requires a non-negative integer.", file=sys.stderr)
+            sys.exit(1)
+        remaining = remaining[:idx] + remaining[idx + 2:]
+    if remaining or ((dry_run or "--keep" in args) and not prune):
+        print(_HOOK_BACKUPS_USAGE, file=sys.stderr)
+        sys.exit(1)
+
+    if local:
+        try:
+            base_dir = find_project_root(Path.cwd())
+        except ProjectRootError:
+            print("hgp hook-backups --local: no git repository found from current directory.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        base_dir = Path.home()
+
+    total = removed = 0
+    for client in _HOOK_CLIENT_DIRS:
+        hooks_dir = base_dir / client / "hooks"
+        for base, paths in _hook_backups(hooks_dir).items():
+            total += len(paths)
+            doomed = paths[: max(len(paths) - keep, 0)] if prune else []
+            for p in paths:
+                mark = ("would delete" if dry_run else "deleted") if p in doomed else "kept"
+                print(f"{p}  [{mark}]" if prune else str(p))
+            for p in doomed:
+                if not dry_run:
+                    try:
+                        p.unlink()
+                    except OSError as exc:
+                        print(f"hgp hook-backups: could not delete {p}: {exc}", file=sys.stderr)
+                        continue
+                removed += 1
+    if total == 0:
+        print("No hook backups found.")
+    elif prune:
+        verb = "Would delete" if dry_run else "Deleted"
+        print(f"{verb} {removed} of {total} hook backup(s).")
 
 
 def _install_hooks_files(pkg: str, dest_dir: Path) -> list[str]:
@@ -2553,6 +2660,7 @@ def run() -> None:
         hgp hook-policy              # show current hook enforcement policy
         hgp hook-policy advisory     # warn only (default)
         hgp hook-policy block        # block native file tools
+        hgp hook-backups [--prune]   # list / prune hook backups left by install
         hgp backup                   # back up .hgp/ to ~/.hgp/projects/<id>/
         hgp restore                  # restore .hgp/ from local backup
         hgp export <dest>            # export history snapshot to <dest>/
@@ -2573,6 +2681,8 @@ def run() -> None:
         _install_hooks(args[1:])
     elif args and args[0] == "hook-policy":
         _hook_policy(args[1:])
+    elif args and args[0] == "hook-backups":
+        _hook_backups_cmd(args[1:])
     elif args and args[0] == "backup":
         _hgp_backup(args[1:])
     elif args and args[0] == "restore":
