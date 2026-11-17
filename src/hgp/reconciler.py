@@ -80,10 +80,22 @@ class Reconciler:
         if self._op_checkout_root(op) != self._linked_root:
             return False
         try:
-            Path(file_path).resolve().relative_to(self._project_root)
+            Path(self._resolve(file_path) or file_path).resolve().relative_to(self._project_root)
             return True
         except (OSError, RuntimeError, ValueError):
             return False
+
+    def _resolve(self, file_path: str) -> str | None:
+        """Return the absolute path for a stored file key.
+
+        Repo-relative keys resolve against this checkout (in-scope ops were
+        recorded here); None when there is no checkout root to resolve against.
+        """
+        if Path(file_path).is_absolute():
+            return file_path
+        if self._project_root is None:
+            return None
+        return str(self._project_root / file_path)
 
     def _op_orphaned(self, op: dict[str, Any]) -> bool:
         """Return whether an op belongs to a linked worktree that no longer exists."""
@@ -160,6 +172,9 @@ class Reconciler:
                         self._db.update_operation_status(op["op_id"], "STALE_PENDING")
                     report.pending_orphaned += 1
                 continue
+            abs_path = self._resolve(file_path)
+            if abs_path is None:
+                continue  # repo-relative key, but no checkout root to resolve it against
             op_type = op.get("op_type")
             op_id = op["op_id"]
             if op_type == "artifact":
@@ -167,7 +182,7 @@ class Reconciler:
                 recovered = (
                     bool(obj_hash)
                     and self._cas.exists(obj_hash)
-                    and _file_matches_hash(file_path, obj_hash)
+                    and _file_matches_hash(abs_path, obj_hash)
                 )
                 if recovered:
                     if not dry_run:
@@ -184,7 +199,7 @@ class Reconciler:
                         self._db.update_operation_status(op_id, "STALE_PENDING")
                     report.pending_stale += 1
             elif op_type == "invalidation":
-                file_gone = not Path(file_path).exists()
+                file_gone = not Path(abs_path).exists()
                 if file_gone:
                     if not dry_run:
                         targets = self._db.get_invalidated_targets(op_id)

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -83,7 +87,7 @@ def test_set_block_writes_policy_file(tmp_path: Path) -> None:
     repo = _make_git_repo(tmp_path / "repo")
     result = _run(["hook-policy", "block"], cwd=repo)
     assert result.returncode == 0
-    assert (repo / ".hgp" / "hook-policy").read_text().strip() == "block"
+    assert json.loads((repo / ".hgp" / "hook-policy").read_text()) == {"block_mode": True}
 
 
 def test_set_advisory_overwrites_block(tmp_path: Path) -> None:
@@ -91,7 +95,58 @@ def test_set_advisory_overwrites_block(tmp_path: Path) -> None:
     _run(["hook-policy", "block"], cwd=repo)
     result = _run(["hook-policy", "advisory"], cwd=repo)
     assert result.returncode == 0
-    assert (repo / ".hgp" / "hook-policy").read_text().strip() == "advisory"
+    assert json.loads((repo / ".hgp" / "hook-policy").read_text()) == {"block_mode": False}
+
+
+def test_set_policy_keeps_other_json_keys(tmp_path: Path) -> None:
+    repo = _make_git_repo(tmp_path / "repo")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "hook-policy").write_text('{"block_mode": false, "telemetry_enabled": true}')
+    assert _run(["hook-policy", "block"], cwd=repo).returncode == 0
+    data = json.loads((repo / ".hgp" / "hook-policy").read_text())
+    assert data == {"block_mode": True, "telemetry_enabled": True}
+    assert _run(["hook-policy"], cwd=repo).stdout.strip() == "block"
+
+
+@pytest.mark.parametrize("content,expected", [
+    ("block", "block"),                       # legacy plain text
+    ("advisory\n", "advisory"),
+    ('{"block_mode": true}', "block"),
+    ('{"block_mode": "yes"}', "advisory"),    # malformed value → advisory (fail-open)
+    ("garbage", "advisory"),
+])
+def test_read_policy_json_and_legacy(tmp_path: Path, content: str, expected: str) -> None:
+    repo = _make_git_repo(tmp_path / "repo")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "hook-policy").write_text(content)
+    assert _run(["hook-policy"], cwd=repo).stdout.strip() == expected
+
+
+@pytest.mark.parametrize("content,blocked", [
+    ('{"block_mode": true, "telemetry_enabled": true}', True),
+    ('{"block_mode": false}', False),
+    ("block", True),
+    ("advisory", False),
+])
+def test_hook_reads_json_and_legacy_policy(tmp_path: Path, content: str, blocked: bool) -> None:
+    repo = _make_git_repo(tmp_path / "repo")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "hook-policy").write_text(content)
+    hook = Path(__file__).parents[1] / "src" / "hgp" / "hooks" / "claude" / "pre_tool_use_hgp.py"
+    env = {k: v for k, v in os.environ.items() if k != "HGP_HOOK_BLOCK"}
+    result = subprocess.run(
+        [sys.executable, str(hook)], input='{"tool_name":"Write"}',
+        cwd=repo, capture_output=True, text=True, env=env,
+    )
+    assert (result.returncode == 2) is blocked
+
+
+def test_set_policy_from_worktree_updates_main_repo(tmp_path: Path) -> None:
+    repo, worktree = _make_linked_worktree(tmp_path)
+    assert _run(["hook-policy", "block"], cwd=worktree).returncode == 0
+    assert json.loads((repo / ".hgp" / "hook-policy").read_text()) == {"block_mode": True}
+    assert not (worktree / ".hgp").exists()
+    assert _run(["hook-policy"], cwd=worktree).stdout.strip() == "block"
 
 
 # ---------------------------------------------------------------------------

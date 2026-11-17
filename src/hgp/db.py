@@ -225,6 +225,60 @@ class Database:
                 ("v5_stale_pending_status",),
             )
 
+    def relativize_file_paths(self, main_root: Path, backup_path: Path | None = None) -> int:
+        """One-time migration (v6): absolute ``file_path`` → repo-relative file keys.
+
+        Untagged ops are made relative to ``main_root``; ops tagged with
+        ``metadata.hgp_checkout.root`` (recorded from a linked worktree) are made
+        relative to that worktree. Paths outside their root stay absolute.
+        When any row changes, the database is first copied to ``backup_path``.
+        Returns the number of rows rewritten.
+        """
+        import json
+        import os
+
+        assert self._conn
+        name = "v6_relative_file_keys"
+        if self._conn.execute("SELECT 1 FROM _hgp_migrations WHERE name = ?", (name,)).fetchone():
+            return 0
+        main_root = main_root.resolve()
+        updates: list[tuple[str, str]] = []
+        for row in self._conn.execute(
+            "SELECT op_id, file_path, metadata FROM operations WHERE file_path IS NOT NULL"
+        ).fetchall():
+            fp = row["file_path"]
+            if not os.path.isabs(fp):
+                continue
+            base = main_root
+            try:
+                meta = json.loads(row["metadata"] or "null")
+            except ValueError:
+                meta = None
+            checkout = meta.get("hgp_checkout") if isinstance(meta, dict) else None
+            if isinstance(checkout, dict) and isinstance(checkout.get("root"), str):
+                base = Path(checkout["root"])
+            try:
+                updates.append((Path(fp).relative_to(base).as_posix(), row["op_id"]))
+            except ValueError:
+                continue  # outside its checkout root: keep the absolute path
+        if updates and backup_path is not None:
+            dst = sqlite3.connect(str(backup_path))
+            try:
+                self._conn.backup(dst)
+            finally:
+                dst.close()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.executemany("UPDATE operations SET file_path = ? WHERE op_id = ?", updates)
+            self._conn.execute("INSERT OR IGNORE INTO _hgp_migrations (name) VALUES (?)", (name,))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if updates:
+            _log.info("v6 migration: %d file path(s) made repo-relative", len(updates))
+        return len(updates)
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()

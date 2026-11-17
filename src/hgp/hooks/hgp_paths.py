@@ -90,6 +90,27 @@ def find_storage_root(project_root: Path) -> Path:
         return project_root
 
 
+def parse_hook_policy(text: str) -> bool | None:
+    """Return block mode from ``.hgp/hook-policy`` content, or None if unrecognised.
+
+    Current format is JSON (``{"block_mode": true}``; other keys are ignored).
+    Legacy plain-text files containing ``block`` / ``advisory`` are still read.
+    """
+    import json
+
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            return None
+        block = data.get("block_mode") if isinstance(data, dict) else None
+        return block if isinstance(block, bool) else None
+    if stripped in ("block", "advisory"):
+        return stripped == "block"
+    return None
+
+
 def shared_hgp_dir(root: Path) -> Path:
     """Return the ``.hgp`` directory HGP uses for a checkout rooted at ``root``."""
     return find_storage_root(root) / ".hgp"

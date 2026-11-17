@@ -35,6 +35,7 @@ from hgp.project import (
     current_branch,
     find_project_root,
     find_storage_root,
+    parse_hook_policy,
 )
 from hgp.reconciler import Reconciler
 
@@ -103,6 +104,12 @@ def _get_context() -> HGPContext:
             hgp_dir.mkdir(parents=True, exist_ok=True)
             hgp_content_dir.mkdir(exist_ok=True)
             db.initialize()
+            if storage_root is not None:
+                # Global mode keeps absolute keys (one DB spans many repositories).
+                db.relativize_file_paths(
+                    storage_root,
+                    backup_path=hgp_dir / f"hgp.db.pre-v6-{time.strftime('%Y%m%d%H%M%S')}.bak",
+                )
             cas = CAS(hgp_content_dir)
             lease_mgr = LeaseManager(db)
             reconciler = Reconciler(db, cas, hgp_content_dir, project_root=project_root)
@@ -156,6 +163,32 @@ def _with_checkout_meta(metadata: dict[str, Any] | None, ctx: HGPContext) -> dic
     if root is None:
         return metadata
     return {**(metadata or {}), _CHECKOUT_META_KEY: {"root": str(root), "branch": current_branch(root)}}
+
+
+def _file_key(canonical: str, root: Path, ctx: HGPContext) -> str:
+    """Return the DB identity of a tracked file.
+
+    Repo-relative POSIX path (relative to the checkout ``root`` the file lives
+    in), so the same file converges to one history across linked worktrees.
+    Global mode keeps absolute paths: one DB spans many repositories there.
+    """
+    if not isinstance(ctx.project_root, Path):
+        return canonical
+    return Path(canonical).relative_to(root.resolve()).as_posix()
+
+
+def _present_ops(ops: list[dict[str, Any]], ctx: HGPContext) -> list[dict[str, Any]]:
+    """Show repo-relative file keys as absolute paths in the active checkout."""
+    if not isinstance(ctx.project_root, Path):
+        return ops
+    root = ctx.project_root.resolve()
+    out: list[dict[str, Any]] = []
+    for op in ops:
+        fp = op.get("file_path")
+        if isinstance(fp, str) and fp and not os.path.isabs(fp):
+            op = {**op, "file_path": str(root / fp)}
+        out.append(op)
+    return out
 
 
 # ── MCP Tools ───────────────────────────────────────────────
@@ -356,14 +389,14 @@ def hgp_query_operations(
     include_inactive: bool = False,
     limit: int = 100,
     file_path: str | None = None,
-    scope: str = "checkout",
+    scope: str = "repo",
 ) -> dict[str, Any]:
     """Query operations with optional filters.
 
     By default excludes inactive-tier ops; pass include_inactive=True to include them.
-    scope="checkout" (default) returns ops recorded from the active checkout only;
-    scope="repo" also returns ops from the repository's other linked worktrees.
-    Ignored when op_id or file_path is given.
+    scope="repo" (default) returns ops from every linked worktree of the repository
+    (one shared history); scope="checkout" narrows to ops recorded from the active
+    checkout. Ignored when op_id or file_path is given.
     """
     if (early := _check_mode(mutation=False)) is not None:
         return early
@@ -387,13 +420,13 @@ def hgp_query_operations(
                     db.rollback()
                 except Exception:
                     pass
-        return {"operations": [op] if op else []}
-    # Canonicalize file_path filter so it matches stored canonical paths
+        return {"operations": _present_ops([op] if op else [], ctx)}
+    # Canonicalize file_path filter so it matches stored file keys
     canonical_fp = file_path
     if file_path is not None:
         try:
             root = find_project_root(Path(file_path).parent)
-            canonical_fp = canonical_file_path(file_path, root)
+            canonical_fp = _file_key(canonical_file_path(file_path, root), root, ctx)
         except (ProjectRootError, PathOutsideRootError) as exc:
             _log.debug("hgp_query_operations: file_path canonicalization failed, using raw path: %s", exc)
             # Results may be empty or incomplete if raw path doesn't match stored canonical paths
@@ -408,7 +441,7 @@ def hgp_query_operations(
         scope_checkout=scope_checkout,
         checkout_root=str(linked_root) if linked_root else None,
     )
-    return {"operations": ops}
+    return {"operations": _present_ops(ops, ctx)}
 
 
 @mcp.tool()
@@ -420,19 +453,22 @@ def hgp_file_history(
     if (early := _check_mode(mutation=False)) is not None:
         return early
     limit = max(1, min(limit, _MAX_QUERY_LIMIT))
-    db = _get_context().db
-    # Canonicalize query path so it matches stored canonical paths
+    ctx = _get_context()
+    db = ctx.db
+    # Canonicalize query path and map it to the stored (repo-relative) file key, so
+    # history recorded from any linked worktree of the repository is returned.
     try:
         root = find_project_root(Path(file_path).parent)
         query_path = canonical_file_path(file_path, root)
+        key = _file_key(query_path, root, ctx)
     except (ProjectRootError, PathOutsideRootError):
         # Fall back to raw path for queries outside a project root (returns empty)
-        query_path = file_path
-    rows = db.get_ops_by_file_path(query_path, limit=limit)
+        query_path = key = file_path
+    rows = db.get_ops_by_file_path(key, limit=limit)
     ops = [dict(r) for r in rows]
     # Use depth-based decay: most recent op (index 0) gets full weight, older ops decay.
     _record_access_with_decay(db, [dict(op, depth=i) for i, op in enumerate(ops)])
-    return {"file_path": query_path, "operations": ops}
+    return {"file_path": query_path, "operations": _present_ops(ops, ctx)}
 
 
 @mcp.tool()
@@ -446,7 +482,8 @@ def hgp_query_subgraph(
     if (early := _check_mode(mutation=False)) is not None:
         return early
     max_depth = max(1, min(max_depth, _MAX_SUBGRAPH_DEPTH))
-    db = _get_context().db
+    ctx = _get_context()
+    db = ctx.db
     # Use a single deferred transaction so chain_hash and ops come from the same snapshot.
     db.begin_deferred()
     try:
@@ -463,7 +500,7 @@ def hgp_query_subgraph(
         ops = [o for o in ops if o["status"] != "INVALIDATED"]
     projected = [_project(op, op.get("memory_tier", "long_term")) for op in ops]
     _record_access_with_decay(db, ops)
-    return {"root_op_id": root_op_id, "chain_hash": chain_hash, "operations": projected}
+    return {"root_op_id": root_op_id, "chain_hash": chain_hash, "operations": _present_ops(projected, ctx)}
 
 
 @mcp.tool()
@@ -844,7 +881,7 @@ def hgp_write_file(
     path.parent.mkdir(parents=True, exist_ok=True)
     effective_reason = reason or f"CREATE {canonical}"
     result = _record_file_op(
-        file_path=canonical,
+        file_path=_file_key(canonical, root, ctx),
         content_bytes=content.encode("utf-8"),
         agent_id=agent_id,
         reason=effective_reason,
@@ -906,7 +943,7 @@ def hgp_append_file(
     combined = existing + content
     effective_reason = reason or f"APPEND {canonical}"
     result = _record_file_op(
-        file_path=canonical,
+        file_path=_file_key(canonical, root, ctx),
         content_bytes=combined.encode("utf-8"),
         agent_id=agent_id,
         reason=effective_reason,
@@ -979,7 +1016,7 @@ def hgp_edit_file(
     updated = original.replace(old_string, new_string, 1)
     effective_reason = reason or f"MODIFY {canonical}"
     result = _record_file_op(
-        file_path=canonical,
+        file_path=_file_key(canonical, root, ctx),
         content_bytes=updated.encode("utf-8"),
         agent_id=agent_id,
         reason=effective_reason,
@@ -1055,7 +1092,7 @@ def hgp_delete_file(
         db.insert_operation(
             op_id=op_id, op_type="invalidation", agent_id=agent_id,
             commit_seq=seq, chain_hash="sha256:pending",
-            metadata=metadata, file_path=canonical,
+            metadata=metadata, file_path=_file_key(canonical, root, ctx),
             status="PENDING",
         )
         if previous_op_id:
@@ -1155,7 +1192,7 @@ def hgp_move_file(
     # Auto-resolve previous_op_id from DB if not supplied by caller
     resolved_previous_op_id = previous_op_id
     if resolved_previous_op_id is None:
-        latest = db.get_ops_by_file_path(canonical_old, limit=1)
+        latest = db.get_ops_by_file_path(_file_key(canonical_old, root, ctx), limit=1)
         if latest:
             resolved_previous_op_id = dict(latest[0])["op_id"]
 
@@ -1179,7 +1216,7 @@ def hgp_move_file(
         db.insert_operation(
             op_id=inv_op_id, op_type="invalidation", agent_id=agent_id,
             commit_seq=db.next_commit_seq(), chain_hash="sha256:pending",
-            metadata=inv_metadata, file_path=canonical_old,
+            metadata=inv_metadata, file_path=_file_key(canonical_old, root, ctx),
             status="PENDING",
         )
         if resolved_previous_op_id:
@@ -1195,7 +1232,7 @@ def hgp_move_file(
         db.insert_operation(
             op_id=op_id, op_type="artifact", agent_id=agent_id,
             commit_seq=seq, chain_hash="sha256:pending",
-            object_hash=object_hash, metadata=metadata, file_path=canonical_new,
+            object_hash=object_hash, metadata=metadata, file_path=_file_key(canonical_new, root, ctx),
             status="PENDING",
         )
         db.insert_edge(op_id, inv_op_id, "causal")
@@ -2038,17 +2075,23 @@ def _hook_policy(args: list[str]) -> None:
 
     policy_file = find_storage_root(project_root) / ".hgp" / "hook-policy"
 
+    existing = policy_file.read_text() if policy_file.exists() else ""
     if not args:
-        # read current policy
-        if policy_file.exists():
-            print(policy_file.read_text().strip())
-        else:
-            print("advisory")
+        # read current policy (JSON or legacy plain text)
+        print("block" if parse_hook_policy(existing) is True else "advisory")
         return
 
     new_policy = args[0]
+    # JSON schema {"block_mode": bool}; keep any other keys already present.
+    try:
+        data = json.loads(existing) if existing.strip().startswith("{") else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["block_mode"] = new_policy == "block"
     policy_file.parent.mkdir(parents=True, exist_ok=True)
-    policy_file.write_text(new_policy)
+    policy_file.write_text(json.dumps(data) + "\n")
     print(f"Hook policy set to: {new_policy}")
 
     # warn if installed hooks predate hook-policy support (policy enforcement broken)

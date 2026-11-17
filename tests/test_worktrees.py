@@ -1,4 +1,4 @@
-"""Linked-worktree storage sharing: hooks, installed layout, and summary scoping."""
+"""Git worktree support: shared storage, file identity, hooks, CLI and concurrency."""
 
 from __future__ import annotations
 
@@ -24,11 +24,153 @@ from hgp.reconciler import Reconciler
 from hgp.server import (
     HGPContext,
     hgp_create_operation,
+    hgp_file_history,
     hgp_get_context,
     hgp_query_operations,
     hgp_set_context,
     hgp_write_file,
 )
+
+# ── resolver: mock git layouts (relative/absolute pointers, submodules) ─────
+
+def _mock_main_repo(root: Path) -> Path:
+    git = root / ".git"
+    for d in ("objects", "worktrees", "modules"):
+        (git / d).mkdir(parents=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    (git / "config").write_text("")
+    return git
+
+
+def _mock_worktree(main: Path, wt: Path, *, relative_gitdir: bool, relative_commondir: bool) -> None:
+    git = main / ".git"
+    admin = git / "worktrees" / wt.name
+    admin.mkdir(parents=True)
+    wt.mkdir(parents=True)
+    (admin / "HEAD").write_text("ref: refs/heads/wt\n")
+    (admin / "commondir").write_text("../..\n" if relative_commondir else f"{git}\n")
+    (admin / "gitdir").write_text(f"{wt / '.git'}\n")
+    pointer = os.path.relpath(admin, wt) if relative_gitdir else str(admin)
+    (wt / ".git").write_text(f"gitdir: {pointer}\n")
+
+
+@pytest.mark.parametrize("relative_gitdir", [False, True])
+@pytest.mark.parametrize("relative_commondir", [False, True])
+def test_mock_worktree_resolves_to_main_root(tmp_path, relative_gitdir, relative_commondir) -> None:
+    main = tmp_path / "main"
+    _mock_main_repo(main)
+    wt = tmp_path / "wt"
+    _mock_worktree(main, wt, relative_gitdir=relative_gitdir, relative_commondir=relative_commondir)
+    assert project.find_storage_root(wt) == main.resolve()
+    assert project.find_project_root(wt) == wt.resolve()  # write boundary stays the checkout
+    assert project.current_branch(wt) == "wt"
+
+
+def test_mock_worktree_with_mismatched_backpointer_is_not_shared(tmp_path) -> None:
+    main = tmp_path / "main"
+    _mock_main_repo(main)
+    wt = tmp_path / "wt"
+    _mock_worktree(main, wt, relative_gitdir=False, relative_commondir=True)
+    (main / ".git" / "worktrees" / "wt" / "gitdir").write_text(f"{tmp_path / 'elsewhere' / '.git'}\n")
+    assert project.find_storage_root(wt) == wt  # spoofed pointer chain → no sharing
+
+
+def test_submodule_keeps_its_own_storage(tmp_path) -> None:
+    main = tmp_path / "main"
+    git = _mock_main_repo(main)
+    module_git = git / "modules" / "sub"
+    for d in ("objects", "refs"):
+        (module_git / d).mkdir(parents=True)
+    (module_git / "HEAD").write_text("ref: refs/heads/main\n")
+    (module_git / "config").write_text("")
+    sub = main / "sub"
+    sub.mkdir()
+    (sub / ".git").write_text("gitdir: ../.git/modules/sub\n")
+    assert project.find_storage_root(sub) == sub
+    assert hgp_paths.find_hgp_dir(sub / "deep") == sub / ".hgp"
+
+
+# ── repo-relative file identity ─────────────────────────────────────────────
+
+def test_file_history_converges_across_worktrees(shared_db) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    (repo / "tracked.txt").write_text("main edit")
+    server_module._ctx = ctx_for(repo)
+    main_op = hgp_write_file(file_path=str(repo / "tracked.txt"), content="main edit", agent_id="a")
+    server_module._ctx = ctx_for(worktree)
+    wt_op = hgp_write_file(file_path=str(worktree / "tracked.txt"), content="wt edit", agent_id="a")
+
+    for op_id in (main_op["op_id"], wt_op["op_id"]):
+        assert db.get_operation(op_id)["file_path"] == "tracked.txt"
+
+    history = hgp_file_history(file_path=str(worktree / "tracked.txt"))
+    assert [o["op_id"] for o in history["operations"]] == [wt_op["op_id"], main_op["op_id"]]
+    # Responses show absolute paths in the active checkout.
+    assert {o["file_path"] for o in history["operations"]} == {str(worktree / "tracked.txt")}
+    server_module._ctx = ctx_for(repo)
+    from_main = hgp_file_history(file_path=str(repo / "tracked.txt"))
+    assert len(from_main["operations"]) == 2
+    queried = hgp_query_operations(file_path=str(repo / "tracked.txt"))["operations"]
+    assert {o["file_path"] for o in queried} == {str(repo / "tracked.txt")}
+
+
+def test_v6_migration_relativizes_paths_with_backup(tmp_path) -> None:
+    root = tmp_path / "repo"
+    wt = tmp_path / "wt"
+    hgp_dir = root / ".hgp"
+    hgp_dir.mkdir(parents=True)
+    db = Database(hgp_dir / "hgp.db")
+    db.initialize()
+    db.execute("DELETE FROM _hgp_migrations WHERE name = 'v6_relative_file_keys'")  # simulate old DB
+    rows = [
+        ("op-main", str(root / "src" / "a.py"), None),
+        ("op-wt", str(wt / "src" / "a.py"), {"hgp_checkout": {"root": str(wt), "branch": "f"}}),
+        ("op-out", str(tmp_path / "outside.txt"), None),
+        ("op-rel", "already/relative.txt", None),
+    ]
+    for i, (op_id, fp, meta) in enumerate(rows, start=1):
+        db.insert_operation(
+            op_id=op_id, op_type="artifact", agent_id="a", commit_seq=i,
+            chain_hash="sha256:" + "a" * 64, file_path=fp,
+            metadata=json.dumps(meta) if meta else None,
+        )
+    db.commit()
+
+    backup = hgp_dir / "pre-v6.bak"
+    assert db.relativize_file_paths(root, backup_path=backup) == 2
+    assert backup.exists()
+    paths = {op_id: db.get_operation(op_id)["file_path"] for op_id, _, _ in rows}
+    assert paths == {
+        "op-main": "src/a.py",
+        "op-wt": "src/a.py",
+        "op-out": str(tmp_path / "outside.txt"),  # outside its root: unchanged
+        "op-rel": "already/relative.txt",
+    }
+    assert db.relativize_file_paths(root, backup_path=hgp_dir / "again.bak") == 0  # one-time
+    assert not (hgp_dir / "again.bak").exists()
+    db.close()
+
+
+def test_reconcile_recovers_pending_op_with_relative_key(shared_db) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    ctx = ctx_for(worktree)
+    (worktree / "f.txt").write_text("content")
+    obj_hash = ctx.cas.store(b"content")
+    db.begin_immediate()
+    seq = db.next_commit_seq()
+    db.insert_operation(
+        op_id="op-rel-pending", op_type="artifact", agent_id="a", commit_seq=seq,
+        chain_hash="sha256:" + "d" * 64, status="PENDING", object_hash=obj_hash,
+        metadata=json.dumps({"hgp_checkout": {"root": str(worktree), "branch": "feature"}}),
+        file_path="f.txt",
+    )
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    db.execute("UPDATE operations SET created_at = ? WHERE op_id = ?", (old_ts, "op-rel-pending"))
+    db.commit()
+
+    assert ctx_for(repo).reconciler.reconcile().pending_recovered == 0  # not main's op
+    assert ctx.reconciler.reconcile().pending_recovered == 1
+    assert db.get_operation("op-rel-pending")["status"] == "COMPLETED"
 
 HOOKS = Path(__file__).parents[1] / "src" / "hgp" / "hooks"
 START_HOOK = HOOKS / "claude" / "subagent_start_hgp.py"
@@ -286,11 +428,12 @@ def test_query_operations_scope(shared_db) -> None:
     def ids(result: dict) -> set[str]:
         return {o["op_id"] for o in result["operations"]}
 
-    assert ids(hgp_query_operations()) == {wt_id}
-    assert ids(hgp_query_operations(scope="repo")) == {main_id, wt_id}
+    # Default: one shared history across worktrees; "checkout" narrows to this one.
+    assert ids(hgp_query_operations()) == {main_id, wt_id}
+    assert ids(hgp_query_operations(scope="checkout")) == {wt_id}
     server_module._ctx = ctx_for(repo)
-    assert ids(hgp_query_operations()) == {main_id}
-    assert ids(hgp_query_operations(scope="repo")) == {main_id, wt_id}
+    assert ids(hgp_query_operations()) == {main_id, wt_id}
+    assert ids(hgp_query_operations(scope="checkout")) == {main_id}
     assert hgp_query_operations(scope="bogus")["error"] == "INVALID_SCOPE"
 
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 # Re-exported: single implementation shared with the standalone hook scripts.
 from hgp.hooks.hgp_paths import find_storage_root as find_storage_root
+from hgp.hooks.hgp_paths import parse_hook_policy as parse_hook_policy
 
 
 class ProjectRootError(RuntimeError):

@@ -56,7 +56,10 @@ def _resolve_block_mode() -> bool:
     for parent in [Path.cwd(), *Path.cwd().parents]:
         policy_file = shared_hgp_dir(parent) / "hook-policy"
         if policy_file.exists():
-            return policy_file.read_text().strip() == "block"
+            text = policy_file.read_text()
+            if paths is not None:
+                return paths.parse_hook_policy(text) is True
+            return text.strip() == "block"  # legacy reader for partial installs
         if (parent / ".git").exists():
             break
     return False
