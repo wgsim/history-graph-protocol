@@ -389,6 +389,34 @@ def test_block_policy_in_ancestor_store_outside_git_does_not_block(
     assert (r.returncode, r.stderr) == (0, "")
 
 
+def test_hgp_enabled_follows_hgp_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = git_init(tmp_path / "r")
+    sub = repo / "sub"
+    (sub / ".hgp").mkdir(parents=True)  # the server's store for HGP_PROJECT_ROOT=sub
+    elsewhere = git_init(tmp_path / "elsewhere")
+    monkeypatch.setenv("HGP_PROJECT_ROOT", str(sub))
+    assert hgp_paths.hgp_enabled(elsewhere)
+    monkeypatch.setenv("HGP_PROJECT_ROOT", str(elsewhere))
+    assert not hgp_paths.hgp_enabled(repo)
+
+
+@pytest.mark.parametrize("env_enabled", [True, False])
+def test_hooks_follow_hgp_project_root_like_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_enabled: bool,
+) -> None:
+    enabled = git_init(tmp_path / "enabled")
+    (enabled / ".hgp").mkdir()
+    (enabled / ".hgp" / "hook-policy").write_text("block")
+    other = git_init(tmp_path / "other")
+    env_root, cwd = (enabled, other) if env_enabled else (other, enabled)
+    monkeypatch.setenv("HGP_PROJECT_ROOT", str(env_root))
+    r = _run_hook(HOOKS / "claude/pre_tool_use_hgp.py",
+                  json.dumps({"tool_name": "Write", "cwd": str(cwd)}), cwd)
+    assert r.returncode == (2 if env_enabled else 0)
+    if not env_enabled:
+        assert r.stderr == ""
+
+
 POST_BASH_CASES = [c for c in HOOK_CASES if c.values[2]]
 
 

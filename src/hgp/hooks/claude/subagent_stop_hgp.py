@@ -9,6 +9,7 @@ Summary file: .hgp/subagent-summary-{session_id}-{timestamp}.json
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import uuid
@@ -40,6 +41,10 @@ def _enabled(start: Path) -> bool:
 
 
 def _event_cwd(event: object) -> Path:
+    """HGP_PROJECT_ROOT when it names a directory (as in the server), else the event cwd."""
+    env = os.environ.get("HGP_PROJECT_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env).resolve()
     cwd = cast(dict[str, Any], event).get("cwd") if isinstance(event, dict) else None
     return Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
 
