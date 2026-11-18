@@ -1017,3 +1017,17 @@ def test_inconclusive_registration_does_not_retire_pending_operations(
     assert main.reconcile().pending_orphaned == 0
     assert not caplog.records
     assert db.get_operation("op-wt")["status"] == "PENDING"
+
+
+def test_worktree_never_opened_by_hgp_does_not_block_orphan_retirement(shared_db, tmp_path) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    checkout_id = ctx_for(worktree).reconciler.checkout_id
+    assert checkout_id
+    _insert_old_pending_with_id(db, "op-wt", worktree, checkout_id)
+    # A second worktree HGP never ran in: it has no ID marker, so it cannot own the op.
+    _git("worktree", "add", "-q", str(tmp_path / "untouched"), "-b", "untouched", cwd=repo)
+    worktree.rename(tmp_path / "elsewhere")  # the op's worktree is deleted outside Git
+
+    report = ctx_for(repo).reconciler.reconcile()
+    assert report.pending_orphaned == 1
+    assert db.get_operation("op-wt")["status"] == "STALE_PENDING"

@@ -163,8 +163,15 @@ class Reconciler:
                 continue
             identifier = read_worktree_id(gitdir)
             if identifier is None:
-                # This worktree could own one of the operations we are checking.
-                _log.warning("Orphan retirement deferred: missing, unreadable, or invalid worktree ID in %s", gitdir)
+                try:
+                    (gitdir / "hgp-worktree-id").lstat()
+                except FileNotFoundError:
+                    # HGP never assigned an ID here, so this worktree owns no ID-tagged op.
+                    continue
+                except OSError:
+                    pass
+                # A marker exists but cannot be read: it could own an op we are checking.
+                _log.warning("Orphan retirement deferred: unreadable or invalid worktree ID in %s", gitdir)
                 return None
             identifiers.add(identifier)
         return identifiers
