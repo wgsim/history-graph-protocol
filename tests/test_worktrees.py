@@ -161,7 +161,7 @@ def test_reconcile_recovers_pending_op_with_relative_key(shared_db) -> None:
     db.insert_operation(
         op_id="op-rel-pending", op_type="artifact", agent_id="a", commit_seq=seq,
         chain_hash="sha256:" + "d" * 64, status="PENDING", object_hash=obj_hash,
-        metadata=json.dumps({"hgp_checkout": {"root": str(worktree), "branch": "feature"}}),
+        metadata=json.dumps({"hgp_checkout": {"root": str(worktree), "id": ctx.reconciler.checkout_id}}),
         file_path="f.txt",
     )
     old_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -821,6 +821,48 @@ def test_legacy_snapshot_file_history_is_portable(linked_worktree, tmp_path, sna
     db.close()
 
 
+def test_reused_checkout_path_cannot_adopt_path_only_history(linked_worktree, monkeypatch):
+    repo, wt = linked_worktree
+    monkeypatch.setattr(server_module, "_ctx", None)
+    monkeypatch.chdir(wt)
+    previous = hgp_write_file("tracked.txt", "old checkout", "review")["op_id"]
+    ctx = server_module._get_context()
+    _insert_old_pending(ctx.db, "pending-old", wt / "tracked.txt", wt)
+    ctx.db.execute("UPDATE operations SET metadata = json_remove(metadata, '$.hgp_checkout.id')")
+    ctx.db.close()
+    server_module._ctx = None
+
+    monkeypatch.chdir(repo)
+    _git("worktree", "remove", "--force", str(wt), cwd=repo)
+    _git("worktree", "add", "-qb", "replacement", str(wt), cwd=repo)
+    monkeypatch.chdir(wt)
+    current = server_module._get_context()
+    try:
+        assert hgp_query_operations(scope="checkout")["operations"] == []
+        assert current.db.get_operation("pending-old")["status"] == "PENDING"
+        assert json.loads(current.db.get_operation(previous)["metadata"])["hgp_checkout"].get("id") is None
+        assert previous in {row["op_id"] for row in hgp_file_history("tracked.txt")["operations"]}
+        assert server_module.hgp_move_file("tracked.txt", "new.txt", "review")["status"] == "COMPLETED"
+        assert current.db.get_operation(previous)["status"] == "COMPLETED"
+    finally:
+        current.db.close()
+
+
+def test_completed_migration_does_not_request_a_write_lock(tmp_path):
+    path = tmp_path / "hgp.db"
+    writer, reader = Database(path), Database(path)
+    writer.initialize()
+    reader.initialize()
+    try:
+        assert writer.relativize_file_paths(tmp_path) == 0
+        writer.begin_immediate()
+        reader.execute("PRAGMA busy_timeout = 0")
+        assert reader.relativize_file_paths(tmp_path) == 0
+    finally:
+        writer.close()
+        reader.close()
+
+
 def test_checkout_history_and_pending_recovery_follow_worktree_move(linked_worktree, tmp_path, monkeypatch):
     repo, wt = linked_worktree
     monkeypatch.setattr(server_module, "_ctx", None)
@@ -828,16 +870,8 @@ def test_checkout_history_and_pending_recovery_follow_worktree_move(linked_workt
     old = hgp_write_file("tracked.txt", "first", "review")["op_id"]
     latest = hgp_write_file("tracked.txt", "current", "review")["op_id"]
     ctx = server_module._get_context()
-    # Simulate worktree records created by the earlier, path-only implementation.
-    ctx.db.execute("UPDATE operations SET metadata = json_remove(metadata, '$.hgp_checkout.id')")
     ctx.db.execute("UPDATE operations SET status='PENDING', created_at='2000-01-01T00:00:00Z' WHERE op_id=?", (latest,))
     ctx.db.close()
-    # Upgrade before moving, so existing path-only operations get an ID.
-    server_module._ctx = None
-    startup = server_module._get_context()
-    assert startup.db.get_operation(latest)["status"] == "COMPLETED"
-    startup.db.execute("UPDATE operations SET status='PENDING' WHERE op_id=?", (latest,))
-    startup.db.close()
     server_module._ctx = None
 
     monkeypatch.chdir(repo)
