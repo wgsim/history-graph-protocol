@@ -1,0 +1,40 @@
+name: Notify maintainer of new PRs
+
+# The base branch's workflow handles fork PRs without checking out their code.
+on:
+  pull_request_target:
+    types: [opened, ready_for_review]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: pr-review-watch-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: github.repository == 'wgsim/history-graph-protocol' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Notify the maintainer once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          endpoint="repos/$GH_REPO/issues/$PR_NUMBER/comments"
+          notified=$(gh api --paginate "$endpoint?per_page=100" --jq '
+            any(.[]; .user.login == "github-actions[bot]"
+                and (.body | contains("<!-- hgp-pr-review-watch -->")))
+          ')
+          if [[ "$notified" == *true* ]]; then
+            exit 0
+          fi
+
+          gh api --method POST "$endpoint" \
+            --raw-field "body=@wgsim This pull request is ready to review.
+
+          <!-- hgp-pr-review-watch -->" --silent
