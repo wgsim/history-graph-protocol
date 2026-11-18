@@ -50,23 +50,30 @@ def _registration_live(gitdir: Path) -> bool | None:
         (gitdir / "locked").stat()
     except FileNotFoundError:
         pass
-    except OSError:
+    except OSError as exc:
+        _log.warning("Orphan retirement deferred: cannot check lock for worktree registration %s: %s", gitdir, exc)
         return None
     else:
         return True
 
     try:
         raw = (gitdir / "gitdir").read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError) as exc:
+        _log.warning("Orphan retirement deferred: cannot read worktree registration %s/gitdir: %s", gitdir, exc)
         return None
     if not raw:
+        _log.warning("Orphan retirement deferred: empty worktree registration %s/gitdir", gitdir)
         return None
     pointer = gitdir / raw
     try:
         pointer.stat()
     except (FileNotFoundError, NotADirectoryError):
         return False
-    except OSError:
+    except OSError as exc:
+        _log.warning(
+            "Orphan retirement deferred: cannot check checkout pointer %s for registration %s: %s",
+            pointer, gitdir, exc,
+        )
         return None
     return True
 
@@ -134,13 +141,18 @@ class Reconciler:
             registrations = list(self._worktrees_dir.iterdir())
         except FileNotFoundError:
             return set()
-        except OSError:
+        except OSError as exc:
+            _log.warning(
+                "Orphan retirement deferred: cannot list worktree registrations in %s: %s",
+                self._worktrees_dir, exc,
+            )
             return None
         identifiers: set[str] = set()
         for gitdir in registrations:
             try:
                 mode = gitdir.stat().st_mode
-            except OSError:
+            except OSError as exc:
+                _log.warning("Orphan retirement deferred: cannot inspect worktree registration %s: %s", gitdir, exc)
                 return None
             if not stat.S_ISDIR(mode):
                 continue
@@ -152,6 +164,7 @@ class Reconciler:
             identifier = read_worktree_id(gitdir)
             if identifier is None:
                 # This worktree could own one of the operations we are checking.
+                _log.warning("Orphan retirement deferred: missing, unreadable, or invalid worktree ID in %s", gitdir)
                 return None
             identifiers.add(identifier)
         return identifiers

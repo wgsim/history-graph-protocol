@@ -987,7 +987,9 @@ def test_worktree_id_without_hard_links(shared_db, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("unreadable_file", ["hgp-worktree-id", "gitdir"])
-def test_inconclusive_registration_does_not_retire_pending_operations(shared_db, monkeypatch, unreadable_file):
+def test_inconclusive_registration_does_not_retire_pending_operations(
+    shared_db, monkeypatch, caplog, unreadable_file,
+):
     repo, worktree, db, ctx_for = shared_db
     checkout_id = ctx_for(worktree).reconciler.checkout_id
     assert checkout_id is not None
@@ -1005,6 +1007,13 @@ def test_inconclusive_registration_does_not_retire_pending_operations(shared_db,
         patch.setattr(Path, "read_text", guarded_read)
         assert main.reconcile().pending_orphaned == 0
         assert db.get_operation("op-wt")["status"] == "PENDING"
+        warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "Orphan retirement deferred" in warnings[0]
+        assert str(target.parent) in warnings[0]
+        assert ("cannot read" if unreadable_file == "gitdir" else "worktree ID") in warnings[0]
 
+    caplog.clear()
     assert main.reconcile().pending_orphaned == 0
+    assert not caplog.records
     assert db.get_operation("op-wt")["status"] == "PENDING"
