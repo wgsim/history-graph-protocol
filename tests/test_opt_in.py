@@ -330,3 +330,33 @@ def test_legacy_worktree_local_store_enables_server(
     (worktree / ".hgp").mkdir()
     monkeypatch.chdir(worktree)
     assert "op_id" in hgp_create_operation(op_type="hypothesis", agent_id="a")
+
+
+@pytest.mark.parametrize("query_before_reinit", [True, False])
+def test_running_server_rebinds_after_store_is_archived(unbound, tmp_path, monkeypatch, query_before_reinit):
+    repo = git_init(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+    assert _init(repo, tmp_path).returncode == 0
+    recorded = hgp_create_operation(op_type="hypothesis", agent_id="old")
+    assert "op_id" in recorded
+    (repo / ".hgp").rename(tmp_path / "archive")
+    if query_before_reinit:
+        result = hgp_create_operation(op_type="hypothesis", agent_id="after-opt-out")
+        assert result["error"] == "HGP_NOT_INITIALIZED"
+        assert not (repo / ".hgp").exists()
+    assert _init(repo, tmp_path).returncode == 0
+    assert hgp_query_operations()["operations"] == []
+    assert "op_id" in hgp_create_operation(op_type="hypothesis", agent_id="new")
+
+
+def test_init_reports_overriding_ignore_rule_and_can_retry(tmp_path):
+    repo = git_init(tmp_path / "repo")
+    rules = repo / ".gitignore"
+    rules.write_text("!/.hgp/\n")
+    result = _init(repo, tmp_path)
+    assert result.returncode != 0
+    assert ".gitignore" in result.stderr
+    assert not (repo / ".hgp").exists()
+    rules.write_text("!/.hgp/\n/.hgp/\n")
+    assert _init(repo, tmp_path).returncode == 0
+    assert (repo / ".hgp").is_dir()

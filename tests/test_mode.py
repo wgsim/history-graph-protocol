@@ -68,15 +68,23 @@ def test_mode_no_project_root_defaults_on():
 
 # ── _check_mode ───────────────────────────────────────────────
 
-def test_check_mode_on_mutation_passes(tmp_path):
+@pytest.fixture
+def enabled_repo(tmp_path, monkeypatch):
     repo = _make_git_repo(tmp_path)
+    (repo / ".hgp").mkdir()
+    monkeypatch.chdir(repo)
+    return repo
+
+
+def test_check_mode_on_mutation_passes(enabled_repo):
+    repo = enabled_repo
     with patch("hgp.server._get_context") as mock_ctx:
         mock_ctx.return_value.project_root = repo
         assert _check_mode(mutation=True) is None
 
 
-def test_check_mode_advisory_mutation_blocked(tmp_path):
-    repo = _make_git_repo(tmp_path)
+def test_check_mode_advisory_mutation_blocked(enabled_repo):
+    repo = enabled_repo
     _write_mode(repo, "advisory")
     with patch("hgp.server._get_context") as mock_ctx:
         mock_ctx.return_value.project_root = repo
@@ -85,16 +93,16 @@ def test_check_mode_advisory_mutation_blocked(tmp_path):
     assert result["status"] == "HGP_ADVISORY"
 
 
-def test_check_mode_advisory_query_passes(tmp_path):
-    repo = _make_git_repo(tmp_path)
+def test_check_mode_advisory_query_passes(enabled_repo):
+    repo = enabled_repo
     _write_mode(repo, "advisory")
     with patch("hgp.server._get_context") as mock_ctx:
         mock_ctx.return_value.project_root = repo
         assert _check_mode(mutation=False) is None
 
 
-def test_check_mode_off_mutation_blocked(tmp_path):
-    repo = _make_git_repo(tmp_path)
+def test_check_mode_off_mutation_blocked(enabled_repo):
+    repo = enabled_repo
     _write_mode(repo, "off")
     with patch("hgp.server._get_context") as mock_ctx:
         mock_ctx.return_value.project_root = repo
@@ -103,8 +111,8 @@ def test_check_mode_off_mutation_blocked(tmp_path):
     assert result["status"] == "HGP_DISABLED"
 
 
-def test_check_mode_off_query_blocked(tmp_path):
-    repo = _make_git_repo(tmp_path)
+def test_check_mode_off_query_blocked(enabled_repo):
+    repo = enabled_repo
     _write_mode(repo, "off")
     with patch("hgp.server._get_context") as mock_ctx:
         mock_ctx.return_value.project_root = repo

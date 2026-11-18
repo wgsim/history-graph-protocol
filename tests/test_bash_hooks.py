@@ -12,6 +12,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def enabled_cwd(tmp_path, monkeypatch):
+    repo = tmp_path / "enabled-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / ".hgp").mkdir()
+    monkeypatch.chdir(repo)
+
+
 _SRC_HOOKS_DIR = Path(__file__).parent.parent / "src" / "hgp" / "hooks"
 _PRE_HOOK = str(_SRC_HOOKS_DIR / "claude" / "pre_bash_hgp.py")
 _POST_HOOK = str(_SRC_HOOKS_DIR / "claude" / "post_bash_hgp.py")
