@@ -111,11 +111,9 @@ def _enabled(start: Path) -> bool:
     if check is not None:
         return bool(check(start))
     for parent in [start, *start.parents]:  # no hgp_paths: walk up to the checkout root
-        if (parent / ".hgp").is_dir():
-            return True
         if (parent / ".git").exists():
-            return False
-    return False
+            return (parent / ".hgp").is_dir()
+    return (start / ".hgp").is_dir()  # outside git only this directory's store counts
 
 
 def _event_cwd(event: object) -> Path:

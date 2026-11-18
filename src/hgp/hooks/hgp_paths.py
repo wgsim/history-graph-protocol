@@ -158,12 +158,11 @@ def hgp_enabled(start: Path) -> bool:
 
     Enabled when its storage ``.hgp/`` exists, or when the checkout itself has a
     legacy ``.hgp/`` (a linked worktree's store from before storage was shared),
-    so upgrading never silently drops a worktree's policy.
+    so upgrading never silently drops a worktree's policy. Outside git only
+    ``start/.hgp`` counts, matching the server's cwd-local store: an ancestor's
+    ``.hgp`` (such as ``~/.hgp``) belongs to another directory.
     """
-    hgp_dir = find_hgp_dir(start)
-    if hgp_dir is not None and hgp_dir.is_dir():
-        return True
     for parent in [start, *start.parents]:
         if (parent / ".git").exists():
-            return (parent / ".hgp").is_dir()
-    return False
+            return shared_hgp_dir(parent).is_dir() or (parent / ".hgp").is_dir()
+    return (start / ".hgp").is_dir()

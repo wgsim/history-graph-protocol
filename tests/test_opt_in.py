@@ -360,3 +360,44 @@ def test_init_reports_overriding_ignore_rule_and_can_retry(tmp_path):
     rules.write_text("!/.hgp/\n/.hgp/\n")
     assert _init(repo, tmp_path).returncode == 0
     assert (repo / ".hgp").is_dir()
+
+
+# ── Hooks agree with the server outside git (an ancestor store is not this dir's) ──
+
+def test_hgp_enabled_ignores_ancestor_store_outside_git(tmp_path: Path) -> None:
+    (tmp_path / ".hgp").mkdir()  # e.g. ~/.hgp above a non-git working directory
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert not hgp_paths.hgp_enabled(plain)
+    (plain / ".hgp").mkdir()  # the server's non-git store is <cwd>/.hgp
+    assert hgp_paths.hgp_enabled(plain)
+
+
+@pytest.mark.parametrize("flags", [(), ("-S",)], ids=["with-helper", "fallback"])
+def test_block_policy_in_ancestor_store_outside_git_does_not_block(
+    tmp_path: Path, flags: tuple[str, ...],
+) -> None:
+    (tmp_path / ".hgp").mkdir()
+    (tmp_path / ".hgp" / "hook-policy").write_text("block")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    hook = HOOKS / "claude/pre_tool_use_hgp.py"
+    if flags:  # installed copy with neither hgp_paths beside it nor the hgp package
+        hook = tmp_path / "pre_tool_use_hgp.py"
+        hook.write_bytes((HOOKS / "claude/pre_tool_use_hgp.py").read_bytes())
+    r = _run_hook(hook, json.dumps({"tool_name": "Write", "cwd": str(plain)}), plain, *flags)
+    assert (r.returncode, r.stderr) == (0, "")
+
+
+POST_BASH_CASES = [c for c in HOOK_CASES if c.values[2]]
+
+
+@pytest.mark.parametrize("script,event,needs_marker", POST_BASH_CASES)
+def test_post_bash_consumes_marker_when_cwd_leaves_enabled_repo(
+    tmp_path: Path, bash_marker: Path, script: str, event: dict[str, object], needs_marker: bool,
+) -> None:
+    other = git_init(tmp_path / "other")  # `cd other && ...` moved out of an enabled repo
+    bash_marker.write_text("cp")
+    r = _run_hook(HOOKS / script, json.dumps({**event, "cwd": str(other)}), other)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
+    assert not bash_marker.exists()

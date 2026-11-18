@@ -73,11 +73,9 @@ def _enabled(start: Path) -> bool:
     if check is not None:
         return bool(check(start))
     for parent in [start, *start.parents]:  # no hgp_paths: walk up to the checkout root
-        if (parent / ".hgp").is_dir():
-            return True
         if (parent / ".git").exists():
-            return False
-    return False
+            return (parent / ".hgp").is_dir()
+    return (start / ".hgp").is_dir()  # outside git only this directory's store counts
 
 
 def _event_cwd(event: object) -> Path:
@@ -91,15 +89,16 @@ def _main() -> None:
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)
     start = _event_cwd(event)  # one directory for the gate and the git status
-    if not _enabled(start):
-        sys.exit(0)
-
     if event.get("tool_name") != "run_shell_command":
         sys.exit(0)
 
+    # Consume before the gate: a command that cd'd out of an enabled repo must
+    # not leave a stale marker for a later, unrelated command.
     matched = _consume_marker()
     if matched is None:
         # No marker → BeforeTool hook didn't flag this as mutating; skip
+        sys.exit(0)
+    if not _enabled(start):
         sys.exit(0)
 
     cwd = str(start)
