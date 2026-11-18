@@ -1,40 +1,52 @@
 name: Notify maintainer of new PRs
 
-# The base branch's workflow handles fork PRs without checking out their code.
 on:
-  pull_request_target:
-    types: [opened, ready_for_review]
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
 
 permissions:
+  actions: read
   pull-requests: write
 
 concurrency:
-  group: pr-review-watch-${{ github.event.pull_request.number }}
+  group: pr-review-watch
   cancel-in-progress: false
 
 jobs:
   notify:
-    if: github.repository == 'wgsim/history-graph-protocol' && !github.event.pull_request.draft
+    if: github.repository == 'wgsim/history-graph-protocol'
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
-      - name: Notify the maintainer once
+      - name: Notify the maintainer once per new PR
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          endpoint="repos/$GH_REPO/issues/$PR_NUMBER/comments"
-          notified=$(gh api --paginate "$endpoint?per_page=100" --jq '
-            any(.[]; .user.login == "github-actions[bot]"
-                and (.body | contains("<!-- hgp-pr-review-watch -->")))
-          ')
-          if [[ "$notified" == *true* ]]; then
-            exit 0
-          fi
+          # Scheduled runs use the default branch, but review PRs targeting any branch.
+          since=$(gh api "repos/$GH_REPO/actions/workflows/pr-review-watch.yml" --jq '.created_at')
+          pr_numbers=$(
+            gh api --paginate "repos/$GH_REPO/pulls?state=open&per_page=100" |
+              jq -r --arg since "$since" '
+                .[] | select(.draft == false and .created_at >= $since) | .number
+              '
+          )
 
-          gh api --method POST "$endpoint" \
-            --raw-field "body=@wgsim This pull request is ready to review.
+          while IFS= read -r pr_number; do
+            [[ "$pr_number" =~ ^[0-9]+$ ]] || continue
+            endpoint="repos/$GH_REPO/issues/$pr_number/comments"
+            notified=$(gh api --paginate "$endpoint?per_page=100" --jq '
+              any(.[]; .user.login == "github-actions[bot]"
+                  and (.body | contains("<!-- hgp-pr-review-watch -->")))
+            ')
+            if [[ "$notified" == *true* ]]; then
+              continue
+            fi
+
+            gh api --method POST "$endpoint" \
+              --raw-field "body=@wgsim This pull request is ready to review.
 
           <!-- hgp-pr-review-watch -->" --silent
+          done <<< "$pr_numbers"
