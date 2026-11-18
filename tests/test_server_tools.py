@@ -1156,6 +1156,7 @@ def test_write_file_rejects_cross_repo_cold_start(server_components, tmp_path, m
 
     repo_a = tmp_path / "repo_a"
     repo_a.mkdir()
+    (repo_a / ".hgp").mkdir()  # HGP is opt-in: the bound repo is enabled
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
 

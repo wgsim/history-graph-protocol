@@ -12,6 +12,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def enabled_cwd(tmp_path, monkeypatch):
+    repo = tmp_path / "enabled-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / ".hgp").mkdir()
+    monkeypatch.chdir(repo)
+
+
 _SRC_HOOKS_DIR = Path(__file__).parent.parent / "src" / "hgp" / "hooks"
 _PRE_HOOK = str(_SRC_HOOKS_DIR / "claude" / "pre_bash_hgp.py")
 _POST_HOOK = str(_SRC_HOOKS_DIR / "claude" / "post_bash_hgp.py")
@@ -256,6 +268,7 @@ def test_gemini_post_bash_no_marker_silent():
 def test_gemini_post_bash_marker_no_changes_emits_additional_context_only(tmp_path):
     """Marker present but no tracked-file changes → additionalContext only, no systemMessage."""
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    (tmp_path / ".hgp").mkdir()  # HGP is opt-in: hooks only speak in enabled repos
 
     marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
     marker.write_text(r"\bcp\b")
@@ -275,6 +288,7 @@ def test_gemini_post_bash_reports_changes_as_json(tmp_path):
     """Marker present + tracked-file changes → both additionalContext and systemMessage."""
     # Init a minimal git repo with a tracked file
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    (tmp_path / ".hgp").mkdir()  # HGP is opt-in: hooks only speak in enabled repos
     subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t.com"],
                    check=True, capture_output=True)
     subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "T"],
@@ -427,6 +441,7 @@ def test_codex_post_tool_use_reports_changed_files(tmp_path):
     import os
     # Create a tracked file change in a git repo
     subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+    (tmp_path / ".hgp").mkdir()  # HGP is opt-in: hooks only speak in enabled repos
     tracked = tmp_path / "tracked.txt"
     tracked.write_text("original")
     subprocess.run(["git", "add", str(tracked)], capture_output=True, cwd=str(tmp_path))

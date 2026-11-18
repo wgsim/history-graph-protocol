@@ -6,37 +6,50 @@ additionalContext so the subagent knows which parent_op_ids to use.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
-def _load_hgp_paths() -> Any:
-    """Load hgp_paths.py installed beside this hook (or from the package tree)."""
-    import importlib.util
-
-    here = Path(__file__).resolve().parent
-    for candidate in (here / "hgp_paths.py", here.parent / "hgp_paths.py"):
-        if not candidate.is_file():
-            continue
+def _hgp_paths() -> Any:
+    """Return hgp_paths: installed beside this hook, else from the hgp package, else None."""
+    try:
+        import hgp_paths  # pyright: ignore[reportMissingImports]
+    except ImportError:
         try:
-            spec = importlib.util.spec_from_file_location("_hgp_paths", candidate)
-            if spec is None or spec.loader is None:
-                continue
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
-        except Exception:
-            continue
-    return None
+            from hgp.hooks import hgp_paths
+        except ImportError:
+            return None
+    return hgp_paths
 
 
-def _find_hgp_dir() -> Path | None:
-    paths = _load_hgp_paths()
+def _enabled(start: Path) -> bool:
+    """Return whether HGP is enabled for ``start`` (its storage .hgp/ exists)."""
+    check = getattr(_hgp_paths(), "hgp_enabled", None)
+    if check is not None:
+        return bool(check(start))
+    for parent in [start, *start.parents]:  # no hgp_paths: walk up to the checkout root
+        if (parent / ".git").exists():
+            return (parent / ".hgp").is_dir()
+    return (start / ".hgp").is_dir()  # outside git only this directory's store counts
+
+
+def _event_cwd(event: object) -> Path:
+    """HGP_PROJECT_ROOT when it names a directory (as in the server), else the event cwd."""
+    env = os.environ.get("HGP_PROJECT_ROOT")
+    if env and Path(env).is_dir():
+        return Path(env).resolve()
+    cwd = cast(dict[str, Any], event).get("cwd") if isinstance(event, dict) else None
+    return Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
+
+
+def _find_hgp_dir(start: Path) -> Path | None:
+    paths = _hgp_paths()
     if paths is not None:
-        return paths.find_hgp_dir(Path.cwd())
+        return paths.find_hgp_dir(start)
     # Fallback for partial installs without hgp_paths.py: worktree-local lookup.
-    for parent in [Path.cwd(), *Path.cwd().parents]:
+    for parent in [start, *start.parents]:
         candidate = parent / ".hgp"
         if candidate.is_dir():
             return candidate
@@ -45,10 +58,13 @@ def _find_hgp_dir() -> Path | None:
     return None
 
 
-def main() -> None:
+def _main() -> None:
     try:
         event = json.loads(sys.stdin.read())
     except json.JSONDecodeError:
+        sys.exit(0)
+    start = _event_cwd(event)  # one directory for the gate and the context lookup
+    if not _enabled(start):
         sys.exit(0)
 
     if event.get("hook_event_name") != "SubagentStart":
@@ -58,7 +74,7 @@ def main() -> None:
     if not session_id:
         sys.exit(0)
 
-    hgp_dir = _find_hgp_dir()
+    hgp_dir = _find_hgp_dir(start)
     if hgp_dir is None:
         sys.exit(0)
 
@@ -84,6 +100,16 @@ def main() -> None:
             ),
         }
     }))
+
+
+def main() -> None:
+    """Fail-open entry point: an unexpected error never blocks the agent's tool call."""
+    try:
+        _main()
+    except SystemExit:
+        raise
+    except Exception:
+        sys.exit(0)
 
 
 if __name__ == "__main__":

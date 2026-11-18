@@ -6,6 +6,7 @@ it by file path, and ``hgp.project`` re-exports :func:`find_storage_root`.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -157,3 +158,24 @@ def find_hgp_dir(start: Path) -> Path | None:
         if candidate.is_dir():
             return candidate
     return None
+
+
+def hgp_enabled(start: Path) -> bool:
+    """Return whether HGP is enabled for ``start``.
+
+    Enabled when its storage ``.hgp/`` exists, or when the checkout itself has a
+    legacy ``.hgp/`` (a linked worktree's store from before storage was shared),
+    so upgrading never silently drops a worktree's policy. Outside git only
+    ``start/.hgp`` counts, matching the server's cwd-local store: an ancestor's
+    ``.hgp`` (such as ``~/.hgp``) belongs to another directory. Like the
+    server, ``HGP_PROJECT_ROOT`` (when it names a directory) replaces ``start``
+    as the project root, with no walk up.
+    """
+    env = os.environ.get("HGP_PROJECT_ROOT")
+    if env and Path(env).is_dir():
+        root = Path(env).resolve()
+        return shared_hgp_dir(root).is_dir() or (root / ".hgp").is_dir()
+    for parent in [start, *start.parents]:
+        if (parent / ".git").exists():
+            return shared_hgp_dir(parent).is_dir() or (parent / ".hgp").is_dir()
+    return (start / ".hgp").is_dir()

@@ -69,6 +69,7 @@ class HGPContext:
     reconciler: Reconciler
     project_root: Path | None  # active checkout root; None = global mode
     storage_root: Path | None = None  # shared repository root for .hgp/
+    db_identity: os.stat_result | None = None  # detect a moved or replaced live store
 
 
 _ctx: HGPContext | None = None
@@ -143,6 +144,7 @@ def _get_context() -> HGPContext:
             reconciler = Reconciler(db, cas, hgp_content_dir, project_root=project_root)
             db.expire_leases()
             db.commit()
+            db_identity = (hgp_dir / "hgp.db").stat()
             startup_report = reconciler.reconcile()
             if startup_report.errors:
                 _log.warning("startup reconcile reported errors: %s", startup_report.errors)
@@ -151,7 +153,7 @@ def _get_context() -> HGPContext:
             raise
         _ctx = HGPContext(
             db=db, cas=cas, lease_mgr=lease_mgr, reconciler=reconciler,
-            project_root=project_root, storage_root=storage_root,
+            project_root=project_root, storage_root=storage_root, db_identity=db_identity,
         )
     return _ctx
 
@@ -1372,6 +1374,43 @@ def _read_mode() -> str:
     return "on"
 
 
+def _check_initialized() -> dict[str, Any] | None:
+    """Return HGP_NOT_INITIALIZED unless HGP is enabled for the current checkout.
+
+    HGP is opt-in: it is enabled when the storage `.hgp/` exists (created by
+    `hgp init`). A bound repository context is valid only while its database
+    is still at the bound path. Global mode always passes. A negative result is not cached, so `hgp init`
+    takes effect on the next call.
+    """
+    global _ctx
+    if _ctx is not None:
+        if _ctx.storage_root is None or _ctx.db_identity is None:
+            return None
+        try:
+            current = (_ctx.storage_root / ".hgp" / "hgp.db").stat()
+        except (FileNotFoundError, NotADirectoryError):
+            current = None
+        if current is not None and os.path.samestat(current, _ctx.db_identity):
+            return None
+        _ctx.db.close()
+        _ctx = None
+    if os.environ.get("HGP_GLOBAL_MODE"):
+        return None
+    try:
+        root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        root = Path.cwd()
+    storage_root = find_storage_root(root)
+    # A checkout-local legacy .hgp/ (a linked worktree's store from before storage
+    # was shared) also counts, so upgrading does not strand that worktree.
+    if (storage_root / ".hgp").is_dir() or (root / ".hgp").is_dir():
+        return None
+    return {
+        "error": "HGP_NOT_INITIALIZED",
+        "message": f"HGP is not enabled for {storage_root}. Run `hgp init` to enable it.",
+    }
+
+
 def _check_mode(mutation: bool = True) -> dict[str, Any] | None:
     """Return an early-exit response if the current mode disables this call.
 
@@ -1380,6 +1419,8 @@ def _check_mode(mutation: bool = True) -> dict[str, Any] | None:
 
     Returns None if the call should proceed normally.
     """
+    if (not_initialized := _check_initialized()) is not None:
+        return not_initialized
     mode = _read_mode()
     if mode == "off":
         return {"status": "HGP_DISABLED", "message": "HGP is disabled. Run `hgp mode on` to resume."}
@@ -1483,6 +1524,10 @@ action and decision.
 
 Record `hypothesis` operations for decisions, `artifact` for outputs,
 `invalidation` when superseding prior work.
+
+If an HGP tool returns `HGP_NOT_INITIALIZED`, HGP is not enabled for this
+repository: skip HGP for the session, use native tools, and do not run
+`hgp init` unless the user asks.
 
 ## Session Context (Subagent Support)
 
@@ -2795,11 +2840,80 @@ def _hgp_import(args: list[str]) -> None:
     print(f"Imported '{repo_name}' from {source}")
 
 
+_INIT_USAGE = (
+    "usage: hgp init\n"
+    "\n"
+    "  Enable HGP for the current git repository: create its .hgp/ store\n"
+    "  (the main repository's, when run inside a linked worktree) and keep\n"
+    "  .hgp/ out of git via .git/info/exclude unless it is already ignored.\n"
+)
+
+
+def _init(args: list[str]) -> None:
+    """`hgp init`: the only command whose purpose is to create a repository's .hgp/."""
+    import sys
+
+    if args:
+        print(_INIT_USAGE, file=sys.stderr, end="")
+        sys.exit(1)
+    try:
+        project_root = find_project_root(Path.cwd())
+    except ProjectRootError:
+        print(
+            "hgp init: no git repository found from current directory.\n"
+            "Run it inside a git repository, or set HGP_PROJECT_ROOT to enable HGP outside git.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    storage_root = find_storage_root(project_root)
+    hgp_dir = storage_root / ".hgp"
+    existed = hgp_dir.is_dir()
+    # HGP_PROJECT_ROOT may explicitly select a subdirectory of a Git checkout.
+    if any((parent / ".git").exists() for parent in (storage_root, *storage_root.parents)):
+        git = ["git", "-C", str(storage_root)]
+
+        def ignored() -> bool:
+            return subprocess.run(
+                [*git, "check-ignore", "-q", ".hgp/"], capture_output=True,
+            ).returncode == 0 and subprocess.run(
+                [*git, "check-ignore", "-q", ".hgp/hgp.db"], capture_output=True,
+            ).returncode == 0
+
+        try:
+            tracked = subprocess.run(
+                [*git, "ls-files", "-z", "--", ".hgp"], capture_output=True, check=True,
+            ).stdout
+            if tracked:
+                sys.exit("hgp init: .hgp contains tracked paths; review and untrack them before enabling HGP.")
+            if not ignored():
+                common = subprocess.run(
+                    [*git, "rev-parse", "--git-common-dir"], capture_output=True, text=True, check=True,
+                ).stdout.strip()
+                exclude = storage_root / common / "info" / "exclude"
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                existing = exclude.read_bytes() if exclude.exists() else b""
+                if b".hgp/" not in existing.splitlines():
+                    with exclude.open("ab") as stream:
+                        if existing and not existing.endswith(b"\n"):
+                            stream.write(b"\n")
+                        stream.write(b".hgp/\n")
+                if not ignored():
+                    sys.exit("hgp init: Git still includes .hgp/. Add /.hgp/ after conflicting "
+                             "rules in the repository .gitignore, then rerun hgp init.")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            sys.exit(f"hgp init: could not verify Git exclusion: {exc}")
+
+    hgp_dir.mkdir(parents=True, exist_ok=True)
+    print(f"HGP {'already enabled' if existed else 'enabled'}: {hgp_dir}")
+
+
 def run() -> None:
     """Entry point for `hgp` console script.
 
     Usage:
         hgp                          # start MCP server (stdio)
+        hgp init                     # enable HGP for this repository (creates .hgp/)
         hgp install                  # register MCP + install hooks + inject instructions
         hgp install --claude         # Claude Code only
         hgp install --gemini         # Gemini CLI only
@@ -2818,7 +2932,9 @@ def run() -> None:
     import sys
 
     args = sys.argv[1:]
-    if args and args[0] == "install":
+    if args and args[0] == "init":
+        _init(args[1:])
+    elif args and args[0] == "install":
         _install(args[1:])
     elif args and args[0] == "mode":
         _mode(args[1:])
