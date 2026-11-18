@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ from hgp.cas import CAS
 from hgp.db import Database
 from hgp.hooks.hgp_paths import checkout_value_from_metadata, find_linked_worktree_gitdir
 from hgp.models import ReconcileReport
-from hgp.project import ensure_worktree_id, read_worktree_id
+from hgp.project import WORKTREE_ID_FILE, ensure_worktree_id, read_worktree_id
 
 _log = logging.getLogger(__name__)
 
@@ -41,6 +42,40 @@ def _file_matches_hash(file_path: str, expected_hash: str) -> bool:
     except OSError as exc:
         _log.warning("_file_matches_hash: unexpected OSError for %r: %s", file_path, exc)
         return False
+
+
+def _registration_live(gitdir: Path) -> bool | None:
+    """Return None when Git's registration cannot be checked reliably."""
+    try:
+        (gitdir / "locked").stat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _log.warning("Orphan retirement deferred: cannot check lock for worktree registration %s: %s", gitdir, exc)
+        return None
+    else:
+        return True
+
+    try:
+        raw = (gitdir / "gitdir").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        _log.warning("Orphan retirement deferred: cannot read worktree registration %s/gitdir: %s", gitdir, exc)
+        return None
+    if not raw:
+        _log.warning("Orphan retirement deferred: empty worktree registration %s/gitdir", gitdir)
+        return None
+    pointer = gitdir / raw
+    try:
+        pointer.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        _log.warning(
+            "Orphan retirement deferred: cannot check checkout pointer %s for registration %s: %s",
+            pointer, gitdir, exc,
+        )
+        return None
+    return True
 
 
 class Reconciler:
@@ -92,13 +127,55 @@ class Reconciler:
             return None
         return str(self._project_root / file_path)
 
-    def _registered_worktree_ids(self) -> set[str]:
-        if self._worktrees_dir is None or not self._worktrees_dir.is_dir():
+    def _registered_worktree_ids(self) -> set[str] | None:
+        """Return IDs of worktrees whose checkout still exists (or is locked).
+
+        A checkout deleted without ``git worktree remove`` leaves its registration
+        behind as "prunable" until Git prunes it, possibly months later; it no
+        longer counts; neither does one without an ID marker, which HGP never
+        opened. None when a registration cannot be checked (unlisted, unreadable,
+        or with an unreadable ID marker): then no other checkout's op is retired.
+        """
+        if self._worktrees_dir is None:
             return set()
-        return {
-            identifier for gitdir in self._worktrees_dir.iterdir()
-            if gitdir.is_dir() and (identifier := read_worktree_id(gitdir)) is not None
-        }
+        try:
+            registrations = list(self._worktrees_dir.iterdir())
+        except FileNotFoundError:
+            return set()
+        except OSError as exc:
+            _log.warning(
+                "Orphan retirement deferred: cannot list worktree registrations in %s: %s",
+                self._worktrees_dir, exc,
+            )
+            return None
+        identifiers: set[str] = set()
+        for gitdir in registrations:
+            try:
+                mode = gitdir.stat().st_mode
+            except OSError as exc:
+                _log.warning("Orphan retirement deferred: cannot inspect worktree registration %s: %s", gitdir, exc)
+                return None
+            if not stat.S_ISDIR(mode):
+                continue
+            live = _registration_live(gitdir)
+            if live is None:
+                return None
+            if not live:
+                continue
+            identifier = read_worktree_id(gitdir)
+            if identifier is None:
+                try:
+                    (gitdir / WORKTREE_ID_FILE).lstat()
+                except FileNotFoundError:
+                    # HGP never assigned an ID here, so this worktree owns no ID-tagged op.
+                    continue
+                except OSError:
+                    pass
+                # A marker exists but cannot be read: it could own an op we are checking.
+                _log.warning("Orphan retirement deferred: unreadable or invalid worktree ID in %s", gitdir)
+                return None
+            identifiers.add(identifier)
+        return identifiers
 
     def reconcile(self, dry_run: bool = False) -> ReconcileReport:
         report = ReconcileReport()
@@ -143,6 +220,7 @@ class Reconciler:
         # Rule 5: PENDING op recovery — finalize or triage stuck PENDING ops
         pending_ops = self._db.query_operations(status="PENDING", include_inactive=True)
         registered_ids: set[str] | None = None
+        registrations_read = False
         for op in pending_ops:
             created_at_str = op.get("created_at", "")
             try:
@@ -168,9 +246,10 @@ class Reconciler:
                 # unless its worktree was removed and nobody will ever finish it.
                 checkout_id = checkout_value_from_metadata(op.get("metadata"), "id")
                 if checkout_id is not None:
-                    if registered_ids is None:
+                    if not registrations_read:
                         registered_ids = self._registered_worktree_ids()
-                    orphaned = checkout_id not in registered_ids
+                        registrations_read = True
+                    orphaned = registered_ids is not None and checkout_id not in registered_ids
                 else:
                     root = checkout_value_from_metadata(op.get("metadata"), "root")
                     orphaned = root is not None and not Path(root).is_dir()
