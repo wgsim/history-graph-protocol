@@ -1,0 +1,52 @@
+name: Notify maintainer of new PRs
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  pull-requests: write
+
+concurrency:
+  group: pr-review-watch
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: github.repository == 'wgsim/history-graph-protocol'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Notify the maintainer once per new PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Scheduled runs use the default branch, but review PRs targeting any branch.
+          since=$(gh api "repos/$GH_REPO/actions/workflows/pr-review-watch.yml" --jq '.created_at')
+          pr_numbers=$(
+            gh api --paginate "repos/$GH_REPO/pulls?state=open&per_page=100" |
+              jq -r --arg since "$since" '
+                .[] | select(.draft == false and .created_at >= $since) | .number
+              '
+          )
+
+          while IFS= read -r pr_number; do
+            [[ "$pr_number" =~ ^[0-9]+$ ]] || continue
+            endpoint="repos/$GH_REPO/issues/$pr_number/comments"
+            notified=$(gh api --paginate "$endpoint?per_page=100" --jq '
+              any(.[]; .user.login == "github-actions[bot]"
+                  and (.body | contains("<!-- hgp-pr-review-watch -->")))
+            ')
+            if [[ "$notified" == *true* ]]; then
+              continue
+            fi
+
+            gh api --method POST "$endpoint" \
+              --raw-field "body=@wgsim This pull request is ready to review.
+
+          <!-- hgp-pr-review-watch -->" --silent
+          done <<< "$pr_numbers"
