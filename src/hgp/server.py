@@ -75,6 +75,20 @@ class HGPContext:
 _ctx: HGPContext | None = None
 
 
+def _existing_history_dir(project_root: Path, storage_root: Path) -> Path:
+    """Select the legacy DB for snapshots until the user archives the local store."""
+    shared = storage_root / ".hgp"
+    if project_root != storage_root:
+        local = project_root / ".hgp"
+        if (local / "hgp.db").is_file() and local.resolve() != shared.resolve():
+            return local
+    return shared
+
+
+class LegacyWorktreeHistoryError(RuntimeError):
+    pass
+
+
 def _get_context() -> HGPContext:
     """Return (and lazily create) the server context singleton.
 
@@ -99,6 +113,14 @@ def _get_context() -> HGPContext:
                     project_root,
                 )
         hgp_dir = (storage_root / ".hgp") if storage_root else (Path.home() / ".hgp")
+        if storage_root is not None and project_root is not None:
+            existing = _existing_history_dir(project_root, storage_root)
+            if existing != hgp_dir:
+                raise LegacyWorktreeHistoryError(
+                    f"Legacy worktree history found at {existing}. Stop older HGP servers, "
+                    "run 'hgp export <new-directory>' here and verify the snapshot. "
+                    f"Move {existing} to an archive location before using shared history at {hgp_dir}."
+                )
         hgp_content_dir = hgp_dir / ".hgp_content"
         db = Database(hgp_dir / "hgp.db")
         try:
@@ -177,6 +199,16 @@ def _file_key(canonical: str, root: Path, ctx: HGPContext) -> str:
     if not isinstance(ctx.project_root, Path):
         return canonical
     return Path(canonical).relative_to(root.resolve()).as_posix()
+
+
+def _check_history_project(file_root: Path, ctx: HGPContext) -> dict[str, Any] | None:
+    """Allow history queries across shared checkouts, but not unrelated repos."""
+    if ctx.project_root is None:
+        return None  # global mode retains absolute file keys
+    storage_root = ctx.storage_root or find_storage_root(ctx.project_root)
+    if find_storage_root(file_root).resolve() == storage_root.resolve():
+        return None
+    return _check_file_project(file_root, ctx)
 
 
 def _present_ops(ops: list[dict[str, Any]], ctx: HGPContext) -> list[dict[str, Any]]:
@@ -428,6 +460,8 @@ def hgp_query_operations(
     if file_path is not None:
         try:
             root = find_project_root(Path(file_path).parent)
+            if err := _check_history_project(root, ctx):
+                return err
             canonical_fp = _file_key(canonical_file_path(file_path, root), root, ctx)
         except (ProjectRootError, PathOutsideRootError) as exc:
             _log.debug("hgp_query_operations: file_path canonicalization failed, using raw path: %s", exc)
@@ -461,6 +495,8 @@ def hgp_file_history(
     # history recorded from any linked worktree of the repository is returned.
     try:
         root = find_project_root(Path(file_path).parent)
+        if err := _check_history_project(root, ctx):
+            return err
         query_path = canonical_file_path(file_path, root)
         key = _file_key(query_path, root, ctx)
     except (ProjectRootError, PathOutsideRootError):
@@ -1194,7 +1230,12 @@ def hgp_move_file(
     # Auto-resolve previous_op_id from DB if not supplied by caller
     resolved_previous_op_id = previous_op_id
     if resolved_previous_op_id is None:
-        latest = db.get_ops_by_file_path(_file_key(canonical_old, root, ctx), limit=1)
+        linked_root = _linked_checkout_root(ctx)
+        latest = db.get_ops_by_file_path(
+            _file_key(canonical_old, root, ctx), limit=1,
+            scope_checkout=ctx.project_root is not None,
+            checkout_root=str(linked_root) if linked_root else None,
+        )
         if latest:
             resolved_previous_op_id = dict(latest[0])["op_id"]
 
@@ -1317,6 +1358,8 @@ def _read_mode() -> str:
         if mode_file.exists():
             val = mode_file.read_text().strip()
             return val if val in _VALID_MODES else "on"
+    except LegacyWorktreeHistoryError:
+        raise
     except Exception:
         pass
     return "on"
@@ -2100,10 +2143,24 @@ _HOOK_POLICY_USAGE = (
 
 
 def _installed_policy_hooks(project_root: Path) -> list[Path]:
-    """Hook scripts that read .hgp/hook-policy: project-local and user-global installs."""
+    """Find policy consumers across all checkouts sharing this repository's store."""
+    storage_root = find_storage_root(project_root)
+    roots = {project_root.resolve(), storage_root.resolve(), Path.home()}
+    worktrees_dir = storage_root / ".git" / "worktrees"
+    if worktrees_dir.is_dir():
+        for admin in worktrees_dir.iterdir():
+            try:
+                pointer = Path((admin / "gitdir").read_text(encoding="utf-8").strip())
+                if not pointer.is_absolute():
+                    pointer = admin / pointer
+                checkout = pointer.resolve().parent
+                if find_storage_root(checkout).resolve() == storage_root.resolve():
+                    roots.add(checkout)
+            except (OSError, UnicodeError, RuntimeError):
+                continue  # stale/pruned worktree registration
     return [
         base / client / "hooks" / "pre_tool_use_hgp.py"
-        for base in (project_root, Path.home())
+        for base in sorted(roots)
         for client in _HOOK_CLIENT_DIRS
     ]
 
@@ -2518,7 +2575,9 @@ def _hgp_backup(args: list[str]) -> None:
         sys.exit(1)
 
     storage_root = find_storage_root(project_root)
-    hgp_dir = storage_root / ".hgp"
+    hgp_dir = _existing_history_dir(project_root, storage_root)
+    if hgp_dir != storage_root / ".hgp":
+        print(f"hgp backup: using legacy worktree history at {hgp_dir}", file=sys.stderr)
     if not hgp_dir.exists():
         print("hgp backup: no .hgp/ directory found. Nothing to back up.", file=sys.stderr)
         sys.exit(1)
@@ -2675,7 +2734,9 @@ def _hgp_export(args: list[str]) -> None:
         sys.exit(1)
 
     storage_root = find_storage_root(project_root)
-    hgp_dir = storage_root / ".hgp"
+    hgp_dir = _existing_history_dir(project_root, storage_root)
+    if hgp_dir != storage_root / ".hgp":
+        print(f"hgp export: using legacy worktree history at {hgp_dir}", file=sys.stderr)
     if not hgp_dir.exists():
         print("hgp export: no .hgp/ directory found. Nothing to export.", file=sys.stderr)
         sys.exit(1)

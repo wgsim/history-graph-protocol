@@ -669,3 +669,112 @@ def test_concurrent_server_processes_share_one_db(tmp_path) -> None:
     rows = db.execute("SELECT COUNT(*), COUNT(DISTINCT commit_seq) FROM operations").fetchone()
     db.close()
     assert tuple(rows) == (writers * per_writer, writers * per_writer)
+
+
+@pytest.mark.parametrize("active_worktree", [False, True])
+def test_move_invalidates_only_active_checkout_revision(shared_db, active_worktree) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    active, other = (worktree, repo) if active_worktree else (repo, worktree)
+    server_module._ctx = ctx_for(active)
+    first = hgp_write_file(file_path=str(active / "tracked.txt"), content="older", agent_id="active")
+    current = hgp_write_file(file_path=str(active / "tracked.txt"), content="current", agent_id="active")
+    # File history must remain ordered by commit sequence, independently of memory tier.
+    db.execute("UPDATE operations SET memory_tier = 'short_term' WHERE op_id = ?", (first["op_id"],))
+    db.execute("UPDATE operations SET memory_tier = 'inactive' WHERE op_id = ?", (current["op_id"],))
+    server_module._ctx = ctx_for(other)
+    foreign = hgp_write_file(file_path=str(other / "tracked.txt"), content="other branch", agent_id="other")
+    server_module._ctx = ctx_for(active)
+    result = server_module.hgp_move_file(
+        old_path=str(active / "tracked.txt"), new_path=str(active / "renamed.txt"), agent_id="active",
+    )
+    assert result["status"] == "COMPLETED"
+    assert db.get_operation(current["op_id"])["status"] == "INVALIDATED"
+    assert db.get_operation(first["op_id"])["status"] == "COMPLETED"
+    assert db.get_operation(foreign["op_id"])["status"] == "COMPLETED"
+    assert (other / "tracked.txt").read_text() == "other branch"
+    assert (active / "renamed.txt").read_text() == "current"
+
+
+def test_move_without_local_history_does_not_invalidate_other_checkout(shared_db) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    server_module._ctx = ctx_for(worktree)
+    other = hgp_write_file(file_path=str(worktree / "tracked.txt"), content="other", agent_id="other")
+    server_module._ctx = ctx_for(repo)
+    result = server_module.hgp_move_file(
+        old_path=str(repo / "tracked.txt"), new_path=str(repo / "renamed.txt"), agent_id="main",
+    )
+    assert result["status"] == "COMPLETED"
+    assert db.get_operation(other["op_id"])["status"] == "COMPLETED"
+    assert db.get_invalidated_targets(result["invalidation_op_id"]) == []
+
+
+@pytest.mark.parametrize("query", [hgp_file_history, hgp_query_operations])
+@pytest.mark.parametrize("active_worktree", [False, True])
+def test_file_queries_reject_foreign_repo_but_allow_shared_checkout(
+    shared_db, tmp_path, query, active_worktree,
+) -> None:
+    repo, worktree, _, ctx_for = shared_db
+    active, sibling = (worktree, repo) if active_worktree else (repo, worktree)
+    server_module._ctx = ctx_for(active)
+    own = hgp_write_file(file_path=str(active / "tracked.txt"), content="own", agent_id="active")
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    _git("init", "-q", cwd=foreign)
+    result = query(file_path=str(foreign / "tracked.txt"))
+    assert result.get("error") == "CROSS_REPO_OPERATION"
+    assert "operations" not in result
+    shared = query(file_path=str(sibling / "tracked.txt"))
+    assert [op["op_id"] for op in shared["operations"]] == [own["op_id"]]
+
+
+@pytest.mark.parametrize("query", [hgp_file_history, hgp_query_operations])
+def test_global_file_queries_keep_absolute_repository_identity(shared_db, tmp_path, query) -> None:
+    repo, _, _, ctx_for = shared_db
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    _git("init", "-q", cwd=foreign)
+    ctx = ctx_for(repo)
+    ctx.project_root = None
+    ctx.storage_root = None
+    server_module._ctx = ctx
+    own = hgp_write_file(file_path=str(repo / "tracked.txt"), content="own", agent_id="a")
+    other = hgp_write_file(file_path=str(foreign / "tracked.txt"), content="other", agent_id="a")
+    for root, op in [(repo, own), (foreign, other)]:
+        result = query(file_path=str(root / "tracked.txt"))
+        assert [row["op_id"] for row in result["operations"]] == [op["op_id"]]
+        assert result["operations"][0]["file_path"] == str(root / "tracked.txt")
+
+
+def test_legacy_worktree_history_requires_archiving_before_switch(linked_worktree, tmp_path, monkeypatch):
+    import sqlite3
+
+    repo, wt = linked_worktree
+    monkeypatch.chdir(wt)
+    monkeypatch.setattr(server_module, "_ctx", None)
+    local = wt / ".hgp"
+    local.mkdir()
+    with sqlite3.connect(local / "hgp.db") as db:
+        db.execute("CREATE TABLE legacy (id INTEGER)")
+        db.execute("INSERT INTO legacy VALUES (42)")
+    content = local / ".hgp_content"
+    content.mkdir()
+    (content / "blob").write_bytes(b"history")
+    with pytest.raises(server_module.LegacyWorktreeHistoryError, match="hgp export"):
+        hgp_query_operations()
+    assert not (repo / ".hgp" / "hgp.db").exists()
+
+    snapshot = tmp_path / "snapshot"
+    for args in [("export", str(snapshot)), ("backup",)]:
+        result = _cli(*args, cwd=wt, tmp_path=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "legacy worktree history" in result.stderr
+    backup = tmp_path / "projects" / json.loads((local / "project-meta").read_text())["project_id"]
+    for dest in (snapshot, backup):
+        with sqlite3.connect(dest / "hgp.db") as db:
+            assert db.execute("SELECT id FROM legacy").fetchone() == (42,)
+        assert (dest / ".hgp_content" / "blob").read_bytes() == b"history"
+
+    local.rename(tmp_path / "archived-history")
+    assert hgp_query_operations()["operations"] == []
+    assert (repo / ".hgp" / "hgp.db").exists()
+    server_module._get_context().db.close()

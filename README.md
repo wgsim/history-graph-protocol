@@ -325,6 +325,8 @@ Databases created by earlier versions are migrated once on server start (migrati
 
 All worktrees of a repository share the main repository's `.hgp/` (database, blobs, `mode`, `hook-policy`, session context files). Git submodules are not merged: each keeps its own `.hgp/`.
 
+If a linked worktree already contains its own `.hgp/hgp.db`, the server pauses before opening the shared database. Stop older HGP processes and run `hgp export <new-directory>` inside the worktree. Export and backup select its legacy database and blobs. Verify the snapshot, then move the entire worktree-local `.hgp/` to an archive outside the checkout. The next server call uses the main repository's history. Keep the archive for historical queries. Importing a snapshot replaces the destination history, so use a separate repository to inspect it. Review any worktree-local hook policy before switching.
+
 - **Provenance**: operations recorded from a linked worktree carry `metadata.hgp_checkout = {"root": <worktree path>, "branch": <branch or null>}` (reserved key). It records where an operation came from; it is not part of the file identity. Operations from the main checkout are untagged.
 - **Queries**: `hgp_query_operations` returns the whole repository's history by default (`scope="repo"`); pass `scope="checkout"` to narrow to operations recorded from the active checkout. `hgp_file_history` returns a file's history from every worktree.
 - **Reconcile**: each checkout reconciles only its own pending file operations. Pending operations of a worktree whose directory no longer exists are marked `STALE_PENDING` (reported as `pending_orphaned`).

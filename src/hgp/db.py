@@ -354,13 +354,29 @@ class Database:
         self,
         file_path: str,
         limit: int = 50,
+        *,
+        scope_checkout: bool = False,
+        checkout_root: str | None = None,
     ) -> list[sqlite3.Row]:
-        """Return operations for a given file_path, ordered by commit_seq DESC."""
+        """Return file history by commit sequence, optionally scoped to a checkout.
+
+        Unlike query_operations, this includes inactive ops and does not rank by
+        memory tier. checkout_root=None selects untagged main-checkout ops.
+        """
         assert self._conn
+        scope = ""
+        params: list[Any] = [file_path]
+        if scope_checkout:
+            scope = (
+                "AND (CASE WHEN json_valid(metadata) "
+                "THEN json_extract(metadata, '$.hgp_checkout.root') END) IS ? "
+            )
+            params.append(checkout_root)
+        params.append(limit)
         return self._conn.execute(
             "SELECT * FROM operations WHERE file_path = ? "
-            "ORDER BY commit_seq DESC LIMIT ?",
-            (file_path, limit),
+            + scope + "ORDER BY commit_seq DESC LIMIT ?",
+            params,
         ).fetchall()
 
     def insert_edge(self, child_op_id: str, parent_op_id: str, edge_type: str = "causal") -> None:
