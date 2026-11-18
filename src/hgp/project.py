@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+import tempfile
+import uuid
 from pathlib import Path
 
 # Re-exported: single implementation shared with the standalone hook scripts.
 from hgp.hooks.hgp_paths import find_storage_root as find_storage_root
 from hgp.hooks.hgp_paths import parse_hook_policy as parse_hook_policy
+
+_log = logging.getLogger(__name__)
+
+WORKTREE_ID_FILE = "hgp-worktree-id"
+_WORKTREE_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
 class ProjectRootError(RuntimeError):
@@ -42,6 +51,65 @@ def find_project_root(start: Path) -> Path:
         f"No .git directory found above {current}. "
         "Set HGP_PROJECT_ROOT to specify the project root explicitly."
     )
+
+
+def read_worktree_id(gitdir: Path) -> str | None:
+    """Read HGP's identifier for this Git worktree registration, if assigned.
+
+    An unreadable or malformed marker reads as None: a damaged file in one
+    registration must not stop HGP in every checkout of the repository.
+    """
+    try:
+        value = (gitdir / WORKTREE_ID_FILE).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value if _WORKTREE_ID_RE.fullmatch(value) else None
+
+
+def ensure_worktree_id(gitdir: Path) -> str | None:
+    """Assign an ID that travels with the registration when Git moves the worktree.
+
+    Publish a complete marker atomically. If two servers start together, both use
+    the winner's ID. A deleted and recreated registration gets a different ID.
+    Returns None, so operations keep path-only provenance, when the marker is
+    damaged (it is never replaced) or cannot be written, e.g. a read-only gitdir.
+    """
+    if existing := read_worktree_id(gitdir):
+        return existing
+    marker = gitdir / WORKTREE_ID_FILE
+    if not (marker.exists() or marker.is_symlink()):
+        try:
+            _publish_worktree_id(marker)
+        except OSError as exc:
+            _log.warning("cannot assign worktree ID in %s: %s", gitdir, exc)
+            return None
+    assigned = read_worktree_id(gitdir)
+    if assigned is None:
+        _log.warning("ignoring damaged worktree ID marker %s", marker)
+    return assigned
+
+
+def _publish_worktree_id(marker: Path) -> None:
+    value = uuid.uuid4().hex + "\n"
+    with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=marker.parent, delete=False) as stream:
+        temp = Path(stream.name)
+        stream.write(value)
+    try:
+        try:
+            marker.hardlink_to(temp)
+        except FileExistsError:
+            pass
+        except OSError:
+            # No hard links on this filesystem: create exclusively instead. A
+            # concurrent reader may see a partial marker and fall back to None.
+            try:
+                fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                return
+            with os.fdopen(fd, "w", encoding="ascii") as out:
+                out.write(value)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def current_branch(checkout_root: Path) -> str | None:

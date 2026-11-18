@@ -161,7 +161,7 @@ def test_reconcile_recovers_pending_op_with_relative_key(shared_db) -> None:
     db.insert_operation(
         op_id="op-rel-pending", op_type="artifact", agent_id="a", commit_seq=seq,
         chain_hash="sha256:" + "d" * 64, status="PENDING", object_hash=obj_hash,
-        metadata=json.dumps({"hgp_checkout": {"root": str(worktree), "branch": "feature"}}),
+        metadata=json.dumps({"hgp_checkout": {"root": str(worktree), "id": ctx.reconciler.checkout_id}}),
         file_path="f.txt",
     )
     old_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -416,7 +416,12 @@ def test_ops_from_worktree_are_tagged_with_checkout(shared_db) -> None:
     written = hgp_write_file(file_path=str(worktree / "f.txt"), content="x", agent_id="a")
     for op_id in (op["op_id"], written["op_id"]):
         meta = json.loads(db.get_operation(op_id)["metadata"])
-        assert meta["hgp_checkout"] == {"root": str(worktree), "branch": "feature"}
+        assert meta["hgp_checkout"] == {
+            "root": str(worktree),
+            "branch": "feature",
+            "id": server_module._get_context().reconciler.checkout_id,
+        }
+        assert meta["hgp_checkout"]["id"]
     assert json.loads(db.get_operation(op["op_id"])["metadata"])["k"] == 1
 
     server_module._ctx = ctx_for(repo)
@@ -778,3 +783,291 @@ def test_legacy_worktree_history_requires_archiving_before_switch(linked_worktre
     assert hgp_query_operations()["operations"] == []
     assert (repo / ".hgp" / "hgp.db").exists()
     server_module._get_context().db.close()
+
+
+@pytest.mark.parametrize("snapshot_command", ["export", "backup"])
+def test_legacy_snapshot_file_history_is_portable(linked_worktree, tmp_path, snapshot_command):
+    repo, worktree = linked_worktree
+    local = worktree / ".hgp"
+    local.mkdir()
+    db = Database(local / "hgp.db")
+    db.initialize()
+    db.insert_operation(
+        op_id="legacy", op_type="artifact", status="COMPLETED", agent_id="old",
+        file_path=str(worktree / "tracked.txt"), commit_seq=1, chain_hash="sha256:" + "a" * 64,
+    )
+    db.close()
+
+    snapshot = tmp_path / "snapshot"
+    args = ("export", str(snapshot)) if snapshot_command == "export" else ("backup",)
+    result = _cli(*args, cwd=worktree, tmp_path=tmp_path)
+    assert result.returncode == 0, result.stderr
+    if snapshot_command == "backup":
+        project_id = json.loads((local / "project-meta").read_text())["project_id"]
+
+    inspection = tmp_path / "inspection"
+    _git("clone", str(repo), str(inspection), cwd=tmp_path)
+    if snapshot_command == "backup":
+        result = _cli("restore", "--project-id", project_id, "--force", cwd=inspection, tmp_path=tmp_path)
+    else:
+        result = _cli("import", str(snapshot), "--force", cwd=inspection, tmp_path=tmp_path)
+    assert result.returncode == 0, result.stderr
+    inspect = subprocess.run(
+        [sys.executable, "-c",
+         "import json; from hgp.server import hgp_file_history; print(json.dumps(hgp_file_history('tracked.txt')))"],
+        cwd=inspection, check=True, capture_output=True, text=True,
+    )
+    records = json.loads(inspect.stdout)["operations"]
+    assert [op["op_id"] for op in records] == ["legacy"]
+    assert records[0]["file_path"] == str(inspection / "tracked.txt")
+
+    db = Database(local / "hgp.db")
+    db.initialize()
+    assert db.get_operation("legacy")["file_path"] == str(worktree / "tracked.txt")
+    db.close()
+
+
+def test_reused_checkout_path_cannot_adopt_path_only_history(linked_worktree, monkeypatch):
+    repo, wt = linked_worktree
+    monkeypatch.setattr(server_module, "_ctx", None)
+    monkeypatch.chdir(wt)
+    previous = hgp_write_file("tracked.txt", "old checkout", "review")["op_id"]
+    ctx = server_module._get_context()
+    _insert_old_pending(ctx.db, "pending-old", wt / "tracked.txt", wt)
+    ctx.db.execute("UPDATE operations SET metadata = json_remove(metadata, '$.hgp_checkout.id')")
+    ctx.db.close()
+    server_module._ctx = None
+
+    monkeypatch.chdir(repo)
+    _git("worktree", "remove", "--force", str(wt), cwd=repo)
+    _git("worktree", "add", "-qb", "replacement", str(wt), cwd=repo)
+    monkeypatch.chdir(wt)
+    current = server_module._get_context()
+    try:
+        assert hgp_query_operations(scope="checkout")["operations"] == []
+        assert current.db.get_operation("pending-old")["status"] == "PENDING"
+        assert json.loads(current.db.get_operation(previous)["metadata"])["hgp_checkout"].get("id") is None
+        assert previous in {row["op_id"] for row in hgp_file_history("tracked.txt")["operations"]}
+        assert server_module.hgp_move_file("tracked.txt", "new.txt", "review")["status"] == "COMPLETED"
+        assert current.db.get_operation(previous)["status"] == "COMPLETED"
+    finally:
+        current.db.close()
+
+
+def test_completed_migration_does_not_request_a_write_lock(tmp_path):
+    path = tmp_path / "hgp.db"
+    writer, reader = Database(path), Database(path)
+    writer.initialize()
+    reader.initialize()
+    try:
+        assert writer.relativize_file_paths(tmp_path) == 0
+        writer.begin_immediate()
+        reader.execute("PRAGMA busy_timeout = 0")
+        assert reader.relativize_file_paths(tmp_path) == 0
+    finally:
+        writer.close()
+        reader.close()
+
+
+def test_checkout_history_and_pending_recovery_follow_worktree_move(linked_worktree, tmp_path, monkeypatch):
+    repo, wt = linked_worktree
+    monkeypatch.setattr(server_module, "_ctx", None)
+    monkeypatch.chdir(wt)
+    old = hgp_write_file("tracked.txt", "first", "review")["op_id"]
+    latest = hgp_write_file("tracked.txt", "current", "review")["op_id"]
+    ctx = server_module._get_context()
+    ctx.db.execute("UPDATE operations SET status='PENDING', created_at='2000-01-01T00:00:00Z' WHERE op_id=?", (latest,))
+    ctx.db.close()
+    server_module._ctx = None
+
+    monkeypatch.chdir(repo)
+    target = tmp_path / "renamed-worktree"
+    _git("worktree", "move", str(wt), str(target), cwd=repo)
+    # Reconcile from another checkout first. The old path is gone, but the
+    # registration still exists and owns the pending operation.
+    main = server_module._get_context()
+    assert main.db.get_operation(latest)["status"] == "PENDING"
+    main.db.close()
+    server_module._ctx = None
+
+    monkeypatch.chdir(target)
+    current = server_module._get_context()
+    assert current.db.get_operation(latest)["status"] == "COMPLETED"
+    scoped = hgp_query_operations(scope="checkout", include_inactive=True)
+    assert {op["op_id"] for op in scoped["operations"]} == {old, latest}
+    move = server_module.hgp_move_file("tracked.txt", "renamed.txt", "review")
+    assert move["status"] == "COMPLETED"
+    assert current.db.get_operation(latest)["status"] == "INVALIDATED"
+    current.db.close()
+    server_module._ctx = None
+
+    # A different checkout at the old path must not inherit the moved checkout's history.
+    _git("worktree", "add", "-qb", "replacement", str(wt), cwd=repo)
+    monkeypatch.chdir(wt)
+    assert hgp_query_operations(scope="checkout", include_inactive=True)["operations"] == []
+    server_module._get_context().db.close()
+    server_module._ctx = None
+
+
+def test_simultaneous_v6_migrations_preserve_original_backup(tmp_path, monkeypatch):
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    path = tmp_path / "hgp.db"
+    backup = tmp_path / "pre-v6.bak"
+    a, b = Database(path), Database(path)
+    a.initialize()
+    b.initialize()
+    original_path = str(tmp_path / "tracked.txt")
+    a.insert_operation(
+        op_id="legacy", op_type="artifact", status="COMPLETED", agent_id="old",
+        file_path=original_path, commit_seq=1, chain_hash="sha256:" + "a" * 64,
+    )
+    copying = Event()
+    second_started = Event()
+    connect = sqlite3.connect
+
+    def synchronize_backup(path, *args, **kwargs):
+        if str(path) == str(backup) and not copying.is_set():
+            copying.set()
+            assert second_started.wait(3)
+        return connect(path, *args, **kwargs)
+
+    def second_migration():
+        assert b._conn is not None
+        b._conn.set_trace_callback(
+            lambda sql: second_started.set() if sql == "BEGIN IMMEDIATE" else None
+        )
+        return b.relativize_file_paths(tmp_path, backup_path=backup)
+
+    monkeypatch.setattr(sqlite3, "connect", synchronize_backup)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(a.relativize_file_paths, tmp_path, backup)
+            assert copying.wait(3)
+            second = pool.submit(second_migration)
+            assert sorted((first.result(timeout=6), second.result(timeout=6))) == [0, 1]
+        with connect(backup) as snapshot:
+            assert snapshot.execute("SELECT file_path FROM operations").fetchone() == (original_path,)
+            assert snapshot.execute(
+                "SELECT 1 FROM _hgp_migrations WHERE name = 'v6_relative_file_keys'"
+            ).fetchone() is None
+    finally:
+        a.close()
+        b.close()
+
+
+def _insert_old_pending_with_id(db: Database, op_id: str, worktree: Path, checkout_id: str) -> None:
+    _insert_old_pending(db, op_id, worktree / "f.txt", worktree)
+    db.execute(
+        "UPDATE operations SET metadata = json_set(metadata, '$.hgp_checkout.id', ?) WHERE op_id = ?",
+        (checkout_id, op_id),
+    )
+    db.commit()
+
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_reconcile_retires_ops_of_worktree_deleted_without_git(shared_db, tmp_path, locked) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    checkout_id = ctx_for(worktree).reconciler.checkout_id
+    assert checkout_id
+    _insert_old_pending_with_id(db, "op-wt", worktree, checkout_id)
+    if locked:  # e.g. on removable media: Git keeps it, so must HGP
+        _git("worktree", "lock", str(worktree), cwd=repo)
+    # Deleted outside Git: the registration stays behind as "prunable".
+    worktree.rename(tmp_path / "elsewhere")
+    assert (repo / ".git" / "worktrees" / worktree.name).is_dir()
+
+    report = ctx_for(repo).reconciler.reconcile()
+    assert report.pending_orphaned == (0 if locked else 1)
+    assert db.get_operation("op-wt")["status"] == ("PENDING" if locked else "STALE_PENDING")
+
+
+@pytest.mark.parametrize("content", [b"", b"\xff\xfe\n", b"not-an-id\n"])
+def test_damaged_worktree_id_does_not_break_startup(shared_db, content) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    marker = repo / ".git" / "worktrees" / worktree.name / "hgp-worktree-id"
+    marker.write_bytes(content)
+    _insert_old_pending(db, "op-live", worktree / "f.txt", worktree)
+
+    # Every checkout reads every registration's marker; none may fail on it.
+    ctx_for(repo).reconciler.reconcile()
+    wt = ctx_for(worktree).reconciler
+    assert wt.checkout_id is None  # path-only provenance, as before IDs
+    wt.reconcile()
+    assert marker.read_bytes() == content  # never silently replaced
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores permissions")
+def test_read_only_worktree_registration_does_not_break_startup(shared_db) -> None:
+    repo, worktree, _, ctx_for = shared_db
+    admin = repo / ".git" / "worktrees" / worktree.name
+    mode = admin.stat().st_mode
+    admin.chmod(0o555)
+    try:
+        assert ctx_for(worktree).reconciler.checkout_id is None
+    finally:
+        admin.chmod(mode)
+
+
+def test_worktree_id_without_hard_links(shared_db, monkeypatch) -> None:
+    import errno
+
+    repo, worktree, _, ctx_for = shared_db
+
+    def no_links(self, target):
+        raise OSError(errno.EPERM, "hard links not supported")
+
+    monkeypatch.setattr(Path, "hardlink_to", no_links)
+    checkout_id = ctx_for(worktree).reconciler.checkout_id
+    assert checkout_id and len(checkout_id) == 32
+    assert project.read_worktree_id(repo / ".git" / "worktrees" / worktree.name) == checkout_id
+    assert [p.name for p in (repo / ".git" / "worktrees" / worktree.name).glob("tmp*")] == []
+
+
+@pytest.mark.parametrize("unreadable_file", ["hgp-worktree-id", "gitdir"])
+def test_inconclusive_registration_does_not_retire_pending_operations(
+    shared_db, monkeypatch, caplog, unreadable_file,
+):
+    repo, worktree, db, ctx_for = shared_db
+    checkout_id = ctx_for(worktree).reconciler.checkout_id
+    assert checkout_id is not None
+    _insert_old_pending_with_id(db, "op-wt", worktree, checkout_id)
+    target = repo / ".git" / "worktrees" / worktree.name / unreadable_file
+    read_text = Path.read_text
+
+    def guarded_read(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError("simulated unreadable worktree registration")
+        return read_text(path, *args, **kwargs)
+
+    main = ctx_for(repo).reconciler
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", guarded_read)
+        assert main.reconcile().pending_orphaned == 0
+        assert db.get_operation("op-wt")["status"] == "PENDING"
+        warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "Orphan retirement deferred" in warnings[0]
+        assert str(target.parent) in warnings[0]
+        assert ("cannot read" if unreadable_file == "gitdir" else "worktree ID") in warnings[0]
+
+    caplog.clear()
+    assert main.reconcile().pending_orphaned == 0
+    assert not caplog.records
+    assert db.get_operation("op-wt")["status"] == "PENDING"
+
+
+def test_worktree_never_opened_by_hgp_does_not_block_orphan_retirement(shared_db, tmp_path) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    checkout_id = ctx_for(worktree).reconciler.checkout_id
+    assert checkout_id
+    _insert_old_pending_with_id(db, "op-wt", worktree, checkout_id)
+    # A second worktree HGP never ran in: it has no ID marker, so it cannot own the op.
+    _git("worktree", "add", "-q", str(tmp_path / "untouched"), "-b", "untouched", cwd=repo)
+    worktree.rename(tmp_path / "elsewhere")  # the op's worktree is deleted outside Git
+
+    report = ctx_for(repo).reconciler.reconcile()
+    assert report.pending_orphaned == 1
+    assert db.get_operation("op-wt")["status"] == "STALE_PENDING"
