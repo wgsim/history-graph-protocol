@@ -153,6 +153,7 @@ Queries operation records by one or more filter criteria. When `op_id` is suppli
 | `include_inactive` | `boolean` | No | `false` | Whether to include operations in the `inactive` memory tier |
 | `limit` | `integer` | No | `100` | Maximum number of results to return. Clamped to `[1, 1000]`; negative values are treated as `1`. |
 | `file_path` | `string` | No | `null` | Filter to operations recorded for this file path (canonicalized before matching) |
+| `scope` | `string` | No | `"repo"` | `"repo"`: operations from every linked Git worktree of the repository (they share one `.hgp/` and one history). `"checkout"`: only operations recorded from the active checkout. Ignored when `op_id` or `file_path` is given. Outside linked worktrees both values return the same results. Invalid values return `INVALID_SCOPE`. |
 
 ### Returns
 
@@ -1126,6 +1127,7 @@ The following table consolidates all error codes across all tools.
 
 | Error Code | Tool(s) | Condition |
 |---|---|---|
+| `HGP_NOT_INITIALIZED` | all tools | HGP is not enabled for the current repository (its `.hgp/` does not exist). Run `hgp init`. Nothing is created. |
 | `INVALID_OP_TYPE` | `hgp_create_operation` | `op_type` is not one of the four valid values |
 | `CHAIN_STALE` | `hgp_create_operation` | Supplied `chain_hash` does not match the current subgraph hash |
 | `INVALID_EVIDENCE_REF` | `hgp_create_operation` | One or more `evidence_refs` entries fail schema validation |

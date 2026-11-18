@@ -29,6 +29,14 @@ def test_inject_instructions_new_file(tmp_path):
     assert "<!-- hgp-instructions-end -->" in content
 
 
+def test_instructions_mention_not_initialized(tmp_path):
+    md = tmp_path / "CLAUDE.md"
+    _inject_instructions(md)
+    content = md.read_text()
+    assert "HGP_NOT_INITIALIZED" in content
+    assert "hgp init" in content
+
+
 def test_inject_instructions_appends_to_existing(tmp_path):
     md = tmp_path / "CLAUDE.md"
     md.write_text("# My project\n\nSome existing content.\n")

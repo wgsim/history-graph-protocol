@@ -104,6 +104,7 @@ class ReconcileReport(BaseModel):
     pending_recovered: int = 0
     pending_stale: int = 0
     pending_skipped_young: int = 0
+    pending_orphaned: int = 0  # PENDING ops of removed linked worktrees → STALE_PENDING
 
 
 # ── V3 Evidence Trail ─────────────────────────────────────────

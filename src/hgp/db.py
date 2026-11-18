@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -162,6 +163,15 @@ PRAGMA foreign_keys = ON;
 _MAX_EVIDENCE_RESULTS = 200
 
 
+# A path can be reused, so only ID-tagged rows belong to a linked checkout.
+_CHECKOUT_MATCH = """CASE WHEN json_valid(metadata) THEN
+    CASE WHEN json_extract(metadata, '$.hgp_checkout.id') IS NOT NULL
+         THEN json_extract(metadata, '$.hgp_checkout.id') = ?
+         ELSE json_extract(metadata, '$.hgp_checkout.root') IS NULL AND ? IS NULL
+    END
+    ELSE ? IS NULL END"""
+
+
 class Database:
     """Thread-safe SQLite wrapper for HGP."""
 
@@ -224,6 +234,59 @@ class Database:
                 "INSERT OR IGNORE INTO _hgp_migrations (name) VALUES (?)",
                 ("v5_stale_pending_status",),
             )
+
+    def relativize_file_paths(self, main_root: Path, backup_path: Path | None = None) -> int:
+        """One-time migration (v6): absolute ``file_path`` → repo-relative file keys.
+
+        Untagged ops are made relative to ``main_root``; ops tagged with
+        ``metadata.hgp_checkout.root`` (recorded from a linked worktree) are made
+        relative to that worktree. Paths outside their root stay absolute.
+        When any row changes, the database is first copied to ``backup_path``.
+        Returns the number of rows rewritten.
+        """
+        import os
+
+        from hgp.hooks.hgp_paths import checkout_value_from_metadata
+
+        assert self._conn
+        name = "v6_relative_file_keys"
+        # Avoid taking a write reservation on every startup after migration.
+        if self._conn.execute("SELECT 1 FROM _hgp_migrations WHERE name = ?", (name,)).fetchone():
+            return 0
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self._conn.execute("SELECT 1 FROM _hgp_migrations WHERE name = ?", (name,)).fetchone():
+                self._conn.commit()
+                return 0
+            main_root = main_root.resolve()
+            updates: list[tuple[str, str]] = []
+            for row in self._conn.execute(
+                "SELECT op_id, file_path, metadata FROM operations WHERE file_path IS NOT NULL"
+            ):
+                fp = row["file_path"]
+                if not os.path.isabs(fp):
+                    continue
+                checkout_root = checkout_value_from_metadata(row["metadata"], "root")
+                base = Path(checkout_root) if checkout_root else main_root
+                try:
+                    updates.append((Path(fp).relative_to(base).as_posix(), row["op_id"]))
+                except ValueError:
+                    continue  # outside its checkout root: keep the absolute path
+            if updates and backup_path is not None:
+                # The writer holds the reservation. A separate reader can back up
+                # its committed view without waiting for that same writer to commit.
+                with closing(sqlite3.connect(str(self._path))) as src:
+                    with closing(sqlite3.connect(str(backup_path))) as dst:
+                        src.backup(dst)
+            self._conn.executemany("UPDATE operations SET file_path = ? WHERE op_id = ?", updates)
+            self._conn.execute("INSERT INTO _hgp_migrations (name) VALUES (?)", (name,))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        if updates:
+            _log.info("v6 migration: %d file path(s) made repo-relative", len(updates))
+        return len(updates)
 
     def close(self) -> None:
         if self._conn:
@@ -305,13 +368,27 @@ class Database:
         self,
         file_path: str,
         limit: int = 50,
+        *,
+        scope_checkout: bool = False,
+        checkout_root: str | None = None,
+        checkout_id: str | None = None,
     ) -> list[sqlite3.Row]:
-        """Return operations for a given file_path, ordered by commit_seq DESC."""
+        """Return file history by commit sequence, optionally scoped to a checkout.
+
+        Unlike query_operations, this includes inactive ops and does not rank by
+        memory tier. checkout_root=None selects untagged main-checkout ops.
+        """
         assert self._conn
+        scope = ""
+        params: list[Any] = [file_path]
+        if scope_checkout:
+            scope = f"AND ({_CHECKOUT_MATCH}) "
+            params.extend((checkout_id, checkout_root, checkout_root))
+        params.append(limit)
         return self._conn.execute(
             "SELECT * FROM operations WHERE file_path = ? "
-            "ORDER BY commit_seq DESC LIMIT ?",
-            (file_path, limit),
+            + scope + "ORDER BY commit_seq DESC LIMIT ?",
+            params,
         ).fetchall()
 
     def insert_edge(self, child_op_id: str, parent_op_id: str, edge_type: str = "causal") -> None:
@@ -367,10 +444,21 @@ class Database:
         include_inactive: bool = False,
         limit: int = 1000,
         file_path: str | None = None,
+        scope_checkout: bool = False,
+        checkout_root: str | None = None,
+        checkout_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Query operations.
+
+        With ``scope_checkout=True``, match the worktree ID. Two None values select
+        the main checkout. Path-only history remains accessible at repo scope.
+        """
         assert self._conn
         clauses: list[str] = []
         params: list[Any] = []
+        if scope_checkout:
+            clauses.append(f"({_CHECKOUT_MATCH})")
+            params.extend((checkout_id, checkout_root, checkout_root))
         if status:
             clauses.append("status = ?")
             params.append(status)

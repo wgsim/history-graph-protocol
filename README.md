@@ -294,14 +294,45 @@ hgp hook-policy block        # block native Write/Edit/MultiEdit/write_file/repl
 
 > If you installed hooks before this feature was added, run `hgp install` again to update them.
 
+The policy is stored in `.hgp/hook-policy` as JSON (`{"block_mode": true}`; other keys are preserved when the CLI updates it). Legacy plain-text files containing `block` or `advisory` are still read; unrecognised content is treated as advisory. While any installed `pre_tool_use_hgp.py` (project-local or in `~/.claude`, `~/.gemini`, `~/.codex`) predates the JSON format, `hgp hook-policy` keeps writing the plain-text format so those hooks still enforce it, and tells you to reinstall them.
+
+### Enabling HGP per repository
+
+HGP is opt-in per repository. Run this once inside the repository (or any of its linked worktrees):
+
+```bash
+hgp init     # creates .hgp/ and keeps it out of git via .git/info/exclude
+```
+
+Until then, HGP tools return `HGP_NOT_INITIALIZED` and never create `.hgp/`, and the installed hooks do nothing in that repository. A repository that already has `.hgp/` (from an earlier version) stays enabled, and so does a linked worktree that kept its own pre-upgrade `.hgp/`. To stop using HGP in a repository, delete `.hgp/` (this deletes its history). To pause it instead, run `hgp hook-policy advisory` first and then `hgp mode off`: hooks do not read `mode`, so under a `block` policy native file tools would stay blocked while HGP tools refuse to record. Global mode (`HGP_GLOBAL_MODE`) is unaffected.
+
 ### Storage
 
-HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gitignored). The server resolves the project root from the nearest `.git` directory at startup.
+HGP stores its database and content-addressable blobs in `<repo_root>/.hgp/` (gitignored). The server resolves the active checkout from the nearest `.git` directory at startup. When running inside a linked Git worktree, it keeps file-safety checks scoped to that worktree but shares internal storage with the main repository through Git's `commondir`.
 
-- **Graph tools** (`hgp_create_operation`, queries, etc.): if no git repo is found, fall back to `<cwd>/.hgp/` with a warning.
+- **Graph tools** (`hgp_create_operation`, queries, etc.): outside a git repository they use `<cwd>/.hgp/` only if it already exists; otherwise they return `HGP_NOT_INITIALIZED`. To use HGP outside git, set `HGP_PROJECT_ROOT` and run `hgp init`, or use `HGP_GLOBAL_MODE`.
 - **File tools** (`hgp_write_file`, `hgp_edit_file`, etc.): always require a git repo or an explicit `HGP_PROJECT_ROOT`. Without one, they return `PROJECT_ROOT_NOT_FOUND`.
 
 The `.hgp/` directory is reserved for HGP internals. File tools reject any path that contains a `.hgp` directory segment — including nested paths like `sub/.hgp/file.txt` — and return `HGP_INTERNAL_PATH`. This applies across all `.hgp/` directories in a project tree, which is intentional for monorepo and nested-repo layouts.
+
+#### File identity
+
+Tracked files are stored as **repo-relative paths** (relative to the checkout the file lives in), so the same file has one history across all worktrees of a repository. Tool responses still report absolute paths, resolved against the active checkout. Global mode (`HGP_GLOBAL_MODE`, one store spanning many repositories) keeps absolute paths.
+
+Databases created by earlier versions are migrated once on server start (migration `v6_relative_file_keys`); when any row changes, the database is first copied to `.hgp/hgp.db.pre-v6-<timestamp>.bak`.
+
+#### Linked Git worktrees
+
+All worktrees of a repository share the main repository's `.hgp/` (database, blobs, `mode`, `hook-policy`, session context files). Git submodules are not merged: each keeps its own `.hgp/`.
+
+If a linked worktree already contains its own `.hgp/hgp.db`, the server pauses before opening the shared database. Stop older HGP processes and run `hgp export <new-directory>` inside the worktree. Export and backup select its legacy database and blobs. Verify the snapshot, then move the entire worktree-local `.hgp/` to an archive outside the checkout. The next server call uses the main repository's history. Keep the archive for historical queries. Importing a snapshot replaces the destination history, so use a separate repository to inspect it. Backups and exports record the original root so pre-v6 file history remains queryable from the new checkout. Review any worktree-local hook policy before switching.
+
+- **Provenance**: operations from a linked worktree carry `metadata.hgp_checkout` with the worktree ID, the path at the time of recording, and the branch (or null). The ID follows `git worktree move` and does not affect file identity. Operations from the main checkout are untagged. Older records with only a worktree path remain available in repository and file history. HGP does not attribute those records to a specific checkout because Git can reuse the path.
+- **Queries**: `hgp_query_operations` returns the whole repository's history by default (`scope="repo"`); pass `scope="checkout"` to narrow to operations recorded from the active checkout. `hgp_file_history` returns a file's history from every worktree.
+- **Reconcile**: each checkout reconciles only its own pending file operations. Pending operations of a worktree whose Git registration no longer exists are marked `STALE_PENDING` (reported as `pending_orphaned`).
+- **Behaviour change**: a `.hgp/mode` inside a linked worktree is no longer read; set it from any checkout and it applies to all. A legacy `.hgp/hook-policy` left inside a worktree is still honoured for `block` (hooks block if either the shared or the worktree-local policy says so), so upgrading never silently drops enforcement.
+- **Restore/import**: `hgp restore` and `hgp import` run inside a linked worktree replace history for every worktree, so they require `--shared` to confirm.
+- **Hooks**: `hgp install` / `hgp install-hooks` also install `hgp_paths.py` next to the hook scripts. A hook file that differs from the bundled one is backed up as `<name>.bak-<timestamp>` before being replaced. List them with `hgp hook-backups [--local]`; delete older ones with `hgp hook-backups --prune [--keep N] [--dry-run]` (keeps the newest per hook file by default; only backups of HGP's own hook files are touched).
 
 One server process is bound to one store.
 

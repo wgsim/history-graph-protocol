@@ -517,30 +517,20 @@ def test_file_history_limit_clamped(server_components):
     assert "operations" in result
 
 
-def test_file_history_negative_limit_clamped(server_components):
+def test_file_history_negative_limit_clamped(server_components, tmp_path, monkeypatch):
     """hgp_file_history limit=-1 must not bypass the result cap."""
-    import os
-    import tempfile
-
     from hgp.server import hgp_file_history, hgp_write_file
-    # Write a few ops for the same file so there is history to return
-    with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / ".git").mkdir()
-        orig_root = os.environ.get("HGP_PROJECT_ROOT")
-        os.environ["HGP_PROJECT_ROOT"] = tmp
-        try:
-            target = str(Path(tmp) / "f.txt")
-            for i in range(3):
-                hgp_write_file(target, f"v{i}", "agent-a")
-            result = hgp_file_history(file_path=target, limit=-1)
-        finally:
-            if orig_root is None:
-                os.environ.pop("HGP_PROJECT_ROOT", None)
-            else:
-                os.environ["HGP_PROJECT_ROOT"] = orig_root
-    assert isinstance(result, dict)
-    assert len(result["operations"]) <= 1, (
-        f"limit=-1 bypassed cap: got {len(result['operations'])} rows"
+
+    # Use the bound fixture root so writes succeed and the history is nonempty.
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("HGP_PROJECT_ROOT", str(tmp_path))
+    target = str(tmp_path / "f.txt")
+    for i in range(3):
+        written = hgp_write_file(target, f"v{i}", "agent-a")
+        assert written["status"] == "COMPLETED"
+    result = hgp_file_history(file_path=target, limit=-1)
+    assert len(result["operations"]) == 1, (
+        f"limit=-1 did not clamp history: got {len(result['operations'])} rows"
     )
 
 
@@ -1166,6 +1156,7 @@ def test_write_file_rejects_cross_repo_cold_start(server_components, tmp_path, m
 
     repo_a = tmp_path / "repo_a"
     repo_a.mkdir()
+    (repo_a / ".hgp").mkdir()  # HGP is opt-in: the bound repo is enabled
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
 

@@ -173,7 +173,7 @@ def test_edit_records_op_with_file_path(project):
     )
     db = server_module._ctx.db
     op = db.get_operation(result["op_id"])
-    assert op["file_path"] == str(target)
+    assert op["file_path"] == "code.py"  # stored as a repo-relative file key
 
 
 def test_delete_removes_file(project):
@@ -232,7 +232,7 @@ def test_move_records_new_path_op(project):
     result = hgp_move_file(str(src), str(dst), "agent-1", previous_op_id=write_result["op_id"])
     db = server_module._ctx.db
     new_op = db.get_operation(result["op_id"])
-    assert new_op["file_path"] == str(dst)
+    assert new_op["file_path"] == "b.txt"  # stored as a repo-relative file key
     assert new_op["op_type"] == "artifact"
     prev_op = db.get_operation(write_result["op_id"])
     assert prev_op["status"] == "INVALIDATED"

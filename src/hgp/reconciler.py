@@ -5,12 +5,16 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from hgp.cas import CAS
 from hgp.db import Database
+from hgp.hooks.hgp_paths import checkout_value_from_metadata, find_linked_worktree_gitdir
 from hgp.models import ReconcileReport
+from hgp.project import WORKTREE_ID_FILE, ensure_worktree_id, read_worktree_id
 
 _log = logging.getLogger(__name__)
 
@@ -40,11 +44,139 @@ def _file_matches_hash(file_path: str, expected_hash: str) -> bool:
         return False
 
 
+def _registration_live(gitdir: Path) -> bool | None:
+    """Return None when Git's registration cannot be checked reliably."""
+    try:
+        (gitdir / "locked").stat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _log.warning("Orphan retirement deferred: cannot check lock for worktree registration %s: %s", gitdir, exc)
+        return None
+    else:
+        return True
+
+    try:
+        raw = (gitdir / "gitdir").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        _log.warning("Orphan retirement deferred: cannot read worktree registration %s/gitdir: %s", gitdir, exc)
+        return None
+    if not raw:
+        _log.warning("Orphan retirement deferred: empty worktree registration %s/gitdir", gitdir)
+        return None
+    pointer = gitdir / raw
+    try:
+        pointer.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        _log.warning(
+            "Orphan retirement deferred: cannot check checkout pointer %s for registration %s: %s",
+            pointer, gitdir, exc,
+        )
+        return None
+    return True
+
+
 class Reconciler:
-    def __init__(self, db: Database, cas: CAS, content_dir: Path) -> None:
+    def __init__(
+        self,
+        db: Database,
+        cas: CAS,
+        content_dir: Path,
+        project_root: Path | None = None,
+    ) -> None:
         self._db = db
         self._cas = cas
         self._staging_dir = content_dir / ".staging"
+        self._project_root = project_root.resolve() if project_root is not None else None
+        gitdir = find_linked_worktree_gitdir(self._project_root) if self._project_root is not None else None
+        self.checkout_id = ensure_worktree_id(gitdir) if gitdir is not None else None
+        self._linked_root = str(self._project_root) if gitdir is not None else None
+        self._worktrees_dir = None
+        if gitdir is not None:
+            self._worktrees_dir = gitdir.parent
+        elif self._project_root is not None:
+            self._worktrees_dir = self._project_root / ".git" / "worktrees"
+
+    def _op_in_scope(self, op: dict[str, Any], file_path: str) -> bool:
+        """Return whether a pending file operation belongs to this checkout."""
+        if self._project_root is None:
+            return True
+        checkout_id = checkout_value_from_metadata(op.get("metadata"), "id")
+        if checkout_id is not None:
+            if checkout_id != self.checkout_id:
+                return False
+        elif self._linked_root is not None or checkout_value_from_metadata(op.get("metadata"), "root") is not None:
+            # A path without an ID cannot prove ownership of a linked checkout.
+            return False
+        try:
+            Path(self._resolve(file_path) or file_path).resolve().relative_to(self._project_root)
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _resolve(self, file_path: str) -> str | None:
+        """Return the absolute path for a stored file key.
+
+        Repo-relative keys resolve against this checkout (in-scope ops were
+        recorded here); None when there is no checkout root to resolve against.
+        """
+        if Path(file_path).is_absolute():
+            return file_path
+        if self._project_root is None:
+            return None
+        return str(self._project_root / file_path)
+
+    def _registered_worktree_ids(self) -> set[str] | None:
+        """Return IDs of worktrees whose checkout still exists (or is locked).
+
+        A checkout deleted without ``git worktree remove`` leaves its registration
+        behind as "prunable" until Git prunes it, possibly months later; it no
+        longer counts; neither does one without an ID marker, which HGP never
+        opened. None when a registration cannot be checked (unlisted, unreadable,
+        or with an unreadable ID marker): then no other checkout's op is retired.
+        """
+        if self._worktrees_dir is None:
+            return set()
+        try:
+            registrations = list(self._worktrees_dir.iterdir())
+        except FileNotFoundError:
+            return set()
+        except OSError as exc:
+            _log.warning(
+                "Orphan retirement deferred: cannot list worktree registrations in %s: %s",
+                self._worktrees_dir, exc,
+            )
+            return None
+        identifiers: set[str] = set()
+        for gitdir in registrations:
+            try:
+                mode = gitdir.stat().st_mode
+            except OSError as exc:
+                _log.warning("Orphan retirement deferred: cannot inspect worktree registration %s: %s", gitdir, exc)
+                return None
+            if not stat.S_ISDIR(mode):
+                continue
+            live = _registration_live(gitdir)
+            if live is None:
+                return None
+            if not live:
+                continue
+            identifier = read_worktree_id(gitdir)
+            if identifier is None:
+                try:
+                    (gitdir / WORKTREE_ID_FILE).lstat()
+                except FileNotFoundError:
+                    # HGP never assigned an ID here, so this worktree owns no ID-tagged op.
+                    continue
+                except OSError:
+                    pass
+                # A marker exists but cannot be read: it could own an op we are checking.
+                _log.warning("Orphan retirement deferred: unreadable or invalid worktree ID in %s", gitdir)
+                return None
+            identifiers.add(identifier)
+        return identifiers
 
     def reconcile(self, dry_run: bool = False) -> ReconcileReport:
         report = ReconcileReport()
@@ -87,7 +219,9 @@ class Reconciler:
                     report.errors.append(f"staging cleanup error for {tmp_file.name}: {exc}")
 
         # Rule 5: PENDING op recovery — finalize or triage stuck PENDING ops
-        pending_ops = self._db.query_operations(status="PENDING")
+        pending_ops = self._db.query_operations(status="PENDING", include_inactive=True)
+        registered_ids: set[str] | None = None
+        registrations_read = False
         for op in pending_ops:
             created_at_str = op.get("created_at", "")
             try:
@@ -108,6 +242,26 @@ class Reconciler:
             if not file_path:
                 # Not a file-tracking op — skip
                 continue
+            if not self._op_in_scope(op, file_path):
+                # Another checkout's op: leave it to that checkout's reconciler,
+                # unless its worktree was removed and nobody will ever finish it.
+                checkout_id = checkout_value_from_metadata(op.get("metadata"), "id")
+                if checkout_id is not None:
+                    if not registrations_read:
+                        registered_ids = self._registered_worktree_ids()
+                        registrations_read = True
+                    orphaned = registered_ids is not None and checkout_id not in registered_ids
+                else:
+                    root = checkout_value_from_metadata(op.get("metadata"), "root")
+                    orphaned = root is not None and not Path(root).is_dir()
+                if orphaned:
+                    if not dry_run:
+                        self._db.update_operation_status(op["op_id"], "STALE_PENDING")
+                    report.pending_orphaned += 1
+                continue
+            abs_path = self._resolve(file_path)
+            if abs_path is None:
+                continue  # repo-relative key, but no checkout root to resolve it against
             op_type = op.get("op_type")
             op_id = op["op_id"]
             if op_type == "artifact":
@@ -115,7 +269,7 @@ class Reconciler:
                 recovered = (
                     bool(obj_hash)
                     and self._cas.exists(obj_hash)
-                    and _file_matches_hash(file_path, obj_hash)
+                    and _file_matches_hash(abs_path, obj_hash)
                 )
                 if recovered:
                     if not dry_run:
@@ -132,7 +286,7 @@ class Reconciler:
                         self._db.update_operation_status(op_id, "STALE_PENDING")
                     report.pending_stale += 1
             elif op_type == "invalidation":
-                file_gone = not Path(file_path).exists()
+                file_gone = not Path(abs_path).exists()
                 if file_gone:
                     if not dry_run:
                         targets = self._db.get_invalidated_targets(op_id)
