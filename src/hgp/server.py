@@ -128,9 +128,15 @@ def _get_context() -> HGPContext:
             db.initialize()
             if storage_root is not None:
                 # Global mode keeps absolute keys (one DB spans many repositories).
+                source_root = (_read_project_meta(hgp_dir) or {}).get("file_path_root")
+                migration_root = (
+                    Path(source_root)
+                    if isinstance(source_root, str) and Path(source_root).is_absolute()
+                    else storage_root
+                )
                 db.relativize_file_paths(
-                    storage_root,
-                    backup_path=hgp_dir / f"hgp.db.pre-v6-{time.strftime('%Y%m%d%H%M%S')}.bak",
+                    migration_root,
+                    backup_path=hgp_dir / f"hgp.db.pre-v6-{time.time_ns()}.bak",
                 )
             cas = CAS(hgp_content_dir)
             lease_mgr = LeaseManager(db)
@@ -184,7 +190,8 @@ def _with_checkout_meta(metadata: dict[str, Any] | None, ctx: HGPContext) -> dic
     root = _linked_checkout_root(ctx)
     if root is None:
         return metadata
-    return {**(metadata or {}), _CHECKOUT_META_KEY: {"root": str(root), "branch": current_branch(root)}}
+    checkout = {"root": str(root), "branch": current_branch(root), "id": ctx.reconciler.checkout_id}
+    return {**(metadata or {}), _CHECKOUT_META_KEY: checkout}
 
 
 def _file_key(canonical: str, root: Path, ctx: HGPContext) -> str:
@@ -474,6 +481,7 @@ def hgp_query_operations(
         file_path=canonical_fp,
         scope_checkout=scope_checkout,
         checkout_root=str(linked_root) if linked_root else None,
+        checkout_id=ctx.reconciler.checkout_id,
     )
     return {"operations": _present_ops(ops, ctx)}
 
@@ -1233,6 +1241,7 @@ def hgp_move_file(
             _file_key(canonical_old, root, ctx), limit=1,
             scope_checkout=ctx.project_root is not None,
             checkout_root=str(linked_root) if linked_root else None,
+            checkout_id=ctx.reconciler.checkout_id,
         )
         if latest:
             resolved_previous_op_id = dict(latest[0])["op_id"]
@@ -2276,7 +2285,8 @@ def _read_project_meta(hgp_dir: Path) -> dict[str, Any] | None:
     if not meta_file.exists():
         return None
     try:
-        return json.loads(meta_file.read_text())  # type: ignore[no-any-return]
+        data: object = json.loads(meta_file.read_text())
+        return cast(dict[str, Any], data) if isinstance(data, dict) else None
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -2358,7 +2368,7 @@ def _check_compatibility(
     return "compatible" if src_remote == cur_remote else "mismatch"
 
 
-def _copy_history_to(hgp_dir: Path, dest_dir: Path) -> None:
+def _copy_history_to(hgp_dir: Path, dest_dir: Path, *, file_path_root: Path | None = None) -> None:
     """Copy history data (hgp.db via SQLite API, .hgp_content/, project-meta) to dest_dir.
 
     Operational files (mode, hook-policy) are excluded.
@@ -2375,8 +2385,15 @@ def _copy_history_to(hgp_dir: Path, dest_dir: Path) -> None:
         shutil.copytree(src_content, dest_dir / ".hgp_content")
 
     src_meta = hgp_dir / "project-meta"
-    if src_meta.exists():
-        shutil.copy2(src_meta, dest_dir / "project-meta")
+    if file_path_root is None:
+        if src_meta.exists():
+            shutil.copy2(src_meta, dest_dir / "project-meta")
+    else:
+        # Keep the source of any pre-v6 absolute paths, including on re-export.
+        # The source DB and project metadata remain usable in their original checkout.
+        meta = _read_project_meta(hgp_dir) or {}
+        meta.setdefault("file_path_root", str(file_path_root.resolve()))
+        (dest_dir / "project-meta").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
 def _restore_snapshot(source_dir: Path, repo_root: Path) -> None:
@@ -2551,7 +2568,7 @@ def _hgp_backup(args: list[str]) -> None:
             sys.exit(1)
         _remove_dest(dest)
 
-    _copy_history_to(hgp_dir, dest)
+    _copy_history_to(hgp_dir, dest, file_path_root=hgp_dir.parent)
     repo_name = meta.get("repo_name", project_root.name)
     print(f"Backed up '{repo_name}' → {dest}")
 
@@ -2708,7 +2725,7 @@ def _hgp_export(args: list[str]) -> None:
             sys.exit(1)
         _remove_dest(dest)
 
-    _copy_history_to(hgp_dir, dest)
+    _copy_history_to(hgp_dir, dest, file_path_root=hgp_dir.parent)
     repo_name = meta.get("repo_name", project_root.name)
     print(f"Exported '{repo_name}' → {dest}")
 
