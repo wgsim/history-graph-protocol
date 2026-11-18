@@ -14,7 +14,7 @@ from hgp.cas import CAS
 from hgp.db import Database
 from hgp.hooks.hgp_paths import checkout_value_from_metadata, find_linked_worktree_gitdir
 from hgp.models import ReconcileReport
-from hgp.project import ensure_worktree_id, read_worktree_id
+from hgp.project import WORKTREE_ID_FILE, ensure_worktree_id, read_worktree_id
 
 _log = logging.getLogger(__name__)
 
@@ -132,8 +132,9 @@ class Reconciler:
 
         A checkout deleted without ``git worktree remove`` leaves its registration
         behind as "prunable" until Git prunes it, possibly months later; it no
-        longer counts. None when the registrations cannot be listed: then no
-        other checkout's operation is retired.
+        longer counts; neither does one without an ID marker, which HGP never
+        opened. None when a registration cannot be checked (unlisted, unreadable,
+        or with an unreadable ID marker): then no other checkout's op is retired.
         """
         if self._worktrees_dir is None:
             return set()
@@ -164,7 +165,7 @@ class Reconciler:
             identifier = read_worktree_id(gitdir)
             if identifier is None:
                 try:
-                    (gitdir / "hgp-worktree-id").lstat()
+                    (gitdir / WORKTREE_ID_FILE).lstat()
                 except FileNotFoundError:
                     # HGP never assigned an ID here, so this worktree owns no ID-tagged op.
                     continue

@@ -15,7 +15,7 @@ from hgp.hooks.hgp_paths import parse_hook_policy as parse_hook_policy
 
 _log = logging.getLogger(__name__)
 
-_WORKTREE_ID_FILE = "hgp-worktree-id"
+WORKTREE_ID_FILE = "hgp-worktree-id"
 _WORKTREE_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
@@ -60,7 +60,7 @@ def read_worktree_id(gitdir: Path) -> str | None:
     registration must not stop HGP in every checkout of the repository.
     """
     try:
-        value = (gitdir / _WORKTREE_ID_FILE).read_text(encoding="ascii").strip()
+        value = (gitdir / WORKTREE_ID_FILE).read_text(encoding="ascii").strip()
     except (OSError, UnicodeError):
         return None
     return value if _WORKTREE_ID_RE.fullmatch(value) else None
@@ -76,7 +76,7 @@ def ensure_worktree_id(gitdir: Path) -> str | None:
     """
     if existing := read_worktree_id(gitdir):
         return existing
-    marker = gitdir / _WORKTREE_ID_FILE
+    marker = gitdir / WORKTREE_ID_FILE
     if not (marker.exists() or marker.is_symlink()):
         try:
             _publish_worktree_id(marker)
