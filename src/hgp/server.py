@@ -26,13 +26,16 @@ from hgp.errors import (
     BlobWriteError,
     PayloadTooLargeError,
 )
+from hgp.hooks.hgp_paths import find_linked_worktree_gitdir
 from hgp.lease import LeaseManager
 from hgp.models import EvidenceRef
 from hgp.project import (
+    WORKTREE_ID_FILE,
     PathOutsideRootError,
     ProjectRootError,
     canonical_file_path,
     current_branch,
+    ensure_worktree_id,
     find_project_root,
     find_storage_root,
     parse_hook_policy,
@@ -1426,7 +1429,35 @@ def _check_mode(mutation: bool = True) -> dict[str, Any] | None:
         return {"status": "HGP_DISABLED", "message": "HGP is disabled. Run `hgp mode on` to resume."}
     if mode == "advisory" and mutation:
         return {"status": "HGP_ADVISORY", "message": "HGP is in advisory mode. Recording skipped."}
+    if mutation:
+        return _check_worktree_id()
     return None
+
+
+def _check_worktree_id() -> dict[str, Any] | None:
+    """Refuse mutations in a linked worktree that has no HGP worktree ID.
+
+    Without an ID its records would belong to no checkout (a reused path cannot
+    prove ownership), so checkout history, pending recovery and move predecessors
+    would silently miss them. Assignment is retried first: the cause may be fixed.
+    """
+    ctx = _get_context()
+    linked = _linked_checkout_root(ctx)
+    if linked is None or ctx.reconciler.checkout_id is not None:
+        return None
+    gitdir = find_linked_worktree_gitdir(linked)
+    if gitdir is not None and (assigned := ensure_worktree_id(gitdir)) is not None:
+        ctx.reconciler.checkout_id = assigned
+        return None
+    where = gitdir if gitdir is not None else linked
+    return {
+        "error": "WORKTREE_ID_UNAVAILABLE",
+        "message": (
+            f"HGP cannot assign an ID to this worktree in {where}, so its records would belong "
+            f"to no checkout. Make {where} writable, or remove a damaged {where / WORKTREE_ID_FILE}, "
+            "then retry. Read-only HGP tools still work."
+        ),
+    }
 
 
 def _check_hgp_dir(file_path: str) -> dict[str, Any] | None:

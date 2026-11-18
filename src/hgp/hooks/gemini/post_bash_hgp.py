@@ -72,6 +72,8 @@ def _enabled(start: Path) -> bool:
     check = getattr(_hgp_paths(), "hgp_enabled", None)
     if check is not None:
         return bool(check(start))
+    if os.environ.get("HGP_GLOBAL_MODE"):
+        return True  # global mode records everywhere, as in the server
     for parent in [start, *start.parents]:  # no hgp_paths: walk up to the checkout root
         if (parent / ".git").exists():
             return (parent / ".hgp").is_dir()
