@@ -737,3 +737,38 @@ def test_global_file_queries_keep_absolute_repository_identity(shared_db, tmp_pa
         result = query(file_path=str(root / "tracked.txt"))
         assert [row["op_id"] for row in result["operations"]] == [op["op_id"]]
         assert result["operations"][0]["file_path"] == str(root / "tracked.txt")
+
+
+def test_legacy_worktree_history_requires_archiving_before_switch(linked_worktree, tmp_path, monkeypatch):
+    import sqlite3
+
+    repo, wt = linked_worktree
+    monkeypatch.chdir(wt)
+    monkeypatch.setattr(server_module, "_ctx", None)
+    local = wt / ".hgp"
+    local.mkdir()
+    with sqlite3.connect(local / "hgp.db") as db:
+        db.execute("CREATE TABLE legacy (id INTEGER)")
+        db.execute("INSERT INTO legacy VALUES (42)")
+    content = local / ".hgp_content"
+    content.mkdir()
+    (content / "blob").write_bytes(b"history")
+    with pytest.raises(server_module.LegacyWorktreeHistoryError, match="hgp export"):
+        hgp_query_operations()
+    assert not (repo / ".hgp" / "hgp.db").exists()
+
+    snapshot = tmp_path / "snapshot"
+    for args in [("export", str(snapshot)), ("backup",)]:
+        result = _cli(*args, cwd=wt, tmp_path=tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "legacy worktree history" in result.stderr
+    backup = tmp_path / "projects" / json.loads((local / "project-meta").read_text())["project_id"]
+    for dest in (snapshot, backup):
+        with sqlite3.connect(dest / "hgp.db") as db:
+            assert db.execute("SELECT id FROM legacy").fetchone() == (42,)
+        assert (dest / ".hgp_content" / "blob").read_bytes() == b"history"
+
+    local.rename(tmp_path / "archived-history")
+    assert hgp_query_operations()["operations"] == []
+    assert (repo / ".hgp" / "hgp.db").exists()
+    server_module._get_context().db.close()

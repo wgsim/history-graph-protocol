@@ -74,6 +74,20 @@ class HGPContext:
 _ctx: HGPContext | None = None
 
 
+def _existing_history_dir(project_root: Path, storage_root: Path) -> Path:
+    """Select the legacy DB for snapshots until the user archives the local store."""
+    shared = storage_root / ".hgp"
+    if project_root != storage_root:
+        local = project_root / ".hgp"
+        if (local / "hgp.db").is_file() and local.resolve() != shared.resolve():
+            return local
+    return shared
+
+
+class LegacyWorktreeHistoryError(RuntimeError):
+    pass
+
+
 def _get_context() -> HGPContext:
     """Return (and lazily create) the server context singleton.
 
@@ -98,6 +112,14 @@ def _get_context() -> HGPContext:
                     project_root,
                 )
         hgp_dir = (storage_root / ".hgp") if storage_root else (Path.home() / ".hgp")
+        if storage_root is not None and project_root is not None:
+            existing = _existing_history_dir(project_root, storage_root)
+            if existing != hgp_dir:
+                raise LegacyWorktreeHistoryError(
+                    f"Legacy worktree history found at {existing}. Stop older HGP servers, "
+                    "run 'hgp export <new-directory>' here and verify the snapshot. "
+                    f"Move {existing} to an archive location before using shared history at {hgp_dir}."
+                )
         hgp_content_dir = hgp_dir / ".hgp_content"
         db = Database(hgp_dir / "hgp.db")
         try:
@@ -1334,6 +1356,8 @@ def _read_mode() -> str:
         if mode_file.exists():
             val = mode_file.read_text().strip()
             return val if val in _VALID_MODES else "on"
+    except LegacyWorktreeHistoryError:
+        raise
     except Exception:
         pass
     return "on"
@@ -2506,7 +2530,9 @@ def _hgp_backup(args: list[str]) -> None:
         sys.exit(1)
 
     storage_root = find_storage_root(project_root)
-    hgp_dir = storage_root / ".hgp"
+    hgp_dir = _existing_history_dir(project_root, storage_root)
+    if hgp_dir != storage_root / ".hgp":
+        print(f"hgp backup: using legacy worktree history at {hgp_dir}", file=sys.stderr)
     if not hgp_dir.exists():
         print("hgp backup: no .hgp/ directory found. Nothing to back up.", file=sys.stderr)
         sys.exit(1)
@@ -2663,7 +2689,9 @@ def _hgp_export(args: list[str]) -> None:
         sys.exit(1)
 
     storage_root = find_storage_root(project_root)
-    hgp_dir = storage_root / ".hgp"
+    hgp_dir = _existing_history_dir(project_root, storage_root)
+    if hgp_dir != storage_root / ".hgp":
+        print(f"hgp export: using legacy worktree history at {hgp_dir}", file=sys.stderr)
     if not hgp_dir.exists():
         print("hgp export: no .hgp/ directory found. Nothing to export.", file=sys.stderr)
         sys.exit(1)
