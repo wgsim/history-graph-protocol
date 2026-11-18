@@ -916,3 +916,71 @@ def test_simultaneous_v6_migrations_preserve_original_backup(tmp_path, monkeypat
     finally:
         a.close()
         b.close()
+
+
+def _insert_old_pending_with_id(db: Database, op_id: str, worktree: Path, checkout_id: str) -> None:
+    _insert_old_pending(db, op_id, worktree / "f.txt", worktree)
+    db.execute(
+        "UPDATE operations SET metadata = json_set(metadata, '$.hgp_checkout.id', ?) WHERE op_id = ?",
+        (checkout_id, op_id),
+    )
+    db.commit()
+
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_reconcile_retires_ops_of_worktree_deleted_without_git(shared_db, tmp_path, locked) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    checkout_id = ctx_for(worktree).reconciler.checkout_id
+    assert checkout_id
+    _insert_old_pending_with_id(db, "op-wt", worktree, checkout_id)
+    if locked:  # e.g. on removable media: Git keeps it, so must HGP
+        _git("worktree", "lock", str(worktree), cwd=repo)
+    # Deleted outside Git: the registration stays behind as "prunable".
+    worktree.rename(tmp_path / "elsewhere")
+    assert (repo / ".git" / "worktrees" / worktree.name).is_dir()
+
+    report = ctx_for(repo).reconciler.reconcile()
+    assert report.pending_orphaned == (0 if locked else 1)
+    assert db.get_operation("op-wt")["status"] == ("PENDING" if locked else "STALE_PENDING")
+
+
+@pytest.mark.parametrize("content", [b"", b"\xff\xfe\n", b"not-an-id\n"])
+def test_damaged_worktree_id_does_not_break_startup(shared_db, content) -> None:
+    repo, worktree, db, ctx_for = shared_db
+    marker = repo / ".git" / "worktrees" / worktree.name / "hgp-worktree-id"
+    marker.write_bytes(content)
+    _insert_old_pending(db, "op-live", worktree / "f.txt", worktree)
+
+    # Every checkout reads every registration's marker; none may fail on it.
+    ctx_for(repo).reconciler.reconcile()
+    wt = ctx_for(worktree).reconciler
+    assert wt.checkout_id is None  # path-only provenance, as before IDs
+    wt.reconcile()
+    assert marker.read_bytes() == content  # never silently replaced
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores permissions")
+def test_read_only_worktree_registration_does_not_break_startup(shared_db) -> None:
+    repo, worktree, _, ctx_for = shared_db
+    admin = repo / ".git" / "worktrees" / worktree.name
+    mode = admin.stat().st_mode
+    admin.chmod(0o555)
+    try:
+        assert ctx_for(worktree).reconciler.checkout_id is None
+    finally:
+        admin.chmod(mode)
+
+
+def test_worktree_id_without_hard_links(shared_db, monkeypatch) -> None:
+    import errno
+
+    repo, worktree, _, ctx_for = shared_db
+
+    def no_links(self, target):
+        raise OSError(errno.EPERM, "hard links not supported")
+
+    monkeypatch.setattr(Path, "hardlink_to", no_links)
+    checkout_id = ctx_for(worktree).reconciler.checkout_id
+    assert checkout_id and len(checkout_id) == 32
+    assert project.read_worktree_id(repo / ".git" / "worktrees" / worktree.name) == checkout_id
+    assert [p.name for p in (repo / ".git" / "worktrees" / worktree.name).glob("tmp*")] == []

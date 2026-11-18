@@ -43,6 +43,20 @@ def _file_matches_hash(file_path: str, expected_hash: str) -> bool:
         return False
 
 
+def _registration_live(gitdir: Path) -> bool:
+    """Return whether Git would keep this worktree registration (not prunable)."""
+    if (gitdir / "locked").exists():
+        return True
+    try:
+        raw = (gitdir / "gitdir").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return False
+    pointer = Path(raw)
+    if not pointer.is_absolute():
+        pointer = gitdir / pointer
+    return pointer.exists()
+
+
 class Reconciler:
     def __init__(
         self,
@@ -92,12 +106,23 @@ class Reconciler:
             return None
         return str(self._project_root / file_path)
 
-    def _registered_worktree_ids(self) -> set[str]:
+    def _registered_worktree_ids(self) -> set[str] | None:
+        """Return IDs of worktrees whose checkout still exists (or is locked).
+
+        A checkout deleted without ``git worktree remove`` leaves its registration
+        behind as "prunable" until Git prunes it, possibly months later; it no
+        longer counts. None when the registrations cannot be listed: then no
+        other checkout's operation is retired.
+        """
         if self._worktrees_dir is None or not self._worktrees_dir.is_dir():
             return set()
+        try:
+            registrations = [gitdir for gitdir in self._worktrees_dir.iterdir() if gitdir.is_dir()]
+        except OSError:
+            return None
         return {
-            identifier for gitdir in self._worktrees_dir.iterdir()
-            if gitdir.is_dir() and (identifier := read_worktree_id(gitdir)) is not None
+            identifier for gitdir in registrations
+            if _registration_live(gitdir) and (identifier := read_worktree_id(gitdir)) is not None
         }
 
     def reconcile(self, dry_run: bool = False) -> ReconcileReport:
@@ -143,6 +168,7 @@ class Reconciler:
         # Rule 5: PENDING op recovery — finalize or triage stuck PENDING ops
         pending_ops = self._db.query_operations(status="PENDING", include_inactive=True)
         registered_ids: set[str] | None = None
+        registrations_read = False
         for op in pending_ops:
             created_at_str = op.get("created_at", "")
             try:
@@ -168,9 +194,10 @@ class Reconciler:
                 # unless its worktree was removed and nobody will ever finish it.
                 checkout_id = checkout_value_from_metadata(op.get("metadata"), "id")
                 if checkout_id is not None:
-                    if registered_ids is None:
+                    if not registrations_read:
                         registered_ids = self._registered_worktree_ids()
-                    orphaned = checkout_id not in registered_ids
+                        registrations_read = True
+                    orphaned = registered_ids is not None and checkout_id not in registered_ids
                 else:
                     root = checkout_value_from_metadata(op.get("metadata"), "root")
                     orphaned = root is not None and not Path(root).is_dir()
