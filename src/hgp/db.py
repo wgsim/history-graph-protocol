@@ -163,11 +163,11 @@ PRAGMA foreign_keys = ON;
 _MAX_EVIDENCE_RESULTS = 200
 
 
-# Match legacy operations by their original path only until they have an ID.
+# A path can be reused, so only ID-tagged rows belong to a linked checkout.
 _CHECKOUT_MATCH = """CASE WHEN json_valid(metadata) THEN
     CASE WHEN json_extract(metadata, '$.hgp_checkout.id') IS NOT NULL
          THEN json_extract(metadata, '$.hgp_checkout.id') = ?
-         ELSE json_extract(metadata, '$.hgp_checkout.root') IS ?
+         ELSE json_extract(metadata, '$.hgp_checkout.root') IS NULL AND ? IS NULL
     END
     ELSE ? IS NULL END"""
 
@@ -250,6 +250,9 @@ class Database:
 
         assert self._conn
         name = "v6_relative_file_keys"
+        # Avoid taking a write reservation on every startup after migration.
+        if self._conn.execute("SELECT 1 FROM _hgp_migrations WHERE name = ?", (name,)).fetchone():
+            return 0
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             if self._conn.execute("SELECT 1 FROM _hgp_migrations WHERE name = ?", (name,)).fetchone():
@@ -284,18 +287,6 @@ class Database:
         if updates:
             _log.info("v6 migration: %d file path(s) made repo-relative", len(updates))
         return len(updates)
-
-    def tag_legacy_checkout(self, checkout_root: Path, checkout_id: str) -> None:
-        """Associate path-only provenance with an existing worktree before it moves."""
-        self.execute(
-            """UPDATE operations
-               SET metadata = json_set(metadata, '$.hgp_checkout.id', ?)
-               WHERE CASE WHEN json_valid(metadata) THEN
-                   json_extract(metadata, '$.hgp_checkout.root') = ?
-                   AND json_extract(metadata, '$.hgp_checkout.id') IS NULL
-               ELSE 0 END""",
-            (checkout_id, str(checkout_root)),
-        )
 
     def close(self) -> None:
         if self._conn:
@@ -459,8 +450,8 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Query operations.
 
-        With ``scope_checkout=True``, match the worktree ID, or the recorded root
-        for rows that predate IDs. Two None values select the main checkout.
+        With ``scope_checkout=True``, match the worktree ID. Two None values select
+        the main checkout. Path-only history remains accessible at repo scope.
         """
         assert self._conn
         clauses: list[str] = []

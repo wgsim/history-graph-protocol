@@ -141,8 +141,6 @@ def _get_context() -> HGPContext:
             cas = CAS(hgp_content_dir)
             lease_mgr = LeaseManager(db)
             reconciler = Reconciler(db, cas, hgp_content_dir, project_root=project_root)
-            if project_root is not None and reconciler.checkout_id is not None:
-                db.tag_legacy_checkout(project_root, reconciler.checkout_id)
             db.expire_leases()
             db.commit()
             startup_report = reconciler.reconcile()

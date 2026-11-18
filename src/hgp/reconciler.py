@@ -72,7 +72,8 @@ class Reconciler:
         if checkout_id is not None:
             if checkout_id != self.checkout_id:
                 return False
-        elif checkout_value_from_metadata(op.get("metadata"), "root") != self._linked_root:
+        elif self._linked_root is not None or checkout_value_from_metadata(op.get("metadata"), "root") is not None:
+            # A path without an ID cannot prove ownership of a linked checkout.
             return False
         try:
             Path(self._resolve(file_path) or file_path).resolve().relative_to(self._project_root)
