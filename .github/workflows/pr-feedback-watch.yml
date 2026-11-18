@@ -1,0 +1,30 @@
+name: Notify maintainer of PR feedback
+
+on:
+  schedule:
+    - cron: '9,24,39,54 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-feedback-watch
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: github.repository == 'wgsim/history-graph-protocol'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Notify the maintainer of new feedback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/scripts/watch_pr_feedback.py
