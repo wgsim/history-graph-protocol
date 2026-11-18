@@ -984,3 +984,27 @@ def test_worktree_id_without_hard_links(shared_db, monkeypatch) -> None:
     assert checkout_id and len(checkout_id) == 32
     assert project.read_worktree_id(repo / ".git" / "worktrees" / worktree.name) == checkout_id
     assert [p.name for p in (repo / ".git" / "worktrees" / worktree.name).glob("tmp*")] == []
+
+
+@pytest.mark.parametrize("unreadable_file", ["hgp-worktree-id", "gitdir"])
+def test_inconclusive_registration_does_not_retire_pending_operations(shared_db, monkeypatch, unreadable_file):
+    repo, worktree, db, ctx_for = shared_db
+    checkout_id = ctx_for(worktree).reconciler.checkout_id
+    assert checkout_id is not None
+    _insert_old_pending_with_id(db, "op-wt", worktree, checkout_id)
+    target = repo / ".git" / "worktrees" / worktree.name / unreadable_file
+    read_text = Path.read_text
+
+    def guarded_read(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError("simulated unreadable worktree registration")
+        return read_text(path, *args, **kwargs)
+
+    main = ctx_for(repo).reconciler
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", guarded_read)
+        assert main.reconcile().pending_orphaned == 0
+        assert db.get_operation("op-wt")["status"] == "PENDING"
+
+    assert main.reconcile().pending_orphaned == 0
+    assert db.get_operation("op-wt")["status"] == "PENDING"

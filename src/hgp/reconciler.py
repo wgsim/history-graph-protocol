@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -43,18 +44,31 @@ def _file_matches_hash(file_path: str, expected_hash: str) -> bool:
         return False
 
 
-def _registration_live(gitdir: Path) -> bool:
-    """Return whether Git would keep this worktree registration (not prunable)."""
-    if (gitdir / "locked").exists():
+def _registration_live(gitdir: Path) -> bool | None:
+    """Return None when Git's registration cannot be checked reliably."""
+    try:
+        (gitdir / "locked").stat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    else:
         return True
+
     try:
         raw = (gitdir / "gitdir").read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
+        return None
+    if not raw:
+        return None
+    pointer = gitdir / raw
+    try:
+        pointer.stat()
+    except (FileNotFoundError, NotADirectoryError):
         return False
-    pointer = Path(raw)
-    if not pointer.is_absolute():
-        pointer = gitdir / pointer
-    return pointer.exists()
+    except OSError:
+        return None
+    return True
 
 
 class Reconciler:
@@ -114,16 +128,33 @@ class Reconciler:
         longer counts. None when the registrations cannot be listed: then no
         other checkout's operation is retired.
         """
-        if self._worktrees_dir is None or not self._worktrees_dir.is_dir():
+        if self._worktrees_dir is None:
             return set()
         try:
-            registrations = [gitdir for gitdir in self._worktrees_dir.iterdir() if gitdir.is_dir()]
+            registrations = list(self._worktrees_dir.iterdir())
+        except FileNotFoundError:
+            return set()
         except OSError:
             return None
-        return {
-            identifier for gitdir in registrations
-            if _registration_live(gitdir) and (identifier := read_worktree_id(gitdir)) is not None
-        }
+        identifiers: set[str] = set()
+        for gitdir in registrations:
+            try:
+                mode = gitdir.stat().st_mode
+            except OSError:
+                return None
+            if not stat.S_ISDIR(mode):
+                continue
+            live = _registration_live(gitdir)
+            if live is None:
+                return None
+            if not live:
+                continue
+            identifier = read_worktree_id(gitdir)
+            if identifier is None:
+                # This worktree could own one of the operations we are checking.
+                return None
+            identifiers.add(identifier)
+        return identifiers
 
     def reconcile(self, dry_run: bool = False) -> ReconcileReport:
         report = ReconcileReport()
