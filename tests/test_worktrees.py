@@ -410,7 +410,12 @@ def test_ops_from_worktree_are_tagged_with_checkout(shared_db) -> None:
     written = hgp_write_file(file_path=str(worktree / "f.txt"), content="x", agent_id="a")
     for op_id in (op["op_id"], written["op_id"]):
         meta = json.loads(db.get_operation(op_id)["metadata"])
-        assert meta["hgp_checkout"] == {"root": str(worktree), "branch": "feature"}
+        assert meta["hgp_checkout"] == {
+            "root": str(worktree),
+            "branch": "feature",
+            "id": server_module._get_context().reconciler.checkout_id,
+        }
+        assert meta["hgp_checkout"]["id"]
     assert json.loads(db.get_operation(op["op_id"])["metadata"])["k"] == 1
 
     server_module._ctx = ctx_for(repo)
@@ -772,3 +777,142 @@ def test_legacy_worktree_history_requires_archiving_before_switch(linked_worktre
     assert hgp_query_operations()["operations"] == []
     assert (repo / ".hgp" / "hgp.db").exists()
     server_module._get_context().db.close()
+
+
+@pytest.mark.parametrize("snapshot_command", ["export", "backup"])
+def test_legacy_snapshot_file_history_is_portable(linked_worktree, tmp_path, snapshot_command):
+    repo, worktree = linked_worktree
+    local = worktree / ".hgp"
+    local.mkdir()
+    db = Database(local / "hgp.db")
+    db.initialize()
+    db.insert_operation(
+        op_id="legacy", op_type="artifact", status="COMPLETED", agent_id="old",
+        file_path=str(worktree / "tracked.txt"), commit_seq=1, chain_hash="sha256:" + "a" * 64,
+    )
+    db.close()
+
+    snapshot = tmp_path / "snapshot"
+    args = ("export", str(snapshot)) if snapshot_command == "export" else ("backup",)
+    result = _cli(*args, cwd=worktree, tmp_path=tmp_path)
+    assert result.returncode == 0, result.stderr
+    if snapshot_command == "backup":
+        project_id = json.loads((local / "project-meta").read_text())["project_id"]
+
+    inspection = tmp_path / "inspection"
+    _git("clone", str(repo), str(inspection), cwd=tmp_path)
+    if snapshot_command == "backup":
+        result = _cli("restore", "--project-id", project_id, "--force", cwd=inspection, tmp_path=tmp_path)
+    else:
+        result = _cli("import", str(snapshot), "--force", cwd=inspection, tmp_path=tmp_path)
+    assert result.returncode == 0, result.stderr
+    inspect = subprocess.run(
+        [sys.executable, "-c",
+         "import json; from hgp.server import hgp_file_history; print(json.dumps(hgp_file_history('tracked.txt')))"],
+        cwd=inspection, check=True, capture_output=True, text=True,
+    )
+    records = json.loads(inspect.stdout)["operations"]
+    assert [op["op_id"] for op in records] == ["legacy"]
+    assert records[0]["file_path"] == str(inspection / "tracked.txt")
+
+    db = Database(local / "hgp.db")
+    db.initialize()
+    assert db.get_operation("legacy")["file_path"] == str(worktree / "tracked.txt")
+    db.close()
+
+
+def test_checkout_history_and_pending_recovery_follow_worktree_move(linked_worktree, tmp_path, monkeypatch):
+    repo, wt = linked_worktree
+    monkeypatch.setattr(server_module, "_ctx", None)
+    monkeypatch.chdir(wt)
+    old = hgp_write_file("tracked.txt", "first", "review")["op_id"]
+    latest = hgp_write_file("tracked.txt", "current", "review")["op_id"]
+    ctx = server_module._get_context()
+    # Simulate worktree records created by the earlier, path-only implementation.
+    ctx.db.execute("UPDATE operations SET metadata = json_remove(metadata, '$.hgp_checkout.id')")
+    ctx.db.execute("UPDATE operations SET status='PENDING', created_at='2000-01-01T00:00:00Z' WHERE op_id=?", (latest,))
+    ctx.db.close()
+    # Upgrade before moving, so existing path-only operations get an ID.
+    server_module._ctx = None
+    startup = server_module._get_context()
+    assert startup.db.get_operation(latest)["status"] == "COMPLETED"
+    startup.db.execute("UPDATE operations SET status='PENDING' WHERE op_id=?", (latest,))
+    startup.db.close()
+    server_module._ctx = None
+
+    monkeypatch.chdir(repo)
+    target = tmp_path / "renamed-worktree"
+    _git("worktree", "move", str(wt), str(target), cwd=repo)
+    # Reconcile from another checkout first. The old path is gone, but the
+    # registration still exists and owns the pending operation.
+    main = server_module._get_context()
+    assert main.db.get_operation(latest)["status"] == "PENDING"
+    main.db.close()
+    server_module._ctx = None
+
+    monkeypatch.chdir(target)
+    current = server_module._get_context()
+    assert current.db.get_operation(latest)["status"] == "COMPLETED"
+    scoped = hgp_query_operations(scope="checkout", include_inactive=True)
+    assert {op["op_id"] for op in scoped["operations"]} == {old, latest}
+    move = server_module.hgp_move_file("tracked.txt", "renamed.txt", "review")
+    assert move["status"] == "COMPLETED"
+    assert current.db.get_operation(latest)["status"] == "INVALIDATED"
+    current.db.close()
+    server_module._ctx = None
+
+    # A different checkout at the old path must not inherit the moved checkout's history.
+    _git("worktree", "add", "-qb", "replacement", str(wt), cwd=repo)
+    monkeypatch.chdir(wt)
+    assert hgp_query_operations(scope="checkout", include_inactive=True)["operations"] == []
+    server_module._get_context().db.close()
+    server_module._ctx = None
+
+
+def test_simultaneous_v6_migrations_preserve_original_backup(tmp_path, monkeypatch):
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    path = tmp_path / "hgp.db"
+    backup = tmp_path / "pre-v6.bak"
+    a, b = Database(path), Database(path)
+    a.initialize()
+    b.initialize()
+    original_path = str(tmp_path / "tracked.txt")
+    a.insert_operation(
+        op_id="legacy", op_type="artifact", status="COMPLETED", agent_id="old",
+        file_path=original_path, commit_seq=1, chain_hash="sha256:" + "a" * 64,
+    )
+    copying = Event()
+    second_started = Event()
+    connect = sqlite3.connect
+
+    def synchronize_backup(path, *args, **kwargs):
+        if str(path) == str(backup) and not copying.is_set():
+            copying.set()
+            assert second_started.wait(3)
+        return connect(path, *args, **kwargs)
+
+    def second_migration():
+        assert b._conn is not None
+        b._conn.set_trace_callback(
+            lambda sql: second_started.set() if sql == "BEGIN IMMEDIATE" else None
+        )
+        return b.relativize_file_paths(tmp_path, backup_path=backup)
+
+    monkeypatch.setattr(sqlite3, "connect", synchronize_backup)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(a.relativize_file_paths, tmp_path, backup)
+            assert copying.wait(3)
+            second = pool.submit(second_migration)
+            assert sorted((first.result(timeout=6), second.result(timeout=6))) == [0, 1]
+        with connect(backup) as snapshot:
+            assert snapshot.execute("SELECT file_path FROM operations").fetchone() == (original_path,)
+            assert snapshot.execute(
+                "SELECT 1 FROM _hgp_migrations WHERE name = 'v6_relative_file_keys'"
+            ).fetchone() is None
+    finally:
+        a.close()
+        b.close()

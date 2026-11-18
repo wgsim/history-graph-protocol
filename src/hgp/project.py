@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import uuid
 from pathlib import Path
 
 # Re-exported: single implementation shared with the standalone hook scripts.
@@ -42,6 +44,38 @@ def find_project_root(start: Path) -> Path:
         f"No .git directory found above {current}. "
         "Set HGP_PROJECT_ROOT to specify the project root explicitly."
     )
+
+
+def read_worktree_id(gitdir: Path) -> str | None:
+    """Read HGP's identifier for this Git worktree registration, if assigned."""
+    try:
+        return (gitdir / "hgp-worktree-id").read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return None
+
+
+def ensure_worktree_id(gitdir: Path) -> str:
+    """Assign an ID that travels with the registration when Git moves the worktree.
+
+    Publish a complete marker atomically. If two servers start together, both use
+    the winner's ID. A deleted and recreated registration gets a different ID.
+    """
+    if existing := read_worktree_id(gitdir):
+        return existing
+    with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=gitdir, delete=False) as stream:
+        temp = Path(stream.name)
+        stream.write(uuid.uuid4().hex + "\n")
+    try:
+        try:
+            (gitdir / "hgp-worktree-id").hardlink_to(temp)
+        except FileExistsError:
+            pass
+    finally:
+        temp.unlink(missing_ok=True)
+    assigned = read_worktree_id(gitdir)
+    if not assigned:
+        raise RuntimeError(f"Missing worktree ID after initialization: {gitdir}")
+    return assigned
 
 
 def current_branch(checkout_root: Path) -> str | None:

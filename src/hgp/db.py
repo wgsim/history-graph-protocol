@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -162,6 +163,15 @@ PRAGMA foreign_keys = ON;
 _MAX_EVIDENCE_RESULTS = 200
 
 
+# Match legacy operations by their original path only until they have an ID.
+_CHECKOUT_MATCH = """CASE WHEN json_valid(metadata) THEN
+    CASE WHEN json_extract(metadata, '$.hgp_checkout.id') IS NOT NULL
+         THEN json_extract(metadata, '$.hgp_checkout.id') = ?
+         ELSE json_extract(metadata, '$.hgp_checkout.root') IS ?
+    END
+    ELSE ? IS NULL END"""
+
+
 class Database:
     """Thread-safe SQLite wrapper for HGP."""
 
@@ -236,36 +246,37 @@ class Database:
         """
         import os
 
-        from hgp.hooks.hgp_paths import checkout_root_from_metadata
+        from hgp.hooks.hgp_paths import checkout_value_from_metadata
 
         assert self._conn
         name = "v6_relative_file_keys"
-        if self._conn.execute("SELECT 1 FROM _hgp_migrations WHERE name = ?", (name,)).fetchone():
-            return 0
-        main_root = main_root.resolve()
-        updates: list[tuple[str, str]] = []
-        for row in self._conn.execute(
-            "SELECT op_id, file_path, metadata FROM operations WHERE file_path IS NOT NULL"
-        ).fetchall():
-            fp = row["file_path"]
-            if not os.path.isabs(fp):
-                continue
-            checkout_root = checkout_root_from_metadata(row["metadata"])
-            base = Path(checkout_root) if checkout_root else main_root
-            try:
-                updates.append((Path(fp).relative_to(base).as_posix(), row["op_id"]))
-            except ValueError:
-                continue  # outside its checkout root: keep the absolute path
-        if updates and backup_path is not None:
-            dst = sqlite3.connect(str(backup_path))
-            try:
-                self._conn.backup(dst)
-            finally:
-                dst.close()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            if self._conn.execute("SELECT 1 FROM _hgp_migrations WHERE name = ?", (name,)).fetchone():
+                self._conn.commit()
+                return 0
+            main_root = main_root.resolve()
+            updates: list[tuple[str, str]] = []
+            for row in self._conn.execute(
+                "SELECT op_id, file_path, metadata FROM operations WHERE file_path IS NOT NULL"
+            ):
+                fp = row["file_path"]
+                if not os.path.isabs(fp):
+                    continue
+                checkout_root = checkout_value_from_metadata(row["metadata"], "root")
+                base = Path(checkout_root) if checkout_root else main_root
+                try:
+                    updates.append((Path(fp).relative_to(base).as_posix(), row["op_id"]))
+                except ValueError:
+                    continue  # outside its checkout root: keep the absolute path
+            if updates and backup_path is not None:
+                # The writer holds the reservation. A separate reader can back up
+                # its committed view without waiting for that same writer to commit.
+                with closing(sqlite3.connect(str(self._path))) as src:
+                    with closing(sqlite3.connect(str(backup_path))) as dst:
+                        src.backup(dst)
             self._conn.executemany("UPDATE operations SET file_path = ? WHERE op_id = ?", updates)
-            self._conn.execute("INSERT OR IGNORE INTO _hgp_migrations (name) VALUES (?)", (name,))
+            self._conn.execute("INSERT INTO _hgp_migrations (name) VALUES (?)", (name,))
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -273,6 +284,18 @@ class Database:
         if updates:
             _log.info("v6 migration: %d file path(s) made repo-relative", len(updates))
         return len(updates)
+
+    def tag_legacy_checkout(self, checkout_root: Path, checkout_id: str) -> None:
+        """Associate path-only provenance with an existing worktree before it moves."""
+        self.execute(
+            """UPDATE operations
+               SET metadata = json_set(metadata, '$.hgp_checkout.id', ?)
+               WHERE CASE WHEN json_valid(metadata) THEN
+                   json_extract(metadata, '$.hgp_checkout.root') = ?
+                   AND json_extract(metadata, '$.hgp_checkout.id') IS NULL
+               ELSE 0 END""",
+            (checkout_id, str(checkout_root)),
+        )
 
     def close(self) -> None:
         if self._conn:
@@ -357,6 +380,7 @@ class Database:
         *,
         scope_checkout: bool = False,
         checkout_root: str | None = None,
+        checkout_id: str | None = None,
     ) -> list[sqlite3.Row]:
         """Return file history by commit sequence, optionally scoped to a checkout.
 
@@ -367,11 +391,8 @@ class Database:
         scope = ""
         params: list[Any] = [file_path]
         if scope_checkout:
-            scope = (
-                "AND (CASE WHEN json_valid(metadata) "
-                "THEN json_extract(metadata, '$.hgp_checkout.root') END) IS ? "
-            )
-            params.append(checkout_root)
+            scope = f"AND ({_CHECKOUT_MATCH}) "
+            params.extend((checkout_id, checkout_root, checkout_root))
         params.append(limit)
         return self._conn.execute(
             "SELECT * FROM operations WHERE file_path = ? "
@@ -434,22 +455,19 @@ class Database:
         file_path: str | None = None,
         scope_checkout: bool = False,
         checkout_root: str | None = None,
+        checkout_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Query operations.
 
-        With ``scope_checkout=True`` only ops recorded from ``checkout_root``
-        are returned, matched on ``metadata.hgp_checkout.root``; ``None`` selects
-        ops from the main checkout (no ``hgp_checkout`` tag).
+        With ``scope_checkout=True``, match the worktree ID, or the recorded root
+        for rows that predate IDs. Two None values select the main checkout.
         """
         assert self._conn
         clauses: list[str] = []
         params: list[Any] = []
         if scope_checkout:
-            clauses.append(
-                "(CASE WHEN json_valid(metadata) "
-                "THEN json_extract(metadata, '$.hgp_checkout.root') END) IS ?"
-            )
-            params.append(checkout_root)
+            clauses.append(f"({_CHECKOUT_MATCH})")
+            params.extend((checkout_id, checkout_root, checkout_root))
         if status:
             clauses.append("status = ?")
             params.append(status)

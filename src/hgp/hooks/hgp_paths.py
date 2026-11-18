@@ -10,45 +10,45 @@ from pathlib import Path
 from typing import Any, cast
 
 
-def find_storage_root(project_root: Path) -> Path:
-    """Return the root that owns shared HGP storage.
+def find_linked_worktree_gitdir(project_root: Path) -> Path | None:
+    """Return the validated Git administrative directory of a linked worktree.
 
     Linked worktrees keep a ``.git`` pointer file in the checkout. Its gitdir
     contains a ``commondir`` entry pointing at the main repository's git
     directory. User file validation still uses ``project_root``; only HGP's
     internal storage is shared through this helper. Any inconsistency in the
-    pointer chain falls back to ``project_root``.
+    pointer chain returns None.
     """
     git_path = project_root / ".git"
     if not git_path.is_file():
-        return project_root
+        return None
 
     try:
         pointer = git_path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
-        return project_root
+        return None
     if not pointer.startswith("gitdir:"):
-        return project_root
+        return None
 
     raw_gitdir = pointer[len("gitdir:"):].strip()
     if not raw_gitdir:
-        return project_root
+        return None
     gitdir = Path(raw_gitdir)
     if not gitdir.is_absolute():
         gitdir = project_root / gitdir
     try:
         gitdir = gitdir.resolve()
     except (OSError, RuntimeError):
-        return project_root
+        return None
     if not gitdir.is_dir():
-        return project_root
+        return None
 
     try:
         raw_common = (gitdir / "commondir").read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
-        return project_root
+        return None
     if not raw_common:
-        return project_root
+        return None
 
     common_git = Path(raw_common)
     if not common_git.is_absolute():
@@ -56,7 +56,7 @@ def find_storage_root(project_root: Path) -> Path:
     try:
         common_git = common_git.resolve()
     except (OSError, RuntimeError):
-        return project_root
+        return None
     if not (
         common_git.is_dir()
         and (common_git / "HEAD").is_file()
@@ -64,15 +64,15 @@ def find_storage_root(project_root: Path) -> Path:
         and (common_git / "objects").is_dir()
         and (common_git / "worktrees").is_dir()
     ):
-        return project_root
+        return None
 
     worktrees_dir = common_git / "worktrees"
     try:
         if gitdir.parent != worktrees_dir:
-            return project_root
+            return None
         backpointer = gitdir / "gitdir"
         if not backpointer.is_file():
-            return project_root
+            return None
         raw_backpointer = backpointer.read_text(encoding="utf-8").strip()
         resolved_backpointer = Path(raw_backpointer)
         if not resolved_backpointer.is_absolute():
@@ -80,19 +80,25 @@ def find_storage_root(project_root: Path) -> Path:
         resolved_backpointer = resolved_backpointer.resolve()
         resolved_git_path = git_path.resolve()
         if resolved_backpointer != resolved_git_path:
-            return project_root
+            return None
 
         storage_root = common_git.parent
         main_git = storage_root / ".git"
         if not main_git.is_dir() or main_git.resolve() != common_git:
-            return project_root
-        return storage_root
+            return None
+        return gitdir
     except (OSError, UnicodeError, RuntimeError, ValueError):
-        return project_root
+        return None
 
 
-def checkout_root_from_metadata(raw: str | None) -> str | None:
-    """Return ``metadata.hgp_checkout.root`` from an op's JSON metadata, if present."""
+def find_storage_root(project_root: Path) -> Path:
+    """Return the root that owns shared HGP storage."""
+    gitdir = find_linked_worktree_gitdir(project_root)
+    return gitdir.parent.parent.parent if gitdir is not None else project_root
+
+
+def checkout_value_from_metadata(raw: str | None, key: str) -> str | None:
+    """Return a string field from an operation's checkout provenance."""
     import json
 
     try:
@@ -104,8 +110,8 @@ def checkout_root_from_metadata(raw: str | None) -> str | None:
     checkout = cast(dict[str, Any], meta).get("hgp_checkout")
     if not isinstance(checkout, dict):
         return None
-    root = cast(dict[str, Any], checkout).get("root")
-    return root if isinstance(root, str) else None
+    value = cast(dict[str, Any], checkout).get(key)
+    return value if isinstance(value, str) else None
 
 
 def parse_hook_policy(text: str) -> bool | None:

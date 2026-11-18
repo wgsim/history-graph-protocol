@@ -11,9 +11,9 @@ from typing import Any
 
 from hgp.cas import CAS
 from hgp.db import Database
-from hgp.hooks.hgp_paths import checkout_root_from_metadata
+from hgp.hooks.hgp_paths import checkout_value_from_metadata, find_linked_worktree_gitdir
 from hgp.models import ReconcileReport
-from hgp.project import find_storage_root
+from hgp.project import ensure_worktree_id, read_worktree_id
 
 _log = logging.getLogger(__name__)
 
@@ -55,23 +55,24 @@ class Reconciler:
         self._cas = cas
         self._staging_dir = content_dir / ".staging"
         self._project_root = project_root.resolve() if project_root is not None else None
-        # Root of this checkout as tagged on ops (metadata.hgp_checkout.root);
-        # None for the main checkout, whose ops carry no tag.
-        self._linked_root: str | None = None
-        if self._project_root is not None:
-            if find_storage_root(self._project_root).resolve() != self._project_root:
-                self._linked_root = str(self._project_root)
-
-    @staticmethod
-    def _op_checkout_root(op: dict[str, Any]) -> str | None:
-        """Return the linked-worktree root an op was recorded from, if tagged."""
-        return checkout_root_from_metadata(op.get("metadata"))
+        gitdir = find_linked_worktree_gitdir(self._project_root) if self._project_root is not None else None
+        self.checkout_id = ensure_worktree_id(gitdir) if gitdir is not None else None
+        self._linked_root = str(self._project_root) if gitdir is not None else None
+        self._worktrees_dir = None
+        if gitdir is not None:
+            self._worktrees_dir = gitdir.parent
+        elif self._project_root is not None:
+            self._worktrees_dir = self._project_root / ".git" / "worktrees"
 
     def _op_in_scope(self, op: dict[str, Any], file_path: str) -> bool:
         """Return whether a pending file operation belongs to this checkout."""
         if self._project_root is None:
             return True
-        if self._op_checkout_root(op) != self._linked_root:
+        checkout_id = checkout_value_from_metadata(op.get("metadata"), "id")
+        if checkout_id is not None:
+            if checkout_id != self.checkout_id:
+                return False
+        elif checkout_value_from_metadata(op.get("metadata"), "root") != self._linked_root:
             return False
         try:
             Path(self._resolve(file_path) or file_path).resolve().relative_to(self._project_root)
@@ -91,10 +92,13 @@ class Reconciler:
             return None
         return str(self._project_root / file_path)
 
-    def _op_orphaned(self, op: dict[str, Any]) -> bool:
-        """Return whether an op belongs to a linked worktree that no longer exists."""
-        root = self._op_checkout_root(op)
-        return root is not None and not Path(root).is_dir()
+    def _registered_worktree_ids(self) -> set[str]:
+        if self._worktrees_dir is None or not self._worktrees_dir.is_dir():
+            return set()
+        return {
+            identifier for gitdir in self._worktrees_dir.iterdir()
+            if gitdir.is_dir() and (identifier := read_worktree_id(gitdir)) is not None
+        }
 
     def reconcile(self, dry_run: bool = False) -> ReconcileReport:
         report = ReconcileReport()
@@ -137,7 +141,8 @@ class Reconciler:
                     report.errors.append(f"staging cleanup error for {tmp_file.name}: {exc}")
 
         # Rule 5: PENDING op recovery — finalize or triage stuck PENDING ops
-        pending_ops = self._db.query_operations(status="PENDING")
+        pending_ops = self._db.query_operations(status="PENDING", include_inactive=True)
+        registered_ids: set[str] | None = None
         for op in pending_ops:
             created_at_str = op.get("created_at", "")
             try:
@@ -161,7 +166,15 @@ class Reconciler:
             if not self._op_in_scope(op, file_path):
                 # Another checkout's op: leave it to that checkout's reconciler,
                 # unless its worktree was removed and nobody will ever finish it.
-                if self._op_orphaned(op):
+                checkout_id = checkout_value_from_metadata(op.get("metadata"), "id")
+                if checkout_id is not None:
+                    if registered_ids is None:
+                        registered_ids = self._registered_worktree_ids()
+                    orphaned = checkout_id not in registered_ids
+                else:
+                    root = checkout_value_from_metadata(op.get("metadata"), "root")
+                    orphaned = root is not None and not Path(root).is_dir()
+                if orphaned:
                     if not dry_run:
                         self._db.update_operation_status(op["op_id"], "STALE_PENDING")
                     report.pending_orphaned += 1
