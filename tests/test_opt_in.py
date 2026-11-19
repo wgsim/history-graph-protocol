@@ -199,6 +199,7 @@ def test_init_outside_git_fails(tmp_path: Path) -> None:
 
 HOOKS = Path(__file__).parents[1] / "src" / "hgp" / "hooks"
 _CP = {"command": "cp a b"}
+_AGY_WRITE = {"toolCall": {"id": "c1", "name": "write_file", "args": {"Path": "a", "Content": "x"}}}
 # (script, event that makes the hook speak when HGP is enabled, needs bash marker)
 HOOK_CASES = [
     pytest.param("claude/pre_tool_use_hgp.py", {"tool_name": "Write"}, False, id="claude-pre_tool_use"),
@@ -217,6 +218,7 @@ HOOK_CASES = [
     pytest.param("codex/pre_tool_use_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, False, id="codex-pre_tool_use"),
     pytest.param("codex/post_tool_use_hgp.py",
                  {"tool_name": "Bash", "tool_input": _CP}, True, id="codex-post_tool_use"),
+    pytest.param("agy/pre_tool_use_hgp.py", _AGY_WRITE, False, id="agy-pre_tool_use"),
 ]
 
 
@@ -460,6 +462,7 @@ PRE_TOOL_CASES = [
     pytest.param("claude/pre_tool_use_hgp.py", {"tool_name": "Write"}, id="claude"),
     pytest.param("gemini/pre_tool_use_hgp.py", {"tool_name": "write_file"}, id="gemini"),
     pytest.param("codex/pre_tool_use_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, id="codex"),
+    pytest.param("agy/pre_tool_use_hgp.py", _AGY_WRITE, id="agy"),
 ]
 
 

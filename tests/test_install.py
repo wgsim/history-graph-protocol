@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,10 +14,14 @@ import pytest
 # Import the functions under test directly so we don't need the full CLI context.
 from hgp.server import (
     _edit_codex_toml,
+    _hook_backups_cmd,
     _inject_instructions,
     _install,
+    _install_hooks_files,
     _install_mcp,
+    _installed_policy_hooks,
     _toml_set_key,
+    _update_agy_hooks_json,
     _update_hooks_settings,
 )
 
@@ -520,7 +527,8 @@ def test_install_all_global(tmp_path, capsys):
          patch("hgp.server._install_mcp", return_value=(True, "registered")) as mock_mcp, \
          patch("hgp.server._install_hooks_files", return_value=[]), \
          patch("hgp.server._update_hooks_settings"), \
-         patch("hgp.server._inject_instructions", return_value="injected"):
+         patch("hgp.server._inject_instructions", return_value="injected"), \
+         patch("shutil.which", return_value=None):  # no agy on PATH: it is not installed unasked
         _install([])
 
     clients_called = [call[0][0] for call in mock_mcp.call_args_list]
@@ -623,6 +631,270 @@ def test_update_hooks_settings_deprecated_event_keeps_custom_hook_in_shared_entr
     settings.write_text(json.dumps({"hooks": {"PreBash": [{"matcher": "", "hooks": [custom, hgp]}]}}))
     _update_hooks_settings("claude", settings, hooks_dir, "global")
     assert json.loads(settings.read_text())["hooks"]["PreBash"] == [{"matcher": "", "hooks": [custom]}]
+
+
+# ── agy (Antigravity CLI) ─────────────────────────────────────
+
+AGY_MATCHER = "write_to_file|replace_file_content|multi_replace_file_content|write_file|edit_file|run_command"
+
+
+def _agy_paths(home: Path) -> tuple[Path, Path]:
+    config = home / ".gemini" / "config"
+    return config / "hooks.json", config / "hooks"
+
+
+def test_update_agy_hooks_json_creates_file(tmp_path):
+    hooks_json, hooks_dir = _agy_paths(tmp_path)
+    assert _update_agy_hooks_json(hooks_json, hooks_dir) == "written"
+    data = json.loads(hooks_json.read_text())
+    assert list(data) == ["hgp"]
+    assert list(data["hgp"]) == ["PreToolUse"]  # no PostToolUse/PreInvocation, and not disabled
+    (group,) = data["hgp"]["PreToolUse"]
+    assert group["matcher"] == AGY_MATCHER
+    (hook,) = group["hooks"]
+    assert hook == {"type": "command", "command": f"python3 {hooks_dir / 'pre_tool_use_hgp.py'}", "timeout": 10}
+
+
+def test_agy_hooks_json_matcher_covers_exactly_the_hook_tools(tmp_path):
+    import re
+
+    from hgp.hooks.agy import pre_tool_use_hgp as agy_hook
+
+    hooks_json, hooks_dir = _agy_paths(tmp_path)
+    _update_agy_hooks_json(hooks_json, hooks_dir)
+    matcher = json.loads(hooks_json.read_text())["hgp"]["PreToolUse"][0]["matcher"]
+    assert set(matcher.split("|")) == {*agy_hook.HGP_TOOLS, "run_command"}
+    for name in (*agy_hook.HGP_TOOLS, "run_command"):
+        assert re.fullmatch(matcher, name)
+    for name in ("call_mcp_tool", "read_file", "view_file", "write_file_x", ""):
+        assert not re.fullmatch(matcher, name)  # HGP's own writes go through call_mcp_tool
+
+
+def test_update_agy_hooks_json_command_survives_spaces_in_path(tmp_path):
+    hooks_json, hooks_dir = _agy_paths(tmp_path / "my home")
+    _update_agy_hooks_json(hooks_json, hooks_dir)
+    command = json.loads(hooks_json.read_text())["hgp"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert shlex.split(command) == ["python3", str(hooks_dir / "pre_tool_use_hgp.py")]
+
+
+def test_update_agy_hooks_json_keeps_other_named_hooks(tmp_path):
+    hooks_json, hooks_dir = _agy_paths(tmp_path)
+    hooks_json.parent.mkdir(parents=True)
+    lint = {"PostToolUse": [{"matcher": "run_command", "hooks": [{"command": "./lint.sh", "timeout": 5}]}]}
+    gate = {"enabled": False, "PreToolUse": [{"matcher": "run_command", "hooks": [{"command": "./gate.sh"}]}]}
+    hooks_json.write_text(json.dumps({"lint": lint, "gate": gate}))
+    assert _update_agy_hooks_json(hooks_json, hooks_dir) == "updated"
+    data = json.loads(hooks_json.read_text())
+    assert data["lint"] == lint
+    assert data["gate"] == gate
+    assert set(data) == {"lint", "gate", "hgp"}
+
+
+def test_update_agy_hooks_json_replaces_stale_hgp_entry_in_place(tmp_path):
+    hooks_json, hooks_dir = _agy_paths(tmp_path)
+    hooks_json.parent.mkdir(parents=True)
+    stale = {
+        "enabled": False,
+        "PreToolUse": [{"matcher": "old", "hooks": [{"type": "command", "command": "python3 /old/hook.py"}]}],
+        "PostToolUse": [{"matcher": "", "hooks": [{"command": "./old.sh"}]}],
+    }
+    hooks_json.write_text(json.dumps({"a": {"Stop": [{"command": "a.sh"}]}, "hgp": stale, "z": {"Stop": []}}))
+    _update_agy_hooks_json(hooks_json, hooks_dir)
+    data = json.loads(hooks_json.read_text())
+    assert list(data) == ["a", "hgp", "z"]  # replaced where it was, neighbours untouched
+    assert list(data["hgp"]) == ["PreToolUse"]
+    assert data["hgp"]["PreToolUse"][0]["matcher"] == AGY_MATCHER
+    assert "/old/" not in hooks_json.read_text()
+    assert data["a"] == {"Stop": [{"command": "a.sh"}]}
+
+
+def test_update_agy_hooks_json_idempotent(tmp_path):
+    hooks_json, hooks_dir = _agy_paths(tmp_path)
+    hooks_json.parent.mkdir(parents=True)
+    hooks_json.write_text(json.dumps({"other": {"Stop": [{"command": "x.sh"}]}}, indent=4))
+    _update_agy_hooks_json(hooks_json, hooks_dir)
+    first = hooks_json.read_bytes()
+    assert _update_agy_hooks_json(hooks_json, hooks_dir) == "already_current"
+    assert hooks_json.read_bytes() == first
+    assert hooks_json.read_text().endswith("\n")
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '"hgp"', "null", "42"])
+def test_update_agy_hooks_json_refuses_to_overwrite_unreadable_file(tmp_path, content):
+    hooks_json, hooks_dir = _agy_paths(tmp_path)
+    hooks_json.parent.mkdir(parents=True)
+    hooks_json.write_text(content)
+    with pytest.raises(ValueError, match="hooks.json"):
+        _update_agy_hooks_json(hooks_json, hooks_dir)
+    assert hooks_json.read_text() == content
+
+
+def test_update_agy_hooks_json_treats_blank_file_as_empty(tmp_path):
+    hooks_json, hooks_dir = _agy_paths(tmp_path)
+    hooks_json.parent.mkdir(parents=True)
+    hooks_json.write_text("\n")
+    assert _update_agy_hooks_json(hooks_json, hooks_dir) == "updated"
+    assert list(json.loads(hooks_json.read_text())) == ["hgp"]
+
+
+def test_install_mcp_agy_is_global_only():
+    with patch("shutil.which", return_value="/opt/agy"), patch("subprocess.run") as mock_run:
+        ok, msg = _install_mcp("agy", "local", "/usr/bin/python3")
+    assert not ok
+    assert "global" in msg
+    mock_run.assert_not_called()
+
+
+def test_install_mcp_agy_global():
+    with patch("shutil.which", return_value="/opt/agy") as mock_which, \
+         patch("subprocess.run", side_effect=_mock_subprocess_ok) as mock_run:
+        ok, msg = _install_mcp("agy", "global", "/usr/bin/python3")
+    assert (ok, msg) == (True, "registered")
+    mock_which.assert_called_with("agy")
+    assert mock_run.call_args[0][0] == ["/opt/agy", "mcp", "add", "hgp", "/usr/bin/python3", "-m", "hgp.server"]
+
+
+def test_install_mcp_agy_cli_missing_and_error():
+    with patch("shutil.which", return_value=None):
+        ok, msg = _install_mcp("agy", "global", "/usr/bin/python3")
+    assert not ok
+    assert "agy CLI not found" in msg
+    with patch("shutil.which", return_value="/opt/agy"), patch("subprocess.run", side_effect=_mock_subprocess_fail):
+        ok, msg = _install_mcp("agy", "global", "/usr/bin/python3")
+    assert not ok
+    assert "CLI error" in msg
+
+
+def test_install_usage_mentions_agy(capsys):
+    with pytest.raises(SystemExit):
+        _install(["--bogus"])
+    assert "--agy" in capsys.readouterr().err
+
+
+def test_install_agy_installs_hook_files_hooks_json_and_instructions(tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    with patch("pathlib.Path.home", return_value=home), \
+         patch("hgp.server._install_mcp", return_value=(True, "registered")) as mock_mcp:
+        _install(["--agy"])
+
+    assert [call[0][0] for call in mock_mcp.call_args_list] == ["agy"]
+    hooks_json, hooks_dir = _agy_paths(home)
+    assert {p.name for p in hooks_dir.iterdir()} == {"pre_tool_use_hgp.py", "hgp_paths.py"}
+    data = json.loads(hooks_json.read_text())
+    assert data["hgp"]["PreToolUse"][0]["hooks"][0]["command"] == f"python3 {hooks_dir / 'pre_tool_use_hgp.py'}"
+    assert "<!-- hgp-instructions-start -->" in (home / ".gemini" / "GEMINI.md").read_text()
+    out = capsys.readouterr().out
+    assert "agy" in out
+    assert "✗" not in out
+    # Gemini CLI's own files, and the other clients, are not touched
+    assert not (home / ".gemini" / "hooks").exists()
+    assert not (home / ".gemini" / "settings.json").exists()
+    assert not (home / ".claude").exists()
+    assert not (home / ".codex").exists()
+
+
+def test_installed_agy_hook_is_self_contained(tmp_path):
+    """The installed copy finds hgp_paths.py beside it (no hgp package): mode off yields to block policy."""
+    home = tmp_path / "home"
+    home.mkdir()
+    with patch("pathlib.Path.home", return_value=home), \
+         patch("hgp.server._install_mcp", return_value=(True, "registered")):
+        _install(["--agy"])
+    hook = _agy_paths(home)[1] / "pre_tool_use_hgp.py"
+    repo = tmp_path / "repo"
+    (repo / ".hgp").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / ".hgp" / "hook-policy").write_text('{"block_mode": true}')
+    event = json.dumps({"toolCall": {"name": "write_file", "args": {}}, "cwd": str(repo)})
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, "-S", str(hook)], input=event, cwd=tmp_path,
+                              capture_output=True, text=True)
+
+    assert json.loads(run().stdout)["decision"] == "deny"
+    (repo / ".hgp" / "mode").write_text("off\n")  # only hgp_paths.hgp_mode knows this
+    assert run().stdout == ""
+
+
+def test_install_agy_local_is_skipped_with_message(tmp_path, capsys):
+    repo = _make_git_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    with patch("hgp.server.find_project_root", return_value=repo), \
+         patch("pathlib.Path.home", return_value=home), \
+         patch("hgp.server._install_mcp") as mock_mcp:
+        _install(["--agy", "--local"])
+
+    mock_mcp.assert_not_called()
+    out = capsys.readouterr().out
+    assert "agy" in out
+    assert "not supported" in out
+    assert not (home / ".gemini").exists()
+    assert not (repo / ".gemini").exists()
+
+
+@pytest.mark.parametrize("flag", ["--claude", "--gemini", "--codex"])
+def test_install_client_flag_leaves_agy_out_even_when_on_path(tmp_path, flag):
+    repo = _make_git_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    with patch("hgp.server.find_project_root", return_value=repo), \
+         patch("pathlib.Path.home", return_value=home), \
+         patch("shutil.which", return_value="/opt/agy"), \
+         patch("hgp.server._install_mcp", return_value=(True, "registered")) as mock_mcp, \
+         patch("hgp.server._install_hooks_files", return_value=[]), \
+         patch("hgp.server._update_hooks_settings"), \
+         patch("hgp.server._inject_instructions", return_value="injected"):
+        _install([flag])
+
+    assert "agy" not in [call[0][0] for call in mock_mcp.call_args_list]
+    assert not (home / ".gemini" / "config").exists()
+
+
+def test_install_all_global_includes_agy_only_when_found(tmp_path):
+    repo = _make_git_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    with patch("hgp.server.find_project_root", return_value=repo), \
+         patch("pathlib.Path.home", return_value=home), \
+         patch("shutil.which", return_value="/opt/agy"), \
+         patch("hgp.server._install_mcp", return_value=(True, "registered")) as mock_mcp, \
+         patch("hgp.server._install_hooks_files", return_value=[]), \
+         patch("hgp.server._update_hooks_settings"), \
+         patch("hgp.server._inject_instructions", return_value="injected"):
+        _install([])
+
+    assert {call[0][0] for call in mock_mcp.call_args_list} == {"claude", "gemini", "codex", "agy"}
+    assert _agy_paths(home)[0].is_file()
+
+
+def test_install_hooks_files_agy_backs_up_modified_hook(tmp_path):
+    dest = tmp_path / "hooks"
+    dest.mkdir()
+    (dest / "pre_tool_use_hgp.py").write_text("# customised\n")
+    _install_hooks_files("agy", dest)
+    (backup,) = [p for p in dest.iterdir() if ".bak-" in p.name]
+    assert backup.name.startswith("pre_tool_use_hgp.py.bak-")
+    assert backup.read_text() == "# customised\n"
+    assert (dest / "hgp_paths.py").is_file()
+
+
+def test_policy_hook_scan_and_backups_cover_agy_hooks_dir(tmp_path, capsys):
+    repo = _make_git_repo(tmp_path)
+    home = tmp_path / "home"
+    _, agy_dir = _agy_paths(home)
+    agy_dir.mkdir(parents=True)
+    backup = agy_dir / "pre_tool_use_hgp.py.bak-20260101000000"
+    backup.write_text("old")
+    with patch("pathlib.Path.home", return_value=home):
+        hooks = _installed_policy_hooks(repo)
+        assert agy_dir / "pre_tool_use_hgp.py" in hooks
+        assert home / ".gemini" / "hooks" / "pre_tool_use_hgp.py" in hooks  # Gemini CLI's stays scanned
+        _hook_backups_cmd([])
+        assert str(backup) in capsys.readouterr().out
+        _hook_backups_cmd(["--prune", "--keep", "0"])
+    assert not backup.exists()
 
 
 def test_inject_instructions_ignores_stray_end_marker_before_block(tmp_path):
