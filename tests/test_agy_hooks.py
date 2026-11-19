@@ -434,6 +434,19 @@ CONTROL_FILE_WRITES = [
     # a redirect after the target must not hide the operand that is written
     f"cp /tmp/x .hgp/{_M} > /dev/null", f"cp /tmp/x .hgp/{_M} 2>/dev/null", f"cp /tmp/x .hgp/{_M} 2>&1",
     f"rm .hgp/{_M} 2>/dev/null", f"tee .hgp/{_M} < /tmp/x",
+    # fail closed: a control path together with a writer word anywhere in the command is a deny,
+    # whichever operand the word acts on (operands are not resolved)
+    "git checkout -- .hgp/hook-policy", f"git checkout -- .hgp/{_M}", "git restore .hgp/hook-policy",
+    f"git reset .hgp/{_M}", f"git apply p .hgp/{_M}", f"patch .hgp/{_M} < p", "patch .hgp/hook-policy < p",
+    f"cp .hgp/{_M} /tmp/x", f"cp .hgp/{_M} /tmp/backup", "cat .hgp/hook-policy | tee log.txt",
+    f"cat .hgp/{_M} && tee log.txt < x", f"grep -c on .hgp/{_M}; touch other.txt", f"ln -s .hgp/{_M} link",
+    "tee log.txt < .hgp/hook-policy", f"chmod 600 .hgp/{_M}", f"install -m 600 x .hgp/{_M}",
+    f"sed -i s/a/b/ x; cat .hgp/{_M}", f"dd if=x of=y; cat .hgp/{_M}", f"rm x; cat .hgp/{_M}",
+    f"echo off | tee x .hgp/{_M}", f"mkdir d && cat .hgp/{_M}", f"find . -path .hgp/{_M} -delete",
+    f"git diff --output=.hgp/{_M}", f"find . -name {_M} -exec echo .hgp/{_M} {{}} +",
+    # redirects are found wherever they occur, not only after the first `>`
+    f"echo off 2> err.log > .hgp/{_M}", f"echo a >> x.log; echo off > .hgp/{_M}", f"cat x > y 2>&1 >.hgp/{_M}",
+    f"echo off >&.hgp/{_M}", f"true > a > .hgp/{_M}",
 ]
 
 
@@ -457,19 +470,20 @@ def test_control_file_write_check_needs_an_enabled_repo(tmp_path: Path) -> None:
     assert _silent(_run(repo, "run_command", {"CommandLine": f"echo off > .hgp/{_M}"}))
 
 
-# Only a write that targets the control file counts: reading it, or writing something else in the
-# same command, is not a control change.
+# Allowed: no writer word at all, and the only writes are redirects to some other file. Everything
+# else that mentions a control path next to a writer word is denied (see CONTROL_FILE_WRITES).
 CONTROL_FILE_READS = [
-    f"grep x .hgp/{_M} > out.txt", "cat .hgp/hook-policy | tee log.txt", f"cp .hgp/{_M} /tmp/backup",
-    f"head -1 .hgp/{_M} 2>/dev/null", f"diff .hgp/{_M} other.txt", f"echo hi > .hgp/{_M}.bak",
-    f"cat .hgp/{_M} .hgp/hook-policy | wc -l", f"sed s/a/b/ .hgp/{_M} > out.txt", f"cat .hgp/{_M} && tee log.txt < x",
-    f"grep -c on .hgp/{_M}; touch other.txt", f"ln -s .hgp/{_M} link", "tee log.txt < .hgp/hook-policy",
+    f"grep x .hgp/{_M} > out.txt", f"head -1 .hgp/{_M} 2>/dev/null", f"diff .hgp/{_M} other.txt",
+    f"echo hi > .hgp/{_M}.bak", f"cat .hgp/{_M} .hgp/hook-policy | wc -l", f"sed s/a/b/ .hgp/{_M} > out.txt",
+    f"grep -c on .hgp/{_M}", f"cat .hgp/{_M} > /tmp/copy.txt", "grep x .hgp/hook-policy 2> err.log",
+    "cat .hgp/hook-policy &> out.txt", f"echo $(cat .hgp/{_M}) > out.txt", f"cat .hgp/{_M} >> log.txt 2>&1",
+    f"cat .hgp/{_M}", "ls -la .hgp/", f"git log --oneline -- .hgp/{_M}",
 ]
 
 
 @pytest.mark.parametrize("mode", ["on", "off"])
 @pytest.mark.parametrize("command", CONTROL_FILE_READS)
-def test_reading_a_control_file_or_writing_elsewhere_is_not_a_control_write(
+def test_reading_a_control_file_or_redirecting_elsewhere_is_not_a_control_write(
     tmp_path: Path, command: str, mode: str,
 ) -> None:
     repo = _repo(tmp_path)
@@ -494,8 +508,8 @@ SELF_MUTATING_READONLY = [
     "find . -name x -okdir echo {} +", "find . -name x -fprint out.txt", "find . -name x -fprint0 out.txt",
     "find . -name x -fprintf out.txt %p", "find . -name x -fls out.txt", "git log --output out.txt",
     "git show --output=x HEAD", "ls -la; find . -delete",
-    # the prefix never suppresses the word patterns: these run another command
-    "rg --pre chmod x .", "find . -name x -exec rm {} +",
+    # options that run another command, with and without a mutating word in it
+    "rg --pre chmod x .", "rg --pre ./clean.sh x .", "rg --pre=./clean.sh x .", "find . -name x -exec rm {} +",
 ]
 
 
@@ -514,6 +528,34 @@ def test_self_mutating_option_behind_a_readonly_prefix_is_denied_under_block(tmp
     assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
 
 
+# A read-only command only runs the option-based checks: a mutating word in its arguments is text.
+READONLY_COMMANDS_MENTIONING_MUTATING_WORDS = [
+    "grep -rn install src", "grep -rn 'rm' src", "rg chmod", "git log --grep=cp", "git show HEAD:install.sh",
+    "ls rm-me", "grep -rn mkdir src", "git log --oneline --grep=patch", "grep -n tee a.txt", "grep -n 'sed -i' src",
+    "grep -n dd a.txt", "find . -name rm-me", "find . -name 'cp*' -type f", "git diff HEAD -- touch.py",
+    "rg --pre-glob '*.pdf' foo .", "git status --short mv.txt", "head -3 ln.txt", "wc -l truncate.py",
+]
+
+
+@pytest.mark.parametrize("command", READONLY_COMMANDS_MENTIONING_MUTATING_WORDS)
+def test_readonly_search_mentioning_a_mutating_word_is_not_denied_under_block(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    args = {"CommandLine": command}
+    assert _silent(_run(repo, "run_command", args))
+    assert _silent(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1"))
+
+
+@pytest.mark.parametrize("command", [
+    "echo cp a b", "cat a.txt | grep install", "ls src && grep -rn install src", "grep -rn install src | head",
+    "grep -rn install src; pwd", "make install",
+])
+def test_commands_that_are_not_readonly_keep_the_full_pattern_set(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    assert _decision(_run(repo, "run_command", {"CommandLine": command})) == "deny"
+
+
 @pytest.mark.parametrize("command", [
     "ls", "ls -la", "git status", "git status --short", "grep x f", "grep -rn x src", "find . -name x -print",
     "find . -type f -name '*.py'", "find . -name delete.txt", "find . -name exec", "git diff HEAD --stat",
@@ -526,7 +568,9 @@ def test_plain_readonly_commands_stay_silent_under_block_after_pattern_changes(t
     assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
 
 
-# ── Commit messages: a heredoc or literal message is text, not a command ─────
+# ── Commit messages: no text is skipped, because a regex is not a shell parser ──
+# A heredoc or quoted message that mentions both words is a false deny. Skipping it would let a
+# crafted heredoc tag or quote mix hide a real mode change, so the workaround is `git commit -F`.
 
 def _message_heredoc(body: str, opener: str = "<<EOF", tag: str = "EOF") -> str:
     return f'git commit -m "$(cat {opener}\n{body}\n{tag}\n)"'
@@ -547,13 +591,44 @@ COMMIT_MESSAGES = [
 
 
 @pytest.mark.parametrize("command", COMMIT_MESSAGES)
-def test_commit_message_text_is_not_a_mode_change(tmp_path: Path, command: str) -> None:
+def test_commit_message_mentioning_both_words_is_denied_with_a_file_hint(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    out = json.loads(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_ASK="0").stdout)
+    assert out["decision"] == "deny"
+    assert "must be run by the user" in out["reason"]
+    assert "git commit -F" in out["reason"]  # the way out
+
+
+@pytest.mark.parametrize("command", [
+    "git commit -F msg.txt", "git commit -a -F /tmp/msg.txt", "git commit --file=msg.txt", "git commit -F - < msg.txt",
+    "git tag -a v1 -F msg.txt", f"git commit -m 'fix paused {_M} handling'", f'git commit -m "fix(hgp): paused {_M}"',
+])
+def test_commit_message_from_a_file_or_without_both_words_is_not_denied(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
     _set_block(repo)
     assert _silent(_run(repo, "run_command", {"CommandLine": command}))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
 
 
-# What must stay denied: text that is expanded or fed to a shell is a command, not a message.
+# Crafted heredocs and quote mixes: whatever hides a command in a message is still seen.
+COMMIT_MESSAGE_HIDING_ATTEMPTS = [
+    _message_heredoc(f"ok\nEOF\nhgp {_M} off\nEOF"),  # a lazy match on the tag ends at the first EOF
+    _message_heredoc(f"ok\nEOF\nhgp {_M} off", "<<'EOF'"),
+    f"git commit -m 'x'\"'\"'; hgp {_M} off; echo '\"'\"'y'",  # 'x'"'"'...'"'"'y' concatenation
+    f"git commit -m 'a' -m \"b\"; hgp {_M} off", f"git commit -m 'a'; git commit -m 'b'; hgp {_M} off",
+    f"git commit -m \"a\" && H=hgp && $H {_M} off", f"git commit -m 'a'\"b\" hgp {_M} off",
+]
+
+
+@pytest.mark.parametrize("command", COMMIT_MESSAGE_HIDING_ATTEMPTS)
+def test_nothing_hides_a_mode_change_inside_a_commit_message_shape(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    out = json.loads(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_ASK="0").stdout)
+    assert out["decision"] == "deny"
+    assert "must be run by the user" in out["reason"]
+
+
+# Text that is expanded or fed to a shell is a command, not a message.
 COMMIT_MESSAGE_LOOKALIKES = [
     _message_heredoc(f"$(hgp {_M} off)"),  # unquoted delimiter: the body is expanded
     _message_heredoc(f"`hgp {_M} off`"),
@@ -563,7 +638,7 @@ COMMIT_MESSAGE_LOOKALIKES = [
     f"git status; sh <<EOF\nhgp {_M} off\nEOF", f'git commit -m "$(cat <<EOF | sh\nhgp {_M} off\nEOF\n)"',
     f"echo -m 'hgp {_M} off' | sh", f'git commit -m "x"; hgp {_M} off', f"git commit -m \"x\" && sh -c 'hgp {_M} off'",
     f"git commit -m \"$(cat <<'EOF'\nok\nEOF\n)\" && H=hgp; $H {_M} off",
-    # the message idiom is only a message inside a git command (same shell segment)
+    # the same shape outside a git command
     f"tool -m \"$(cat <<'EOF'\nhgp {_M} off\nEOF\n)\"", f"git status | tool -m \"$(cat <<EOF\nhgp {_M} off\nEOF\n)\"",
     f"ls; tool --message=\"$(cat <<'EOF'\nhgp {_M} off\nEOF\n)\"",
     f"python -m hgp.server {_M} off", "python3 -m hgp.server hook-policy block",

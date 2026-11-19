@@ -13,14 +13,17 @@ tool call that agy would otherwise have gated behind its own permission check.
     (HGP_HOOK_BLOCK=1 or ``hgp hook-policy block``); otherwise ask once the session has
     already used HGP (HGP_HOOK_ASK=0 disables); otherwise stay silent.
   * run_command: deny a command that runs HGP's mode or hook-policy command, or that writes
-    .hgp/mode or .hgp/hook-policy (those controls are user-only, even while HGP is paused;
-    quotes and backslashes are normalised away, the message of a git command is ignored, and
-    with `$` or a backtick the words only need to appear; this is a heuristic, not a shell
-    parser; a control-file write means a redirect to it or it as a written operand, so reading
-    it is fine); deny a command that looks file-mutating under the block policy; otherwise stay
+    .hgp/mode or .hgp/hook-policy (those controls are user-only, even while HGP is paused).
+    Quotes and backslashes are normalised away and nothing else is skipped, not even a commit
+    message (a regex that drops text can be made to hide a command), so a message that mentions
+    both words is a false deny; `git commit -F <file>` avoids it. With `$` or a backtick the
+    words only need to appear, otherwise they must be adjacent. A command that names a control
+    path fails closed: a redirect to it, or any writer word anywhere in the command, is a deny;
+    only reading it or redirecting some other file is allowed. This is a heuristic, not a shell
+    parser. Deny a command that looks file-mutating under the block policy; otherwise stay
     silent. A command is read-only only with a read-only prefix and no chaining, substitution
-    or redirection, and even then it skips only the redirect patterns: the word patterns and
-    self-mutating options (`find -delete/-exec/...`, `git --output`) always apply.
+    or redirection, and then only the self-mutating options (`find -delete/-exec/...`,
+    `git --output`, `rg --pre`) are checked: its other arguments are text.
 
 Silent when HGP is not enabled for the repository, and while HGP mode is advisory or off
 (HGP tools then do not write files). HGP_HOOK_BLOCK=1 always wins over the mode file: the
@@ -118,11 +121,13 @@ _MEDIUM_PATTERNS = [
     re.compile(r"\bdd\b"),
 ]
 
-# Options that make a read-only-looking command write files or run another command. A read-only
-# prefix never hides them: `find . -delete`, `git diff --output=f`.
+# Options that make a read-only-looking command write files or run another command. These are
+# the only patterns a read-only command (_is_readonly) is checked against: `find . -delete`,
+# `git diff --output=f`, `rg --pre cmd`. Its other arguments are text (`grep -rn install src`).
 _SELF_MUTATING_PATTERNS = [
     re.compile(r"\bfind\b.*\s-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b", re.S),
     re.compile(r"\bgit\b.*\s--output(?![\w-])", re.S),
+    re.compile(r"\brg\b.*\s--pre(?![\w-])", re.S),
 ]
 
 # Mode and hook policy are user-only controls. These patterns run on a command with its quotes and
@@ -136,21 +141,6 @@ _CONTROL_WORD = re.compile(r"(?<![\w./-])(?:mode|hook-policy)(?![\w./-])")
 # The files behind those controls: the agent can write them, so the shell must not.
 _CONTROL_PATH = re.compile(r"\.hgp/(?:mode|hook-policy)(?![\w.-])")
 _REDIRECT_TARGET = re.compile(r"\d*&?>>?\s*(\S+)")  # `>|` is turned into `>` first
-_REDIRECT_START = re.compile(r"\s\d*>|>")  # ` 2>`: the file descriptor is not an operand
-_INPUT_REDIRECT = re.compile(r"\d*<{1,3}-?\s*\S*")  # `< f`, `<<EOF`: the operand is read, not written
-_SEGMENT_BREAK = re.compile(r"[;&|\n]")
-_WRITES_EVERY_OPERAND = frozenset({"tee", "mv", "rm", "touch", "truncate"})
-_WRITES_LAST_OPERAND = frozenset({"cp", "ln", "install"})
-
-# A message given to `git ... -m`/`--message` (a quoted literal, or the `$(cat <<EOF ...)` idiom) is
-# text. Only a literal that nothing can expand is dropped, and only inside a git command.
-_MESSAGE_FLAG = r"(?<!\S)(?:-[A-Za-z]*m|--message)(?:\s+|=)?"
-_MESSAGE_LITERAL = re.compile(_MESSAGE_FLAG + r"""(?:'[^']*'|"[^"$`]*")""")
-_MESSAGE_HEREDOC = re.compile(
-    _MESSAGE_FLAG + r"""\"\$\(\s*cat\s+<<-?\s*(?P<q>['"]?)(?P<tag>[A-Za-z_]\w*)(?P=q)[ \t]*\n"""
-    r"""(?:(?P<body>.*?)\n)?[ \t]*(?P=tag)[ \t]*\n\s*\)\"""",
-    re.S,
-)
 
 # A command containing one of these chains, substitutes or redirects: never read-only.
 _CONTROL_OPERATORS = (";", "&", "|", "\n", "\r", "$(", "`", ">", "<(")
@@ -312,83 +302,50 @@ def _normalise(command: str) -> str:
 def _detect_mutating(command: str, readonly: bool = False) -> str | None:
     """Return the first matched pattern description, or None if command looks safe.
 
-    A read-only command (see _is_readonly) contains no redirect, so only it skips the redirect
-    patterns. The word patterns and the self-mutating options always apply: a read-only prefix
-    must not hide `find . -delete`, `git diff --output=f` or `rg --pre chmod`.
+    A read-only command (see _is_readonly) is checked against the self-mutating options only
+    (`find -delete`, `git --output`, `rg --pre`): its other arguments are text, so
+    `grep -rn install src` is fine. Any other command gets every pattern. `sed -i` and `dd` are
+    left to the full set: a read-only prefix reaches them only as text or through `find -exec`
+    and `rg --pre`, which are caught.
     """
-    patterns = [*_HIGH_PATTERNS, *_SELF_MUTATING_PATTERNS, *([] if readonly else _REDIRECT_PATTERNS), *_MEDIUM_PATTERNS]
+    if readonly:
+        patterns = _SELF_MUTATING_PATTERNS
+    else:
+        patterns = [*_HIGH_PATTERNS, *_SELF_MUTATING_PATTERNS, *_REDIRECT_PATTERNS, *_MEDIUM_PATTERNS]
     for pat in patterns:
         if pat.search(command):
             return pat.pattern
     return None
 
 
-def _in_git_command(text: str, pos: int) -> bool:
-    """Whether the shell segment (split at ; & | newline) that holds ``pos`` mentions git before it."""
-    start = max(text.rfind(sep, 0, pos) for sep in ";&|\n")
-    return re.search(r"\bgit\b", text[start + 1:pos]) is not None
-
-
-def _strip_commit_messages(command: str) -> str:
-    """Replace the message of a git command (`-m 'text'`, `-m "$(cat <<EOF ... EOF)"`) by an empty one.
-
-    The message is text that git stores, not a command. A message that can be expanded, such as
-    `-m "$(printf ...)"` or an unquoted heredoc whose body has `$` or a backtick, is kept (so it
-    may stay denied), and so is any heredoc that is not directly the message (`cat <<EOF | sh`).
-    """
-    def drop_heredoc(m: re.Match[str]) -> str:
-        body = m.group("body") or ""
-        expanded = not m.group("q") and ("$" in body or "`" in body)
-        return m.group(0) if expanded or not _in_git_command(m.string, m.start()) else '""'
-
-    def drop_literal(m: re.Match[str]) -> str:
-        return '""' if _in_git_command(m.string, m.start()) else m.group(0)
-
-    return _MESSAGE_LITERAL.sub(drop_literal, _MESSAGE_HEREDOC.sub(drop_heredoc, command))
-
-
 def _changes_hgp_controls(command: str) -> bool:
     """Whether a command runs HGP's mode or hook-policy command, or hides doing so.
 
-    Quotes and backslashes are dropped first, and so are git commit messages. `$` or a backtick
-    means a variable or command substitution may be assembling the command, so the words only
-    have to appear somewhere. Without one they must be adjacent, which keeps a commit message
-    that mentions both words from being denied.
+    Quotes and backslashes are dropped first; nothing else is skipped, not even a commit message
+    (a regex that removed text could be made to hide a real command). `$` or a backtick means a
+    variable or command substitution may be assembling the command, so the words only have to
+    appear somewhere. Without one they must be adjacent.
     """
-    text = _normalise(_strip_commit_messages(command))
+    text = _normalise(command)
     if _HGP_MODE_PATTERN.search(text):
         return True
     return ("$" in text or "`" in text) and bool(_HGP_WORD.search(text) and _CONTROL_WORD.search(text))
 
 
 def _writes_hgp_control_file(text: str) -> bool:
-    """Whether a normalised command writes .hgp/mode or .hgp/hook-policy.
+    """Whether a normalised command may write .hgp/mode or .hgp/hook-policy. Fails closed.
 
-    A per-segment token check, not a shell parser: the file is the target of a redirect, or an
-    operand of a command that writes its operands (tee, mv, rm, touch, truncate), of the last
-    operand a command writes (cp, ln, install), `of=` of dd, or a file given to `sed -i`.
-    Reading the file, or writing something else in the same command, is not a write to it.
+    A command that names a control path is denied if a redirect anywhere in it targets one, or
+    if it contains any writer word anywhere (the mutating word patterns, `sed -i`, `dd`, the
+    self-mutating options). Operands are not resolved, so `cp .hgp/mode /tmp/x` and
+    `cat .hgp/hook-policy | tee log.txt` are denied too. Only reading it, or redirecting some
+    other file with no writer word, is allowed.
     """
     if not _CONTROL_PATH.search(text):
         return False
-    for segment in _SEGMENT_BREAK.split(text.replace(">|", ">")):
-        if any(_CONTROL_PATH.search(target) for target in _REDIRECT_TARGET.findall(segment)):
-            return True
-        tokens = _INPUT_REDIRECT.sub(" ", _REDIRECT_START.split(" " + segment, 1)[0]).split()
-        for i, token in enumerate(tokens):
-            name = token.rsplit("/", 1)[-1]
-            rest = tokens[i + 1:]
-            operands = [t for t in rest if not t.startswith("-")]
-            if name in _WRITES_EVERY_OPERAND and any(_CONTROL_PATH.search(t) for t in operands):
-                return True
-            if name in _WRITES_LAST_OPERAND and operands and _CONTROL_PATH.search(operands[-1]):
-                return True
-            if name == "dd" and any(t.startswith("of=") and _CONTROL_PATH.search(t) for t in rest):
-                return True
-            if name == "sed" and any(re.match(r"-[A-Za-z]*i|--in-place", t) for t in rest):
-                if any(_CONTROL_PATH.search(t) for t in operands):
-                    return True
-    return False
+    if any(_CONTROL_PATH.search(target) for target in _REDIRECT_TARGET.findall(text.replace(">|", ">"))):
+        return True
+    return any(pat.search(text) for pat in (*_HIGH_PATTERNS, *_SELF_MUTATING_PATTERNS, *_MEDIUM_PATTERNS))
 
 
 def _respond(decision: str, reason: str) -> None:
@@ -428,7 +385,8 @@ def _main() -> None:
             _respond(
                 "deny",
                 "[HGP] Blocked: `hgp mode` and `hgp hook-policy` must be run by the user directly, "
-                "not by the agent. Use `!hgp mode <value>` or `!hgp hook-policy <value>` in your terminal.",
+                "not by the agent. Use `!hgp mode <value>` or `!hgp hook-policy <value>` in your terminal. "
+                "If this is only text, such as a commit message, write it to a file and run `git commit -F <file>`.",
             )
             sys.exit(0)
         if _writes_hgp_control_file(text):
