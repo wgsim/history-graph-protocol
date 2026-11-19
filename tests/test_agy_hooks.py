@@ -426,6 +426,14 @@ CONTROL_FILE_WRITES = [
     f"sed -i s/on/off/ .hgp/{_M}", "mv /tmp/x .hgp/hook-policy", f"cp /tmp/x /repo/.hgp/{_M}",
     f"echo advisory >> .hgp/{_M}", f'echo off > ".hgp/{_M}"', "echo off > .hgp/mo\\de", "rm .hgp/hook-policy",
     f"ls -la && echo off > .hgp/{_M}",
+    f"echo off 1>.hgp/{_M}", f"echo off 2> .hgp/{_M}", f"echo off &> .hgp/{_M}", f"echo off >| .hgp/{_M}",
+    f"cat > .hgp/{_M} <<EOF\noff\nEOF", f"dd if=/dev/null of=.hgp/{_M}", f"truncate -s 0 .hgp/{_M}",
+    f"touch .hgp/{_M}", f"ln -sf /dev/null .hgp/{_M}", "sed -i.bak s/a/b/ .hgp/hook-policy", f"sudo tee .hgp/{_M}",
+    f"/bin/cp x .hgp/{_M}", f"echo off | tee -a .hgp/{_M} > /dev/null", f"find . -exec cp x .hgp/{_M} \\;",
+    "mv .hgp/hook-policy /tmp/policy.bak",  # moving the policy away drops it
+    # a redirect after the target must not hide the operand that is written
+    f"cp /tmp/x .hgp/{_M} > /dev/null", f"cp /tmp/x .hgp/{_M} 2>/dev/null", f"cp /tmp/x .hgp/{_M} 2>&1",
+    f"rm .hgp/{_M} 2>/dev/null", f"tee .hgp/{_M} < /tmp/x",
 ]
 
 
@@ -447,6 +455,154 @@ def test_control_file_write_check_needs_an_enabled_repo(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     (repo / ".hgp").rmdir()
     assert _silent(_run(repo, "run_command", {"CommandLine": f"echo off > .hgp/{_M}"}))
+
+
+# Only a write that targets the control file counts: reading it, or writing something else in the
+# same command, is not a control change.
+CONTROL_FILE_READS = [
+    f"grep x .hgp/{_M} > out.txt", "cat .hgp/hook-policy | tee log.txt", f"cp .hgp/{_M} /tmp/backup",
+    f"head -1 .hgp/{_M} 2>/dev/null", f"diff .hgp/{_M} other.txt", f"echo hi > .hgp/{_M}.bak",
+    f"cat .hgp/{_M} .hgp/hook-policy | wc -l", f"sed s/a/b/ .hgp/{_M} > out.txt", f"cat .hgp/{_M} && tee log.txt < x",
+    f"grep -c on .hgp/{_M}; touch other.txt", f"ln -s .hgp/{_M} link", "tee log.txt < .hgp/hook-policy",
+]
+
+
+@pytest.mark.parametrize("mode", ["on", "off"])
+@pytest.mark.parametrize("command", CONTROL_FILE_READS)
+def test_reading_a_control_file_or_writing_elsewhere_is_not_a_control_write(
+    tmp_path: Path, command: str, mode: str,
+) -> None:
+    repo = _repo(tmp_path)
+    (repo / ".hgp" / "mode").write_text(mode + "\n")
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_ASK="0"))
+
+
+def test_unrelated_redirect_is_an_ordinary_mutation_not_a_control_write(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    out = json.loads(_run(repo, "run_command", {"CommandLine": f"grep x .hgp/{_M} > out.txt"}).stdout)
+    assert out["decision"] == "deny"
+    assert "may mutate" in out["reason"]
+    assert "user-controlled" not in out["reason"]
+
+
+# ── A read-only prefix never hides a self-mutating option ────────────────────
+
+SELF_MUTATING_READONLY = [
+    "find . -name '*.tmp' -delete", "find . -name x -exec chmod 600 {} +", "git diff --output=patch.txt",
+    "find . -name x -exec echo {} +", "find . -name x -execdir echo {} +", "find . -name x -ok echo {} +",
+    "find . -name x -okdir echo {} +", "find . -name x -fprint out.txt", "find . -name x -fprint0 out.txt",
+    "find . -name x -fprintf out.txt %p", "find . -name x -fls out.txt", "git log --output out.txt",
+    "git show --output=x HEAD", "ls -la; find . -delete",
+    # the prefix never suppresses the word patterns: these run another command
+    "rg --pre chmod x .", "find . -name x -exec rm {} +",
+]
+
+
+@pytest.mark.parametrize("command", SELF_MUTATING_READONLY)
+def test_self_mutating_option_behind_a_readonly_prefix_is_denied_under_block(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    args = {"CommandLine": command}
+    assert _silent(_run(repo, "run_command", args))  # advisory policy: never denied
+    _set_block(repo)
+    r = _run(repo, "run_command", args)
+    assert (r.returncode, r.stderr) == (0, "")
+    assert json.loads(r.stdout)["decision"] == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    (repo / ".hgp" / "mode").write_text("off\n")  # paused: the policy file yields, the env var does not
+    assert _silent(_run(repo, "run_command", args))
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    "ls", "ls -la", "git status", "git status --short", "grep x f", "grep -rn x src", "find . -name x -print",
+    "find . -type f -name '*.py'", "find . -name delete.txt", "find . -name exec", "git diff HEAD --stat",
+    "git diff --output-indicator-new=+", "git log --oneline -5", "head -5 a.txt", "pwd", "uname -a",
+])
+def test_plain_readonly_commands_stay_silent_under_block_after_pattern_changes(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
+
+
+# ── Commit messages: a heredoc or literal message is text, not a command ─────
+
+def _message_heredoc(body: str, opener: str = "<<EOF", tag: str = "EOF") -> str:
+    return f'git commit -m "$(cat {opener}\n{body}\n{tag}\n)"'
+
+
+COMMIT_MESSAGES = [
+    _message_heredoc(f"fix(hgp): handle paused {_M}"),
+    _message_heredoc(f"fix(hgp): handle paused {_M}", "<<'EOF'"),
+    _message_heredoc(f"fix(hgp): handle paused {_M}", '<<"EOF"'),
+    _message_heredoc(f"fix(hgp): handle paused {_M}", "<<-EOF"),
+    _message_heredoc(f"subject\n\ndocs: explain hgp {_M} off and hgp hook-policy\n\nmore", "<<'EOF'"),
+    _message_heredoc(f"docs: explain hgp {_M} off"),  # unquoted delimiter, but nothing is expanded in the body
+    _message_heredoc(f"docs: hgp {_M}", "<<'END'", "END"),
+    f"git commit -am 'explain hgp {_M} off'", f'git commit -m "docs: hgp {_M}"',
+    f'git tag -a v1 --message="hgp {_M} notes"',
+    f"git commit -m x -m 'hgp {_M} y'",
+]
+
+
+@pytest.mark.parametrize("command", COMMIT_MESSAGES)
+def test_commit_message_text_is_not_a_mode_change(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}))
+
+
+# What must stay denied: text that is expanded or fed to a shell is a command, not a message.
+COMMIT_MESSAGE_LOOKALIKES = [
+    _message_heredoc(f"$(hgp {_M} off)"),  # unquoted delimiter: the body is expanded
+    _message_heredoc(f"`hgp {_M} off`"),
+    f"git commit -m \"$(printf 'hgp {_M}')\"",  # substitution inside the message: not told apart from a command
+    f"git commit -m \"$(printf '%s' hgp) {_M} off\"",
+    f"sh <<'EOF'\nhgp {_M} off\nEOF", f"bash <<EOF\nhgp {_M} off\nEOF", f"cat <<EOF | sh\nhgp {_M} off\nEOF",
+    f"git status; sh <<EOF\nhgp {_M} off\nEOF", f'git commit -m "$(cat <<EOF | sh\nhgp {_M} off\nEOF\n)"',
+    f"echo -m 'hgp {_M} off' | sh", f'git commit -m "x"; hgp {_M} off', f"git commit -m \"x\" && sh -c 'hgp {_M} off'",
+    f"git commit -m \"$(cat <<'EOF'\nok\nEOF\n)\" && H=hgp; $H {_M} off",
+    # the message idiom is only a message inside a git command (same shell segment)
+    f"tool -m \"$(cat <<'EOF'\nhgp {_M} off\nEOF\n)\"", f"git status | tool -m \"$(cat <<EOF\nhgp {_M} off\nEOF\n)\"",
+    f"ls; tool --message=\"$(cat <<'EOF'\nhgp {_M} off\nEOF\n)\"",
+    f"python -m hgp.server {_M} off", "python3 -m hgp.server hook-policy block",
+]
+
+
+@pytest.mark.parametrize("command", COMMIT_MESSAGE_LOOKALIKES)
+def test_expanded_or_executed_text_is_still_a_mode_change(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    r = _run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_ASK="0")
+    assert (r.returncode, r.stderr) == (0, "")
+    out = json.loads(r.stdout)
+    assert out["decision"] == "deny"
+    assert "must be run by the user" in out["reason"]
+
+
+# ── Reading the transcript ───────────────────────────────────────────────────
+
+def test_transcript_scan_parses_only_lines_that_could_hold_an_hgp_mcp_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hgp.hooks.agy import pre_tool_use_hgp as agy_hook
+
+    noise_call = {"name": "run_command", "args": {"CommandLine": "ls src/hgp"}}
+    noise = {"content": "talk about hgp", "tool_calls": [noise_call]}
+    lines = [json.dumps({"step_index": i, **noise}) for i in range(50)]
+    lines.append(json.dumps({"step_index": 99, "tool_calls": [HGP_CALL]}))
+    path = tmp_path / "t.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+    real_loads = json.loads
+    parsed: list[str] = []
+
+    def counting_loads(text: str, *args: object, **kwargs: object) -> object:
+        parsed.append(text)
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(agy_hook.json, "loads", counting_loads)
+    assert agy_hook._hgp_loaded({"transcriptPath": str(path)})  # pyright: ignore[reportPrivateUsage]
+    assert [text.strip() for text in parsed] == [lines[-1]]  # the 50 lines that only mention hgp were never decoded
 
 
 @pytest.mark.parametrize("mode", ["advisory", "off"])
