@@ -1878,10 +1878,13 @@ def _inject_instructions(md_path: Path) -> str:
     END = "<!-- hgp-instructions-end -->"
     md_path.parent.mkdir(parents=True, exist_ok=True)
     content = md_path.read_text() if md_path.exists() else ""
-    if START in content and END in content:
-        # replace existing block
-        before = content[: content.index(START)]
-        after = content[content.index(END) + len(END):]
+    # Replace the last block whose end marker follows its start marker. A stray end
+    # marker above it, or a start marker with no end, must not swallow or repeat text.
+    start = content.rfind(START)
+    end = content.find(END, start + len(START)) if start != -1 else -1
+    if end != -1:
+        before = content[:start]
+        after = content[end + len(END):]
         new_content = before + _HGP_INSTRUCTIONS_BLOCK + after
         if new_content == content:
             return "already_current"

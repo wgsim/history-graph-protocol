@@ -623,3 +623,28 @@ def test_update_hooks_settings_deprecated_event_keeps_custom_hook_in_shared_entr
     settings.write_text(json.dumps({"hooks": {"PreBash": [{"matcher": "", "hooks": [custom, hgp]}]}}))
     _update_hooks_settings("claude", settings, hooks_dir, "global")
     assert json.loads(settings.read_text())["hooks"]["PreBash"] == [{"matcher": "", "hooks": [custom]}]
+
+
+def test_inject_instructions_ignores_stray_end_marker_before_block(tmp_path):
+    """An end marker left above the block must not duplicate it on every install."""
+    md = tmp_path / "AGENTS.md"
+    old_block = "<!-- hgp-instructions-start -->\nold HGP text\n<!-- hgp-instructions-end -->"
+    md.write_text("# Rules\n\nunmarked old copy\n<!-- hgp-instructions-end -->\n\n" + old_block + "\n")
+
+    assert _inject_instructions(md) == "updated"
+    first = md.read_text()
+    assert first.count("<!-- hgp-instructions-start -->") == 1
+    assert "old HGP text" not in first
+    assert first.startswith("# Rules\n\nunmarked old copy\n<!-- hgp-instructions-end -->\n\n")
+    assert _inject_instructions(md) == "already_current"
+    assert md.read_text() == first
+
+
+def test_inject_instructions_appends_when_start_has_no_end(tmp_path):
+    md = tmp_path / "AGENTS.md"
+    md.write_text("# Rules\n<!-- hgp-instructions-start -->\ntruncated\n")
+    assert _inject_instructions(md) == "injected"
+    text = md.read_text()
+    assert text.startswith("# Rules\n<!-- hgp-instructions-start -->\ntruncated\n")
+    assert text.count("<!-- hgp-instructions-end -->") == 1
+    assert _inject_instructions(md) == "already_current"
