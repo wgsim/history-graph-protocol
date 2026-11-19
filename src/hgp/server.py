@@ -1527,16 +1527,18 @@ _INSTALL_HOOKS_USAGE = (
 _VALID_INSTALL_FLAGS = {"--claude", "--gemini"}
 
 _INSTALL_USAGE = (
-    "usage: hgp install [--claude] [--gemini] [--codex] [--local]\n"
+    "usage: hgp install [--claude] [--gemini] [--codex] [--agy] [--local]\n"
     "\n"
-    "  (no flags)   install for Claude Code, Gemini CLI, and Codex (global scope)\n"
+    "  (no flags)   install for Claude Code, Gemini CLI, and Codex (global scope),\n"
+    "               plus Antigravity CLI when `agy` is on PATH\n"
     "  --claude     Claude Code only\n"
     "  --gemini     Gemini CLI only\n"
     "  --codex      Codex only\n"
+    "  --agy        Antigravity CLI (agy) only; global scope only\n"
     "  --local      project-local scope (default: global/user scope)\n"
 )
 
-_VALID_INSTALL_ARGS = {"--claude", "--gemini", "--codex", "--local"}
+_VALID_INSTALL_ARGS = {"--claude", "--gemini", "--codex", "--agy", "--local"}
 
 _HGP_INSTRUCTIONS_BLOCK = """\
 <!-- hgp-instructions-start -->
@@ -1614,6 +1616,13 @@ def _backup_modified_hook(src: Path, dest: Path) -> Path | None:
 _HOOK_BACKUP_RE = re.compile(r"(?P<base>[A-Za-z0-9_]+\.py)\.bak-\d{14}(?:-\d+)?")
 _HOOK_BACKUP_HINT_THRESHOLD = 3
 _HOOK_CLIENT_DIRS = (".claude", ".gemini", ".codex")
+_AGY_HOOKS_SUBDIR = Path(".gemini") / "config" / "hooks"  # agy: global only, beside its hooks.json
+
+
+def _client_hook_dirs(base: Path) -> list[Path]:
+    """Hook directories `hgp install` writes to under ``base`` (home or a project root)."""
+    return [*(base / client / "hooks" for client in _HOOK_CLIENT_DIRS), base / _AGY_HOOKS_SUBDIR]
+
 
 _HOOK_BACKUPS_USAGE = (
     "usage: hgp hook-backups [--local] [--prune [--keep N] [--dry-run]]\n"
@@ -1631,7 +1640,7 @@ def _bundled_hook_names() -> set[str]:
     import importlib.resources
 
     names = {"hgp_paths.py"}
-    for pkg in ("claude", "gemini", "codex"):
+    for pkg in ("claude", "gemini", "codex", "agy"):
         for item in importlib.resources.files(f"hgp.hooks.{pkg}").iterdir():
             if item.name.endswith(".py") and not item.name.startswith("__"):
                 names.add(item.name)
@@ -1689,8 +1698,7 @@ def _hook_backups_cmd(args: list[str]) -> None:
         base_dir = Path.home()
 
     total = removed = 0
-    for client in _HOOK_CLIENT_DIRS:
-        hooks_dir = base_dir / client / "hooks"
+    for hooks_dir in _client_hook_dirs(base_dir):
         for paths in _hook_backups(hooks_dir).values():
             total += len(paths)
             doomed = paths[: max(len(paths) - keep, 0)] if prune else []
@@ -1869,6 +1877,44 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
     settings_path.write_text(json.dumps(existing, indent=2) + "\n")
 
 
+_AGY_HOOK_MATCHER = "write_to_file|replace_file_content|multi_replace_file_content|write_file|edit_file|run_command"
+
+
+def _update_agy_hooks_json(path: Path, hooks_dir: Path) -> str:
+    """Set HGP's named hook in agy's ``hooks.json``, leaving every other named hook alone.
+
+    agy's ``hooks.json`` maps hook names to event configs and merges them, so only the
+    top-level ``"hgp"`` key is written (replacing a stale one in place). Returns "written",
+    "updated" or "already_current". Raises ValueError, without touching the file, when it
+    exists but is not a JSON object.
+    """
+    import shlex
+
+    hook = hooks_dir / "pre_tool_use_hgp.py"
+    spec: dict[str, Any] = {"PreToolUse": [{
+        "matcher": _AGY_HOOK_MATCHER,
+        "hooks": [{"type": "command", "command": f"python3 {shlex.quote(str(hook))}", "timeout": 10}],
+    }]}
+    existing: dict[str, Any] = {}
+    existed = path.exists()
+    if existed:
+        text = path.read_text(encoding="utf-8")
+        if text.strip():
+            try:
+                loaded: object = json.loads(text)
+            except ValueError as exc:
+                raise ValueError(f"cannot parse {path}: {exc}") from exc
+            if not isinstance(loaded, dict):
+                raise ValueError(f"cannot update {path}: expected a JSON object of named hooks")
+            existing = cast(dict[str, Any], loaded)
+    if existing.get("hgp") == spec:
+        return "already_current"
+    existing["hgp"] = spec
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    return "updated" if existed else "written"
+
+
 def _inject_instructions(md_path: Path) -> str:
     """Append or update the HGP instructions block in a markdown file.
 
@@ -2017,6 +2063,13 @@ def _install_mcp(client: str, scope: str, python: str) -> tuple[bool, str]:
         if not cli:
             return False, "codex CLI not found — skipping global MCP registration"
         cmd = [cli, "mcp", "add", "hgp", "--", python, "-m", "hgp.server"]
+    elif client == "agy":
+        if scope != "global":
+            return False, "agy MCP registration is global only"
+        cli = shutil.which("agy")
+        if not cli:
+            return False, "agy CLI not found — skipping MCP registration"
+        cmd = [cli, "mcp", "add", "hgp", python, "-m", "hgp.server"]  # adds or updates
     else:
         return False, f"unknown client: {client}"
 
@@ -2040,10 +2093,15 @@ def _install(args: list[str]) -> None:
         print(_INSTALL_USAGE, file=sys.stderr)
         sys.exit(1)
 
+    import shutil
+
     scope = "local" if "--local" in args else "global"
-    do_claude = not any(a in args for a in ("--claude", "--gemini", "--codex")) or "--claude" in args
-    do_gemini = not any(a in args for a in ("--claude", "--gemini", "--codex")) or "--gemini" in args
-    do_codex = not any(a in args for a in ("--claude", "--gemini", "--codex")) or "--codex" in args
+    explicit = any(a in args for a in ("--claude", "--gemini", "--codex", "--agy"))
+    do_claude = not explicit or "--claude" in args
+    do_gemini = not explicit or "--gemini" in args
+    do_codex = not explicit or "--codex" in args
+    # agy is installed on request, or by a plain `hgp install` when it is on PATH
+    do_agy = "--agy" in args or (not explicit and shutil.which("agy") is not None)
 
     python = sys.executable
 
@@ -2126,6 +2184,19 @@ def _install(args: list[str]) -> None:
         _step("hooks settings", lambda: (_update_hooks_settings("codex", hooks_json, hooks_dir, scope), "updated")[1])  # noqa: E501
         _step("instructions", lambda p=md_path: _inject_instructions(p))
 
+    if do_agy:
+        print("Antigravity CLI (agy):")
+        if scope == "local":
+            print("  - not supported with --local yet (agy hooks are installed globally only); skipping")
+        else:
+            agy_config = Path.home() / ".gemini" / "config"
+            hooks_dir = Path.home() / _AGY_HOOKS_SUBDIR
+            md_path = Path.home() / ".gemini" / "GEMINI.md"
+            _step("MCP", lambda: _install_mcp("agy", scope, python))
+            _step("hooks files", lambda d=hooks_dir: f"installed {len(_install_hooks_files('agy', d))} file(s) → {d}")
+            _step("hooks.json", lambda: _update_agy_hooks_json(agy_config / "hooks.json", hooks_dir))
+            _step("instructions", lambda p=md_path: _inject_instructions(p))
+
 
 def _install_hooks(args: list[str]) -> None:
     """Install HGP hook files into .claude/hooks/ and/or .gemini/hooks/."""
@@ -2207,9 +2278,9 @@ def _installed_policy_hooks(project_root: Path) -> list[Path]:
             except (OSError, UnicodeError, RuntimeError):
                 continue  # stale/pruned worktree registration
     return [
-        base / client / "hooks" / "pre_tool_use_hgp.py"
+        hooks_dir / "pre_tool_use_hgp.py"
         for base in sorted(roots)
-        for client in _HOOK_CLIENT_DIRS
+        for hooks_dir in _client_hook_dirs(base)
     ]
 
 
@@ -2957,6 +3028,7 @@ def run() -> None:
         hgp install --claude         # Claude Code only
         hgp install --gemini         # Gemini CLI only
         hgp install --codex          # Codex only
+        hgp install --agy            # Antigravity CLI only (global)
         hgp install --local          # project-local scope
         hgp install-hooks            # (deprecated) install hook files only
         hgp hook-policy              # show current hook enforcement policy

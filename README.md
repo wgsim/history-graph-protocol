@@ -105,13 +105,14 @@ If `command -v hgp` prints nothing, the package was installed in a Python enviro
 hgp install
 ```
 
-This registers HGP as an MCP server, installs hooks, and injects agent instructions — all in one step. Supports Claude Code, Gemini CLI, and Codex:
+This registers HGP as an MCP server, installs hooks, and injects agent instructions — all in one step. Supports Claude Code, Gemini CLI, Codex, and Antigravity CLI (`agy`):
 
 ```bash
-hgp install            # all supported clients (recommended)
+hgp install            # all supported clients (recommended); agy only if `agy` is on PATH
 hgp install --claude   # Claude Code only
 hgp install --gemini   # Gemini CLI only
 hgp install --codex    # Codex only
+hgp install --agy      # Antigravity CLI only (global scope only)
 hgp install --local    # project-local scope instead of global
 ```
 
@@ -134,8 +135,9 @@ A `✗` line includes a reason (e.g. `claude CLI not found — skipping MCP regi
 | Claude Code | `~/.claude/hooks/` | `claude mcp add` (via CLI) |
 | Gemini CLI | `~/.gemini/hooks/` | `gemini mcp add` (via CLI) |
 | Codex | `~/.codex/hooks/` | `~/.codex/config.toml` |
+| Antigravity CLI (`agy`) | `~/.gemini/config/hooks/`, registered in `~/.gemini/config/hooks.json` | `agy mcp add` (via CLI) |
 
-For local scope (`--local`), paths are under `<repo_root>/.claude/`, `<repo_root>/.gemini/`, or `<repo_root>/.codex/` respectively.
+For local scope (`--local`), paths are under `<repo_root>/.claude/`, `<repo_root>/.gemini/`, or `<repo_root>/.codex/` respectively. agy is global only: with `--local` the installer prints that agy is not supported yet and skips it.
 
 **Restart your client** to load the newly registered MCP server. This requires human action — an AI agent cannot restart its own host process. After restarting, the HGP tools (`hgp_write_file`, `hgp_create_operation`, etc.) will appear in the tool list.
 
@@ -156,6 +158,12 @@ claude mcp add --scope user hgp -- python -m hgp.server
 
 ```bash
 gemini mcp add --scope user hgp python -m hgp.server
+```
+
+**Antigravity CLI (`agy`):**
+
+```bash
+agy mcp add hgp python -m hgp.server
 ```
 
 **Codex** — add to `.codex/config.toml`:
@@ -296,7 +304,14 @@ hgp hook-policy block        # block native Write/Edit/MultiEdit/write_file/repl
 
 In Claude Code, once a session has loaded or used HGP tools, the advisory policy asks you to approve each native `Write`/`Edit`/`MultiEdit` instead of only warning (the hook reads the session transcript for `mcp__hgp__*` tool use). Set `HGP_HOOK_ASK=0` in the hook's environment to keep plain warnings. A `block` policy still blocks, and the hook stays silent while HGP is paused or not enabled.
 
-The policy is stored in `.hgp/hook-policy` as JSON (`{"block_mode": true}`; other keys are preserved when the CLI updates it). Legacy plain-text files containing `block` or `advisory` are still read; unrecognised content is treated as advisory. While any installed `pre_tool_use_hgp.py` (project-local or in `~/.claude`, `~/.gemini`, `~/.codex`) predates the JSON format, `hgp hook-policy` keeps writing the plain-text format so those hooks still enforce it, and tells you to reinstall them.
+**Antigravity CLI (`agy`).** `hgp install --agy` adds a named `hgp` hook to `~/.gemini/config/hooks.json` (any other named hook there is kept) and puts `pre_tool_use_hgp.py` and `hgp_paths.py` in `~/.gemini/config/hooks/`. agy hooks answer with decisions instead of warnings, so this hook has no advisory warning: with the default advisory policy it is silent unless the ask rule applies.
+
+- Native file tools (`write_file`, `edit_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`): `deny` under the `block` policy (or `HGP_HOOK_BLOCK=1`); otherwise `ask` once the session has called an HGP MCP tool (the hook reads agy's session transcript for a `call_mcp_tool` call to the `hgp` server; `HGP_HOOK_ASK=0` disables); otherwise nothing.
+- `run_command`: a command that changes HGP's mode is always denied, even while HGP is paused; a command that looks file-mutating is denied under `block` and ignored otherwise (no ask, as in Claude Code).
+- The hook never returns `allow`, so agy's own permission checks still apply, and it fails open: any error means no output, which agy treats as "no opinion". It is silent when HGP is not enabled for the repository or while HGP is paused, and HGP's own `hgp_*` calls are never matched.
+- agy ignores the Gemini CLI hooks in `~/.gemini/hooks/` and `settings.json`; they are separate and untouched. Restart agy after installing.
+
+The policy is stored in `.hgp/hook-policy` as JSON (`{"block_mode": true}`; other keys are preserved when the CLI updates it). Legacy plain-text files containing `block` or `advisory` are still read; unrecognised content is treated as advisory. While any installed `pre_tool_use_hgp.py` (project-local or in `~/.claude`, `~/.gemini`, `~/.gemini/config/hooks`, `~/.codex`) predates the JSON format, `hgp hook-policy` keeps writing the plain-text format so those hooks still enforce it, and tells you to reinstall them.
 
 ### Enabling HGP per repository
 
