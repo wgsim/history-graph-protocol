@@ -294,6 +294,8 @@ hgp hook-policy block        # block native Write/Edit/MultiEdit/write_file/repl
 
 > If you installed hooks before this feature was added, run `hgp install` again to update them.
 
+In Claude Code, once a session has loaded or used HGP tools, the advisory policy asks you to approve each native `Write`/`Edit`/`MultiEdit` instead of only warning (the hook reads the session transcript for `mcp__hgp__*` tool use). Set `HGP_HOOK_ASK=0` in the hook's environment to keep plain warnings. A `block` policy still blocks, and the hook stays silent while HGP is paused or not enabled.
+
 The policy is stored in `.hgp/hook-policy` as JSON (`{"block_mode": true}`; other keys are preserved when the CLI updates it). Legacy plain-text files containing `block` or `advisory` are still read; unrecognised content is treated as advisory. While any installed `pre_tool_use_hgp.py` (project-local or in `~/.claude`, `~/.gemini`, `~/.codex`) predates the JSON format, `hgp hook-policy` keeps writing the plain-text format so those hooks still enforce it, and tells you to reinstall them.
 
 ### Enabling HGP per repository

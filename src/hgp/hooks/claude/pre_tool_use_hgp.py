@@ -3,6 +3,7 @@
 Exit 0 = allow the tool call (non-blocking by default).
 Print to stderr = message shown to the agent as a warning.
 Set HGP_HOOK_BLOCK=1 to make the hook reject native file tool calls.
+In a session that already used HGP tools it asks the user first (HGP_HOOK_ASK=0 disables).
 """
 import json
 import os
@@ -45,6 +46,42 @@ def _paused(start: Path) -> bool:
         return False
     mode = getattr(_hgp_paths(), "hgp_mode", None)
     return mode is not None and mode(start) in ("advisory", "off")
+
+
+def _hgp_loaded(event: object) -> bool:
+    """Return whether this session already loaded or used HGP tools.
+
+    True once the transcript shows an ``mcp__hgp__*`` tool call, or a ToolSearch
+    that loaded one. Fail-safe: a missing or unreadable transcript reads as False.
+    """
+    path = cast(dict[str, Any], event).get("transcript_path") if isinstance(event, dict) else None
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if "mcp__hgp__" not in line:
+                    continue
+                try:
+                    record: object = json.loads(line)
+                except ValueError:
+                    continue
+                message = cast(dict[str, Any], record).get("message") if isinstance(record, dict) else None
+                content = cast(dict[str, Any], message).get("content") if isinstance(message, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for block in cast(list[Any], content):
+                    if not isinstance(block, dict) or cast(dict[str, Any], block).get("type") != "tool_use":
+                        continue
+                    name = cast(dict[str, Any], block).get("name", "")
+                    if name.startswith("mcp__hgp__") or (
+                        name == "ToolSearch"
+                        and "mcp__hgp__" in json.dumps(cast(dict[str, Any], block).get("input", {}))
+                    ):
+                        return True
+    except (OSError, UnicodeError):
+        return False
+    return False
 
 
 def _event_cwd(event: object) -> Path:
@@ -124,6 +161,14 @@ def _main() -> None:
     if _resolve_block_mode(start):
         # Exit 2 = block; Claude Code reads stderr (already printed above), ignores stdout
         sys.exit(2)
+
+    # A session that uses HGP asks the user before a native write (HGP_HOOK_ASK=0 disables).
+    if os.environ.get("HGP_HOOK_ASK", "1") == "1" and _hgp_loaded(event):
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": msg,
+        }}))
 
     sys.exit(0)
 
