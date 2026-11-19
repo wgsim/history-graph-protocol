@@ -37,7 +37,12 @@ def _enabled(start: Path) -> bool:
 
 
 def _paused(start: Path) -> bool:
-    """Return whether HGP mode is advisory or off: HGP tools then do not write files."""
+    """Return whether HGP mode is advisory or off: HGP tools then do not write files.
+
+    HGP_HOOK_BLOCK=1 always wins: an agent can write .hgp/mode, not this environment.
+    """
+    if os.environ.get("HGP_HOOK_BLOCK") == "1":
+        return False
     mode = getattr(_hgp_paths(), "hgp_mode", None)
     return mode is not None and mode(start) in ("advisory", "off")
 

@@ -491,3 +491,16 @@ def test_codex_still_blocks_mode_change_when_paused(tmp_path: Path) -> None:
     event = {"tool_name": "Bash", "tool_input": {"command": "hgp " + "mode on"}, "cwd": str(repo)}
     r = _run_hook(HOOKS / "codex/pre_tool_use_hgp.py", json.dumps(event), repo)
     assert '"deny"' in r.stdout
+
+
+@pytest.mark.parametrize("script,event", PRE_TOOL_CASES)
+def test_env_block_is_not_relaxed_by_mode_file(tmp_path: Path, script: str, event: dict[str, object]) -> None:
+    # An agent can write .hgp/mode; it cannot change the hook's environment.
+    repo = git_init(tmp_path / "r")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "mode").write_text("off\n")
+    r = subprocess.run(
+        [sys.executable, str(HOOKS / script)], input=json.dumps({**event, "cwd": str(repo)}),
+        cwd=repo, capture_output=True, text=True, env={**os.environ, "HGP_HOOK_BLOCK": "1"},
+    )
+    assert _blocked(r)
