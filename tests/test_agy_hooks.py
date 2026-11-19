@@ -329,6 +329,126 @@ def test_readonly_and_other_commands_never_denied(tmp_path: Path, command: str) 
     assert _silent(_run(repo, "run_command", {"CommandLine": command}))
 
 
+# A read-only prefix must not exempt a command that chains, substitutes or redirects.
+COMPOUND_COMMANDS = [
+    "ls && cp a b", "git status; echo x > f", "ls -la | tee out.txt", "ls -la\ncp a b", "git diff $(cp a b)",
+    "grep x `rm f`", "ls -la > out.txt", "git log; rm -f a", "pwd && mv a b", "find . -exec rm {} \\;",
+    "head -1 a || touch b", "ls -la & cp a b", "git status >> log.txt", "uname -a;rm a",
+]
+
+
+@pytest.mark.parametrize("command", COMPOUND_COMMANDS)
+def test_compound_command_with_readonly_prefix_is_still_checked_for_mutation(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    args = {"CommandLine": command}
+    assert _silent(_run(repo, "run_command", args))  # advisory policy: never denied
+    _set_block(repo)
+    r = _run(repo, "run_command", args)
+    assert (r.returncode, r.stderr) == (0, "")
+    assert json.loads(r.stdout)["decision"] == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    (repo / ".hgp" / "mode").write_text("off\n")  # paused: the policy file yields, the env var does not
+    assert _silent(_run(repo, "run_command", args))
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    "ls -la", "git status", "git diff HEAD~1 -- src", "git log --oneline -5", "pwd", "grep -rn foo src",
+    "find . -name x -type f", "head -5 a.txt", "  git diff HEAD  ", "wc -l a.txt",
+])
+def test_plain_readonly_commands_stay_silent_under_block(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
+
+
+@pytest.mark.parametrize("command", ['c"p" a b', "r\\m -f a", "'mv' a b", 't""ee out.txt', "echo hi | 't'ee out.txt"])
+def test_quoting_does_not_hide_a_mutating_command(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    args = {"CommandLine": command}
+    assert _silent(_run(repo, "run_command", args))
+    _set_block(repo)
+    assert _decision(_run(repo, "run_command", args)) == "deny"
+
+
+def test_is_readonly_needs_a_prefix_and_no_control_operators() -> None:
+    from hgp.hooks.agy import pre_tool_use_hgp as agy_hook
+
+    for command in ("ls -la", "git status", "pwd", "grep -rn x .", "  git diff HEAD\n", "head -5 a.txt"):
+        assert agy_hook._is_readonly(command), command  # pyright: ignore[reportPrivateUsage]
+    for command in (*COMPOUND_COMMANDS, "ls ; pwd", "cp a b", "echo hi", "ls -la <(cp a b)"):
+        assert not agy_hook._is_readonly(command), command  # pyright: ignore[reportPrivateUsage]
+
+
+# Mode and policy are user-only. Quoting, backslashes and variable expansion must not hide the command.
+_M = "mo" + "de"  # keeps the literal command text out of this file
+MODE_CHANGE_BYPASSES = [
+    f"'hgp' {_M} off", f'"hgp" "{_M}" off', "h\"g\"p mo'd'e off", "hg\\p m\\ode on", f"hgp \\{_M} off",
+    f"/usr/local/bin/hgp {_M} off", f"uv run hgp {_M} advisory", f"HGP_X=1 hgp {_M} off", f"sh -c 'hgp {_M} off'",
+    f"H=hgp; $H {_M} off", f"M={_M}; hgp $M off", f"$(echo hgp) {_M} off", f"H=hgp && ${{H}} {_M} on",
+    f"M={_M}; ~/.venv/bin/hgp $M off",
+    "hgp hook-policy block", "hgp 'hook-policy' advisory", "hgp hook\\-policy advisory",
+    "X=hook-policy; hgp $X advisory", "hgp hook-policy", f"ls -la && hgp hook-policy block; echo {_M}",
+]
+
+
+@pytest.mark.parametrize("mode", ["on", "off"])
+@pytest.mark.parametrize("command", MODE_CHANGE_BYPASSES)
+def test_mode_and_policy_changes_are_denied_through_quoting_and_expansion(
+    tmp_path: Path, command: str, mode: str,
+) -> None:
+    repo = _repo(tmp_path)
+    (repo / ".hgp" / "mode").write_text(mode + "\n")
+    r = _run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_ASK="0")
+    assert (r.returncode, r.stderr) == (0, "")
+    out = json.loads(r.stdout)
+    assert out["decision"] == "deny"
+    assert "must be run by the user" in out["reason"]
+
+
+@pytest.mark.parametrize("command", [
+    f"grep -rn {_M} src/hgp", "cat src/hgp/hooks/hgp_paths.py", f'git commit -m "fix(hgp): paused {_M} handling"',
+    "python -m hgp.server --help", f"echo {_M}", "echo hgp", f"uv run pytest tests/test_{_M}.py -q",
+    f"git log --oneline --grep={_M} -- src/hgp", f"cat .hgp/{_M}", "ls -la .hgp/", "grep -n block .hgp/hook-policy",
+    # with `$` the words only need to appear, but a path component or file name is not the word hgp
+    f"cd $(git rev-parse --show-toplevel) && grep -rn {_M} src/hgp", f"grep -n {_M} $HOME/proj/hgp_paths.py",
+    "echo $HOME; grep -n hook-policy src/hgp/server.py",
+])
+def test_commands_that_only_mention_hgp_or_mode_are_not_denied(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}))
+
+
+# The agent can write .hgp/mode and .hgp/hook-policy itself, so a shell write to them is denied too.
+CONTROL_FILE_WRITES = [
+    f"echo off > .hgp/{_M}", 'echo \'{"block_mode": false}\' > .hgp/hook-policy', f"printf off | tee .hgp/{_M}",
+    f"sed -i s/on/off/ .hgp/{_M}", "mv /tmp/x .hgp/hook-policy", f"cp /tmp/x /repo/.hgp/{_M}",
+    f"echo advisory >> .hgp/{_M}", f'echo off > ".hgp/{_M}"', "echo off > .hgp/mo\\de", "rm .hgp/hook-policy",
+    f"ls -la && echo off > .hgp/{_M}",
+]
+
+
+@pytest.mark.parametrize("mode", ["on", "off"])
+@pytest.mark.parametrize("command", CONTROL_FILE_WRITES)
+def test_shell_writes_to_hgp_control_files_are_denied(tmp_path: Path, command: str, mode: str) -> None:
+    repo = _repo(tmp_path)
+    (repo / ".hgp" / "mode").write_text(mode + "\n")
+    # whatever the policy: no block policy, ask disabled, paused (mode off) or not
+    r = _run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_ASK="0")
+    assert (r.returncode, r.stderr) == (0, "")
+    out = json.loads(r.stdout)
+    assert out["decision"] == "deny"
+    assert ".hgp/mode" in out["reason"]
+    assert "hook-policy" in out["reason"]
+
+
+def test_control_file_write_check_needs_an_enabled_repo(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / ".hgp").rmdir()
+    assert _silent(_run(repo, "run_command", {"CommandLine": f"echo off > .hgp/{_M}"}))
+
+
 @pytest.mark.parametrize("mode", ["advisory", "off"])
 def test_mutating_command_not_denied_while_paused_unless_env_block(tmp_path: Path, mode: str) -> None:
     repo = _repo(tmp_path)
@@ -439,7 +559,9 @@ def test_never_emits_allow_across_scenarios(tmp_path: Path) -> None:
         else:
             (repo / ".hgp" / "mode").write_text(setup + "\n")
         for tool, args in [*((n, a) for n, (a, _) in FILE_TOOLS.items()), ("run_command", {"CommandLine": "cp a b"}),
-                           ("run_command", {"CommandLine": MODE_CMD}), ("run_command", {"CommandLine": "ls"})]:
+                           ("run_command", {"CommandLine": MODE_CMD}), ("run_command", {"CommandLine": "ls"}),
+                           ("run_command", {"CommandLine": "ls && cp a b"}),
+                           ("run_command", {"CommandLine": CONTROL_FILE_WRITES[0]})]:
             for transcript in transcripts.values():
                 for env in ({}, {"HGP_HOOK_BLOCK": "1"}, {"HGP_HOOK_ASK": "0"}, {"HGP_GLOBAL_MODE": "1"}):
                     r = _run(repo, tool, args, transcript, **env)

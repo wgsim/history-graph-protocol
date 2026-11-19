@@ -12,12 +12,17 @@ tool call that agy would otherwise have gated behind its own permission check.
     multi_replace_file_content, edit_file): deny under the block policy
     (HGP_HOOK_BLOCK=1 or ``hgp hook-policy block``); otherwise ask once the session has
     already used HGP (HGP_HOOK_ASK=0 disables); otherwise stay silent.
-  * run_command: deny a command that changes HGP's mode (that control is user-only, even
-    while HGP is paused); deny a command that looks file-mutating under the block policy;
-    otherwise stay silent.
+  * run_command: deny a command that runs HGP's mode or hook-policy command, or that writes
+    .hgp/mode or .hgp/hook-policy (those controls are user-only, even while HGP is paused;
+    quotes and backslashes are normalised away, and with `$` or a backtick the words only need
+    to appear, but this is a heuristic, not a shell parser); deny a command that looks
+    file-mutating under the block policy; otherwise stay silent. A command is read-only only
+    with a read-only prefix and no chaining, substitution or redirection.
 
 Silent when HGP is not enabled for the repository, and while HGP mode is advisory or off
-(HGP tools then do not write files). HGP_HOOK_BLOCK=1 always wins over the mode file.
+(HGP tools then do not write files). HGP_HOOK_BLOCK=1 always wins over the mode file: the
+file-based policy yields to a paused mode (as in the other hooks), and since an agent can write
+.hgp/mode and .hgp/hook-policy, only the hook's environment is a trusted channel.
 
 The agent's own HGP calls arrive as ``call_mcp_tool`` and are never matched here.
 """
@@ -106,8 +111,19 @@ _MEDIUM_PATTERNS = [
     re.compile(r"\bawk\b.*>"),           # awk with redirect
 ]
 
-# Detect agent attempts to change HGP mode via the shell
-_HGP_MODE_PATTERN = re.compile(r"\bhgp\s+mode\b")
+# Mode and hook policy are user-only controls. These patterns run on a command with its quotes and
+# backslashes removed (_normalise), so `'hgp' "mo"de` reads like the plain command.
+_HGP_MODE_PATTERN = re.compile(r"\bhgp\s+(?:mode|hook-policy)\b")
+# Standalone words, for when substitution splits the command (`H=hgp; $H mode off`). A path
+# component such as `src/hgp` or `hgp_paths.py` is not the word, but `.../bin/hgp` is.
+_HGP_WORD = re.compile(r"(?:(?<![\w./-])|(?<=/bin/))hgp(?![\w./-])")
+_CONTROL_WORD = re.compile(r"(?<![\w./-])(?:mode|hook-policy)(?![\w./-])")
+# The files behind those controls: the agent can write them, so the shell must not.
+_HGP_CONTROL_FILE = re.compile(r"\.hgp/(?:mode|hook-policy)\b")
+
+# A command containing one of these chains, substitutes or redirects: never read-only.
+_CONTROL_OPERATORS = (";", "&", "|", "\n", "\r", "$(", "`", ">", "<(")
+_QUOTES_AND_BACKSLASHES = str.maketrans("", "", "'\"\\")
 
 
 def _hgp_paths() -> Any:
@@ -246,8 +262,19 @@ def _resolve_block_mode(start: Path) -> bool:
 
 
 def _is_readonly(command: str) -> bool:
-    stripped = command.lstrip()
+    """Read-only means a read-only prefix and nothing chained, substituted or redirected.
+
+    A prefix alone would exempt `ls && cp a b` or `git status; echo x > f`.
+    """
+    stripped = command.strip()
+    if any(op in stripped for op in _CONTROL_OPERATORS):
+        return False
     return any(stripped.startswith(p) for p in _READONLY_PREFIXES)
+
+
+def _normalise(command: str) -> str:
+    """Drop quotes and backslashes so `h"g"p mo\\de` reads like the plain command. Not a shell parser."""
+    return command.translate(_QUOTES_AND_BACKSLASHES)
 
 
 def _detect_mutating(command: str) -> str | None:
@@ -259,6 +286,23 @@ def _detect_mutating(command: str) -> str | None:
         if pat.search(command):
             return pat.pattern
     return None
+
+
+def _changes_hgp_controls(text: str) -> bool:
+    """Whether a normalised command runs HGP's mode or hook-policy command, or hides doing so.
+
+    `$` or a backtick means a variable or command substitution may be assembling the command,
+    so the words only have to appear somewhere. Without one they must be adjacent, which keeps
+    a commit message that mentions both words from being denied.
+    """
+    if _HGP_MODE_PATTERN.search(text):
+        return True
+    return ("$" in text or "`" in text) and bool(_HGP_WORD.search(text) and _CONTROL_WORD.search(text))
+
+
+def _writes_hgp_control_file(text: str) -> bool:
+    """Whether a normalised command mentions .hgp/mode or .hgp/hook-policy and writes something."""
+    return bool(_HGP_CONTROL_FILE.search(text)) and _detect_mutating(text) is not None
 
 
 def _respond(decision: str, reason: str) -> None:
@@ -290,19 +334,29 @@ def _main() -> None:
         command = args.get("CommandLine")
         if not isinstance(command, str) or not command:
             sys.exit(0)
-        # Mode control is user-only, so this runs before the paused and read-only exits:
-        # a leading read-only command must not smuggle a mode change through.
-        if _HGP_MODE_PATTERN.search(command):
+        text = _normalise(command)
+        # Mode and policy control is user-only, so these run before the paused and read-only
+        # exits: a leading read-only command must not smuggle a change through, and neither
+        # may pausing HGP first.
+        if _changes_hgp_controls(text):
             _respond(
                 "deny",
-                "[HGP] Blocked: `hgp mode` must be run by the user directly, not by the agent. "
-                "Use `!hgp mode <value>` in your terminal to change HGP mode.",
+                "[HGP] Blocked: `hgp mode` and `hgp hook-policy` must be run by the user directly, "
+                "not by the agent. Use `!hgp mode <value>` or `!hgp hook-policy <value>` in your terminal.",
+            )
+            sys.exit(0)
+        if _writes_hgp_control_file(text):
+            _respond(
+                "deny",
+                "[HGP] Blocked: `.hgp/mode` and `.hgp/hook-policy` are user-controlled settings; the agent "
+                "must not write them from the shell. Ask the user to run `!hgp mode <value>` or "
+                "`!hgp hook-policy <value>` instead.",
             )
             sys.exit(0)
         # Advising or blocking native tools is pointless while HGP tools do not write.
-        if _paused(start) or _is_readonly(command):
+        if _paused(start) or _is_readonly(text):
             sys.exit(0)
-        matched = _detect_mutating(command)
+        matched = _detect_mutating(text)
         if matched is not None and _resolve_block_mode(start):
             _respond(
                 "deny",
