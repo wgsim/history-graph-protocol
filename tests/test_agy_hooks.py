@@ -2,8 +2,10 @@
 
 The payloads mirror what agy 1.5.x sends a PreToolUse hook on stdin (camelCase JSON:
 ``toolCall.{id,name,args}``, ``cwd``, ``workspacePaths``, ``transcriptPath``). The hook
-answers with ``{"decision": "ask"|"deny", "reason": ...}`` or with empty stdout, which
-agy treats as "no opinion". It must never answer "allow": that auto-approves the call.
+answers with ``{"decision": "force_ask"|"ask"|"deny", "reason": ...}`` or with empty stdout,
+which agy treats as "no opinion". It must never answer "allow": that auto-approves the call.
+A native write in a session that used HGP gets ``force_ask`` by default (agy's plain ``ask``
+honours its always-allow cache and mode, so ``--mode accept-edits`` approved it unseen).
 """
 
 from __future__ import annotations
@@ -154,7 +156,7 @@ def test_no_output_for_write_in_session_that_never_used_hgp(
 
 @pytest.mark.parametrize("call", [HGP_CALL, HGP_CALL_ENCODED], ids=["plain", "json-encoded"])
 @pytest.mark.parametrize("name,args,equiv", FILE_TOOL_CASES)
-def test_asks_once_session_used_hgp(
+def test_force_asks_once_session_used_hgp(
     tmp_path: Path, call: dict[str, object], name: str, args: dict[str, object], equiv: str,
 ) -> None:
     repo = _repo(tmp_path)
@@ -162,7 +164,7 @@ def test_asks_once_session_used_hgp(
     assert (r.returncode, r.stderr) == (0, "")
     out = json.loads(r.stdout)
     assert set(out) == {"decision", "reason"}
-    assert out["decision"] == "ask"
+    assert out["decision"] == "force_ask"
     assert out["reason"].startswith("[HGP]")
     assert f"`{name}`" in out["reason"]
     assert f"`{equiv}`" in out["reason"]
@@ -187,7 +189,7 @@ def test_ask_survives_garbage_lines_in_transcript(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     path = _transcript(tmp_path, HGP_CALL)
     path.write_text("not json hgp\n" + path.read_text() + "\xff\xfe broken hgp line\n", errors="replace")
-    assert _decision(_run(repo, "write_file", FILE_TOOLS["write_file"][0], path)) == "ask"
+    assert _decision(_run(repo, "write_file", FILE_TOOLS["write_file"][0], path)) == "force_ask"
 
 
 def test_hgp_hook_ask_0_disables_ask(tmp_path: Path) -> None:
@@ -196,11 +198,108 @@ def test_hgp_hook_ask_0_disables_ask(tmp_path: Path) -> None:
     assert _silent(r)
 
 
+# HGP_HOOK_ASK picks the decision for a native write in a session that used HGP: unset, 1 and force
+# give force_ask (always prompts, unlike agy's ask, which honours the always-allow cache and the
+# accept-edits mode); ask gives ask; 0 gives no prompt; any other value fails toward prompting.
+ASK_VALUES = [
+    pytest.param(None, "force_ask", id="unset"), pytest.param("1", "force_ask", id="1"),
+    pytest.param("force", "force_ask", id="force"), pytest.param("ask", "ask", id="ask"),
+    pytest.param("0", None, id="0"), pytest.param("", "force_ask", id="empty"),
+    pytest.param("2", "force_ask", id="2"), pytest.param("yes", "force_ask", id="yes"),
+    pytest.param("false", "force_ask", id="false"), pytest.param("no", "force_ask", id="no"),
+    pytest.param("ASK", "force_ask", id="ASK-is-case-sensitive"), pytest.param("Force", "force_ask", id="Force"),
+    pytest.param(" 0", "force_ask", id="space-0"),
+]
+
+
+def _ask_env(value: str | None) -> dict[str, str]:
+    return {} if value is None else {"HGP_HOOK_ASK": value}
+
+
+@pytest.mark.parametrize("value,expected", ASK_VALUES)
+@pytest.mark.parametrize("name,args,equiv", FILE_TOOL_CASES)
+def test_hgp_hook_ask_value_picks_the_decision(
+    tmp_path: Path, name: str, args: dict[str, object], equiv: str, value: str | None, expected: str | None,
+) -> None:
+    repo = _repo(tmp_path)
+    r = _run(repo, name, args, _transcript(tmp_path, HGP_CALL), **_ask_env(value))
+    assert (r.returncode, r.stderr) == (0, "")
+    assert '"allow"' not in r.stdout
+    if expected is None:
+        assert r.stdout == ""
+        return
+    out = json.loads(r.stdout)
+    assert set(out) == {"decision", "reason"}
+    assert out["decision"] == expected
+    assert f"`{name}`" in out["reason"]
+    assert f"`{equiv}`" in out["reason"]
+
+
+@pytest.mark.parametrize("value,_expected", ASK_VALUES)
+def test_block_still_denies_whatever_hgp_hook_ask_says(
+    tmp_path: Path, value: str | None, _expected: str | None,
+) -> None:
+    repo = _repo(tmp_path)
+    transcript = _transcript(tmp_path, HGP_CALL)
+    args = FILE_TOOLS["write_file"][0]
+    assert _decision(_run(repo, "write_file", args, transcript, HGP_HOOK_BLOCK="1", **_ask_env(value))) == "deny"
+    _set_block(repo)
+    assert _decision(_run(repo, "write_file", args, transcript, **_ask_env(value))) == "deny"
+
+
+@pytest.mark.parametrize("value,_expected", ASK_VALUES)
+def test_no_prompt_outside_a_session_that_used_hgp_whatever_hgp_hook_ask_says(
+    tmp_path: Path, value: str | None, _expected: str | None,
+) -> None:
+    repo = _repo(tmp_path)
+    args = FILE_TOOLS["write_file"][0]
+    for calls in ((), (OTHER_SERVER,), (MENTION_ONLY,)):
+        assert _silent(_run(repo, "write_file", args, _transcript(tmp_path, *calls), **_ask_env(value)))
+    assert _silent(_run(repo, "write_file", args, **_ask_env(value)))  # no transcript at all
+    (repo / ".hgp").rmdir()  # HGP not enabled: silent even for a session that used it
+    assert _silent(_run(repo, "write_file", args, _transcript(tmp_path, HGP_CALL), **_ask_env(value)))
+
+
+@pytest.mark.parametrize("value,_expected", ASK_VALUES)
+def test_paused_hgp_stays_silent_whatever_hgp_hook_ask_says(
+    tmp_path: Path, value: str | None, _expected: str | None,
+) -> None:
+    repo = _repo(tmp_path)
+    (repo / ".hgp" / "mode").write_text("off\n")
+    r = _run(repo, "write_file", FILE_TOOLS["write_file"][0], _transcript(tmp_path, HGP_CALL), **_ask_env(value))
+    assert _silent(r)
+
+
+def test_respond_emits_force_ask_ask_and_deny_but_never_allow(capsys: pytest.CaptureFixture[str]) -> None:
+    from hgp.hooks.agy import pre_tool_use_hgp as agy_hook
+
+    for decision in ("force_ask", "ask", "deny"):
+        agy_hook._respond(decision, "why")  # pyright: ignore[reportPrivateUsage]
+        assert json.loads(capsys.readouterr().out) == {"decision": decision, "reason": "why"}
+    for decision in ("allow", "ALLOW", "", "force_allow", "bogus"):
+        agy_hook._respond(decision, "why")  # pyright: ignore[reportPrivateUsage]
+        assert capsys.readouterr().out == ""
+
+
+def test_ask_value_helper_maps_the_documented_values() -> None:
+    import os
+    from unittest import mock
+
+    from hgp.hooks.agy import pre_tool_use_hgp as agy_hook
+
+    for value, expected in [(p.values[0], p.values[1]) for p in ASK_VALUES]:
+        env = {k: v for k, v in os.environ.items() if k != "HGP_HOOK_ASK"}
+        if value is not None:
+            env["HGP_HOOK_ASK"] = value
+        with mock.patch.dict(os.environ, env, clear=True):
+            assert agy_hook._ask_decision() == expected  # pyright: ignore[reportPrivateUsage]
+
+
 def test_workspace_path_used_when_cwd_absent(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     event = _event(repo, "write_file", FILE_TOOLS["write_file"][0], _transcript(tmp_path, HGP_CALL))
     del event["cwd"]
-    assert _decision(_run_raw(json.dumps(event), tmp_path)) == "ask"
+    assert _decision(_run_raw(json.dumps(event), tmp_path)) == "force_ask"
     other = tmp_path / "other"
     other.mkdir()  # neither cwd nor workspacePaths: the hook's own cwd decides (not enabled here)
     del event["workspacePaths"]
@@ -215,7 +314,7 @@ def test_hgp_project_root_env_decides_like_the_server(tmp_path: Path) -> None:
     transcript = _transcript(tmp_path, HGP_CALL)
     event = json.dumps(_event(elsewhere, "write_file", FILE_TOOLS["write_file"][0], transcript))
     assert _silent(_run_raw(event, tmp_path))
-    assert _decision(_run_raw(event, tmp_path, HGP_PROJECT_ROOT=str(repo))) == "ask"
+    assert _decision(_run_raw(event, tmp_path, HGP_PROJECT_ROOT=str(repo))) == "force_ask"
 
 
 # ── Block policy ─────────────────────────────────────────────────────────────
@@ -799,7 +898,7 @@ def test_enforces_in_global_mode(tmp_path: Path, flags: tuple[str, ...]) -> None
     assert _decision(r) == "deny"
     r = _run(repo, "write_file", FILE_TOOLS["write_file"][0], _transcript(tmp_path, HGP_CALL),
              hook=hook, flags=flags, HGP_GLOBAL_MODE="1")
-    assert _decision(r) == "ask"
+    assert _decision(r) == "force_ask"
 
 
 def test_partial_install_reads_policy_and_gates_without_helper(tmp_path: Path) -> None:
@@ -872,8 +971,12 @@ def test_never_emits_allow_across_scenarios(tmp_path: Path) -> None:
                            ("run_command", {"CommandLine": "ls && cp a b"}),
                            ("run_command", {"CommandLine": CONTROL_FILE_WRITES[0]})]:
             for transcript in transcripts.values():
-                for env in ({}, {"HGP_HOOK_BLOCK": "1"}, {"HGP_HOOK_ASK": "0"}, {"HGP_GLOBAL_MODE": "1"}):
+                for env in (
+                    {}, {"HGP_HOOK_BLOCK": "1"}, {"HGP_HOOK_ASK": "0"}, {"HGP_HOOK_ASK": "ask"},
+                    {"HGP_HOOK_ASK": "force"}, {"HGP_HOOK_ASK": "weird"}, {"HGP_GLOBAL_MODE": "1"},
+                ):
                     r = _run(repo, tool, args, transcript, **env)
                     assert r.returncode == 0
+                    assert '"allow"' not in r.stdout
                     seen.add(_decision(r))
-    assert seen == {None, "ask", "deny"}
+    assert seen == {None, "force_ask", "ask", "deny"}
