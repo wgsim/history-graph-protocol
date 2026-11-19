@@ -3,15 +3,19 @@
 agy protocol (always exit 0; hooks.json command, run with the hooks.json directory as cwd):
   Input:  stdin JSON, camelCase: {"toolCall": {"id", "name", "args"}, "cwd", "workspacePaths",
           "transcriptPath", "hookEventName", ...}
-  Output: stdout JSON {"decision": "ask" | "deny", "reason": "..."}, or nothing ("no opinion").
+  Output: stdout JSON {"decision": "force_ask" | "ask" | "deny", "reason": "..."}, or nothing
+          ("no opinion").
 
-This hook only ever answers ask or deny. It never answers allow: that would auto-approve a
-tool call that agy would otherwise have gated behind its own permission check.
+This hook only ever answers force_ask, ask or deny. It never answers allow: that would
+auto-approve a tool call that agy would otherwise have gated behind its own permission check.
 
   * Native file tools (write_to_file, write_file, replace_file_content,
     multi_replace_file_content, edit_file): deny under the block policy
-    (HGP_HOOK_BLOCK=1 or ``hgp hook-policy block``); otherwise ask once the session has
-    already used HGP (HGP_HOOK_ASK=0 disables); otherwise stay silent.
+    (HGP_HOOK_BLOCK=1 or ``hgp hook-policy block``); otherwise prompt once the session has
+    already used HGP; otherwise stay silent. The prompt is force_ask, which always asks. agy's
+    plain ask honours its always-allow cache and its mode (accept-edits approved it unseen).
+    HGP_HOOK_ASK picks it: unset, 1 or force -> force_ask; ask -> ask; 0 -> no prompt; any
+    other value -> force_ask (an unknown value fails toward prompting).
   * run_command: deny a command that runs HGP's mode or hook-policy command, or that writes
     .hgp/mode or .hgp/hook-policy (those controls are user-only, even while HGP is paused).
     Quotes and backslashes are normalised away and nothing else is skipped, not even a commit
@@ -363,9 +367,21 @@ def _writes_hgp_control_file(text: str) -> bool:
     return any(pat.search(text) for pat in writers)
 
 
+def _ask_decision() -> str | None:
+    """Decision for a native write in a session that used HGP, from HGP_HOOK_ASK.
+
+    unset, "1" or "force" -> "force_ask"; "ask" -> "ask"; "0" -> None (no prompt); any other
+    value -> "force_ask", so a typo or an unexpected value fails toward prompting.
+    """
+    value = os.environ.get("HGP_HOOK_ASK")
+    if value == "0":
+        return None
+    return "ask" if value == "ask" else "force_ask"
+
+
 def _respond(decision: str, reason: str) -> None:
-    """Print agy's PreToolUse answer. Only ask and deny exist here: never auto-approve."""
-    if decision in ("ask", "deny"):
+    """Print agy's PreToolUse answer. Only force_ask, ask and deny exist here: never auto-approve."""
+    if decision in ("force_ask", "ask", "deny"):
         print(json.dumps({"decision": decision, "reason": reason}))
 
 
@@ -437,9 +453,9 @@ def _main() -> None:
     )
     if _resolve_block_mode(start):
         _respond("deny", msg)
-    # A session that uses HGP asks the user before a native write (HGP_HOOK_ASK=0 disables).
-    elif os.environ.get("HGP_HOOK_ASK", "1") == "1" and _hgp_loaded(event):
-        _respond("ask", msg)
+    # A session that uses HGP prompts the user before a native write (HGP_HOOK_ASK=0 disables).
+    elif (decision := _ask_decision()) is not None and _hgp_loaded(event):
+        _respond(decision, msg)
     sys.exit(0)
 
 
