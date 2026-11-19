@@ -1227,17 +1227,75 @@ def test_dot_hgp_through_a_symlink_is_denied(tmp_path: Path) -> None:
     assert _decision(_write(repo, "write_file", repo / "link" / "mode")) == "deny"
 
 
-def test_relative_targets_resolve_against_the_session_root(tmp_path: Path, world: dict[str, Path]) -> None:
-    """The root is the checkout (as the server resolves a relative file_path), not the event's cwd."""
+def test_a_relative_target_is_judged_unless_it_is_outside_from_both_bases(
+    tmp_path: Path, world: dict[str, Path],
+) -> None:
+    """The tool resolves a relative path against the agent's cwd, the server against the checkout root.
+    The hook keeps the target in scope unless BOTH resolutions leave the checkout."""
     repo = world["repo"]
     sub = repo / "sub"
     sub.mkdir()
     _set_block(repo, BLOCK_POLICY)
-    assert _decision(_write(repo, "write_file", "x.txt", event_cwd=sub)) == "deny"       # <root>/x.txt
-    assert _decision(_write(repo, "write_file", "sub/x.txt", event_cwd=sub)) == "deny"   # <root>/sub/x.txt
-    assert _silent(_write(repo, "write_file", "../x.txt", event_cwd=sub))                 # <root>/../x.txt: outside
-    assert _silent(_write(repo, "write_file", "../sibling-repo/x.txt", event_cwd=sub))
-    assert _decision(_write(repo, "write_file", "../.hgp/mode", event_cwd=sub)) == "deny"  # a .hgp segment, anywhere
+    transcript = _transcript(tmp_path, HGP_CALL)
+    for target in ("x.txt", "../x.txt", "sub/x.txt", "../sub/x.txt", "../sibling-repo/x.txt", "./y/../z.txt"):
+        # cwd=<root>/sub: `../x.txt` really writes <root>/x.txt, so it must not slip through as <root>/../x.txt
+        assert _decision(_write(repo, "write_file", target, event_cwd=sub)) == "deny", target
+        assert _decision(_write(repo, "write_file", target, transcript, event_cwd=sub)) == "deny", target
+    for target in ("../../x.txt", "../../elsewhere/x", "../../../elsewhere/x", "../../sibling-repo/x.txt"):
+        assert _silent(_write(repo, "write_file", target, transcript, event_cwd=sub)), target  # outside both ways
+    for target in ("../x.txt", "../elsewhere/x", "../sibling-repo/x.txt", "../../elsewhere/x"):
+        assert _silent(_write(repo, "write_file", target, transcript, event_cwd=repo)), target  # cwd=<root>
+    for target in ("x.txt", "sub/x.txt", "a/../b.txt"):
+        assert _decision(_write(repo, "write_file", target, event_cwd=repo)) == "deny", target
+
+
+@pytest.mark.parametrize("name", TOOL_NAMES)
+def test_every_file_tool_judges_a_relative_target_from_the_cwd_too(
+    tmp_path: Path, world: dict[str, Path], name: str,
+) -> None:
+    repo = world["repo"]
+    sub = repo / "sub"
+    sub.mkdir()
+    _set_block(repo, BLOCK_POLICY)
+    assert _decision(_write(repo, name, "../x", event_cwd=sub)) == "deny"
+    assert _decision(_write(repo, name, "x", event_cwd=sub)) == "deny"
+    assert _silent(_write(repo, name, "../../elsewhere/x", event_cwd=repo))
+
+
+def test_a_relative_target_without_a_cwd_in_the_event_uses_the_session_root(
+    tmp_path: Path, world: dict[str, Path],
+) -> None:
+    repo = world["repo"]
+    _set_block(repo, BLOCK_POLICY)
+    event = _event(repo, "write_file", _target_args("write_file", "x.txt"))
+    del event["cwd"]  # the workspace path stands in for the cwd
+    assert _decision(_run_raw(json.dumps(event), tmp_path)) == "deny"
+    event["toolCall"]["args"] = _target_args("write_file", "../x.txt")  # type: ignore[index]
+    assert _silent(_run_raw(json.dumps(event), tmp_path))
+
+
+def test_a_dot_hgp_target_is_found_from_either_base(tmp_path: Path, world: dict[str, Path]) -> None:
+    repo = world["repo"]
+    sub = repo / "sub"
+    sub.mkdir()
+    for target in ("../.hgp/mode", ".hgp/mode", "../../r/.hgp/hook-policy", "../sub/../.hgp/x"):
+        assert _decision(_write(repo, "write_file", target, event_cwd=sub)) == "deny", target
+
+
+def test_a_tilde_target_is_the_home_directory(tmp_path: Path, world: dict[str, Path]) -> None:
+    repo = world["repo"]
+    home = tmp_path / "home"  # outside the checkout
+    home.mkdir()
+    _set_block(repo, BLOCK_POLICY)
+    transcript = _transcript(tmp_path, HGP_CALL)
+    for target in ("~/x", "~/notes/x.md", "~"):
+        assert _silent(_write(repo, "write_file", target, transcript, HOME=str(home))), target
+        assert _silent(_write(repo, "write_file", target, transcript, event_cwd=repo / "sub", HOME=str(home))), target
+    inside = repo / "home"  # a home inside the checkout is in scope
+    inside.mkdir()
+    assert _decision(_write(repo, "write_file", "~/x", HOME=str(inside))) == "deny"
+    assert _decision(_write(repo, "write_file", "~/.hgp/mode", HOME=str(home))) == "deny"  # a .hgp segment anywhere
+    assert _decision(_write(repo, "write_file", "~/x", HOME=str(home), HGP_GLOBAL_MODE="1")) == "deny"
 
 
 @pytest.mark.parametrize("target", [None, 7, "", ["a"], {"x": 1}, True])
@@ -1400,3 +1458,32 @@ def test_the_whole_checkout_is_in_scope_from_a_subdirectory_session(tmp_path: Pa
     assert _decision(_write(repo, name, repo / "other" / "x.txt", event_cwd=repo / "sub")) == "deny"
     assert _decision(_write(repo, name, repo / "sub" / "x.txt", event_cwd=repo / "sub")) == "deny"
     assert _silent(_write(repo, name, tmp_path / "x.txt", event_cwd=repo / "sub"))
+
+
+def test_a_relative_target_from_a_cwd_outside_the_checkout_is_still_judged(
+    tmp_path: Path, world: dict[str, Path],
+) -> None:
+    """In scope unless it is outside both ways: the root reading keeps it in scope."""
+    repo = world["repo"]
+    _set_block(repo, BLOCK_POLICY)
+    kw = {"event_cwd": world["plain"], "HGP_PROJECT_ROOT": str(repo)}
+    assert _decision(_write(repo, "write_file", "x.txt", **kw)) == "deny"  # <root>/x.txt by the root reading
+    assert _silent(_write(repo, "write_file", "../../elsewhere/x", **kw))
+
+
+def test_a_relative_write_from_a_cwd_inside_dot_hgp_is_denied(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    for target in ("mode", "hook-policy", "sub/x", "../.hgp/mode"):
+        assert _decision(_write(repo, "write_file", target, event_cwd=repo / ".hgp")) == "deny", target
+    assert _silent(_write(repo, "write_file", "../../x", event_cwd=repo / ".hgp"))  # outside both ways
+
+
+def test_the_agent_cwd_counts_even_when_hgp_project_root_is_set(tmp_path: Path, world: dict[str, Path]) -> None:
+    """HGP_PROJECT_ROOT picks the repository; the tool still resolves `..` from the event's cwd."""
+    repo = world["repo"]
+    sub = repo / "sub"
+    sub.mkdir()
+    _set_block(repo, BLOCK_POLICY)
+    kw = {"event_cwd": sub, "HGP_PROJECT_ROOT": str(repo)}
+    assert _decision(_write(repo, "write_file", "../x", **kw)) == "deny"      # really <root>/x
+    assert _silent(_write(repo, "write_file", "../../x", **kw))               # outside both ways

@@ -311,7 +311,7 @@ hgp hook-policy strict       # block native file tools and mutating shell comman
 
 The level is stored in `.hgp/hook-policy` as JSON `{"block_mode": bool, "block_shell": bool}`: advisory is `false, false`, block is `true, false`, strict is `true, true` (other keys are preserved when the CLI updates it). `HGP_HOOK_BLOCK` in the hook's environment is trusted and wins over the file: `0` means advisory, `strict` means strict, and any other value (`1`, `block`, a typo, empty) means block, so an unexpected value fails toward enforcing files. Any value other than `0` also keeps enforcing while HGP is paused; the policy file does not (see the mode note below).
 
-> **Behaviour change for agy.** `{"block_mode": true}` without `block_shell` (written before the levels), the legacy plain-text `block`, and `hgp hook-policy block` now mean files-only. Before, the agy hook also denied mutating shell commands under `block`. To keep that, run `hgp hook-policy strict` (or set `HGP_HOOK_BLOCK=strict`). Claude and Codex behave as before.
+> **Behaviour change for agy: an existing `block` policy no longer blocks agy shell mutations; use `strict`.** `{"block_mode": true}` without `block_shell` (written before the levels), the legacy plain-text `block`, and `hgp hook-policy block` now mean files-only. Before, the agy hook also denied mutating shell commands (`mkdir`, `pip install`, `git checkout`, ...) under `block`. To keep that, run `hgp hook-policy strict` (or set `HGP_HOOK_BLOCK=strict`). Claude and Codex behave as before.
 
 > If you installed hooks before the levels existed, run `hgp install` again to update them. While an installed hook predates them, `hgp hook-policy` keeps writing the plain-text format so it still enforces, writes `strict` as `block`, and tells you to reinstall.
 
@@ -325,7 +325,7 @@ The level is stored in `.hgp/hook-policy` as JSON `{"block_mode": bool, "block_s
 6. The level is `block` or `strict`: denied.
 7. The session already used HGP: ask (see below); otherwise silent (agy) or a warning (Claude).
 
-A relative target resolves against the session's checkout root, as the server resolves a relative `file_path`. A missing or non-string target falls back to the cwd-based behaviour (steps 2 and 5 to 7).
+A leading `~` in the target is the home directory (so `~/x` is outside the checkout unless home is inside it). A relative target has two readings: the tool writes it against the agent's cwd, while the server resolves it against the checkout root. The hook keeps both: the target is in scope unless it is outside the checkout both ways, and the `.hgp` check looks at every reading. So from `<root>/sub`, `../x` (really `<root>/x`) is judged, while `../../x` is not. A missing or non-string target falls back to the cwd-based behaviour (steps 2 and 5 to 7).
 
 In Claude Code, once a session has loaded or used HGP tools, the advisory policy asks you to approve each native `Write`/`Edit`/`MultiEdit` instead of only warning (the hook reads the session transcript for `mcp__hgp__*` tool use). The Claude hook has no `force_ask`, and it reads `HGP_HOOK_ASK` strictly: it asks only when the variable is unset or exactly `1`, and any other value (`0` included) keeps plain warnings. `block` and `strict` still deny, and the hook stays silent while HGP is paused or not enabled. Its Bash hook (`pre_bash`) stays non-blocking at every level.
 

@@ -17,6 +17,8 @@ Decision order, first match wins:
   5. The level is block or strict (policy file, or HGP_HOOK_BLOCK: 0 advisory, strict, any other
      value block): deny (exit 2). Claude has only file tools here, so block and strict agree.
   6. The session already used HGP: ask (HGP_HOOK_ASK=0 disables). Otherwise a warning only.
+A relative target is read against both the agent's cwd and the checkout root; it is in scope
+unless it is outside the checkout both ways (steps 1 and 3 use every reading).
 A missing or non-string target falls back to the cwd-based behaviour (steps 2 and 4 to 6).
 """
 import json
@@ -221,17 +223,28 @@ def _inside(target: Path, root: Path) -> bool:
     return resolved == base or base in resolved.parents
 
 
-def _target(event: object, root: Path) -> Path | None:
-    """The file a native tool writes, from tool_input.file_path; None when absent or not a string.
+def _targets(event: object, root: Path, cwd: Path) -> list[Path]:
+    """The file(s) a native tool may write, from tool_input.file_path; empty when absent or not a string.
 
-    A relative path resolves against ``root``, as the server resolves a relative file_path.
+    A leading `~` is the home directory. An absolute path is one target. A relative path has two
+    readings: the tool writes it against the agent's ``cwd``, the server resolves it against
+    ``root``; the hook keeps both, so `../x` from <root>/sub (really <root>/x) is not mistaken
+    for <root>/../x.
     """
     tool_input = cast(dict[str, Any], event).get("tool_input") if isinstance(event, dict) else None
     raw = cast(dict[str, Any], tool_input).get("file_path") if isinstance(tool_input, dict) else None
     if not isinstance(raw, str) or not raw:
-        return None
+        return []
     path = Path(os.path.expanduser(raw))
-    return path if path.is_absolute() else root / path
+    if path.is_absolute():
+        return [path]
+    return list(dict.fromkeys([cwd / path, root / path]))
+
+
+def _event_dir(event: dict[str, Any], start: Path) -> Path:
+    """The agent's cwd, where its tools resolve a relative path; ``start`` when the event has none."""
+    cwd = event.get("cwd")
+    return Path(cwd) if isinstance(cwd, str) and cwd and Path(cwd).is_absolute() else start
 
 
 def _main() -> None:
@@ -248,8 +261,8 @@ def _main() -> None:
         sys.exit(0)
 
     root = _session_root(start)
-    target = _target(event, root)
-    if target is not None and _in_hgp_dir(target):
+    targets = _targets(event, root, _event_dir(event, start))
+    if any(_in_hgp_dir(t) for t in targets):
         print(
             f"[HGP] Blocked: `{tool_name}` targets `.hgp/`, which is HGP-internal and user-controlled "
             "(database, mode, hook-policy). Agents must not write it, with a native tool or an HGP one; "
@@ -260,7 +273,8 @@ def _main() -> None:
     if not _enabled(start):
         sys.exit(0)
     # HGP records only files under the session's checkout; anywhere else the hook has no say.
-    if target is not None and not os.environ.get("HGP_GLOBAL_MODE") and not _inside(target, root):
+    # In scope unless every reading of the target leaves the checkout.
+    if targets and not os.environ.get("HGP_GLOBAL_MODE") and not any(_inside(t, root) for t in targets):
         sys.exit(0)
     # Advising or blocking native tools is pointless while HGP tools do not write.
     if _paused(start):

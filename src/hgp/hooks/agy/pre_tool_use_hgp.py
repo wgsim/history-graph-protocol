@@ -22,6 +22,8 @@ auto-approve a tool call that agy would otherwise have gated behind its own perm
       6. The level is block or strict (policy file, or HGP_HOOK_BLOCK: 0 advisory, strict, any
          other value block): deny.
       7. The session already used HGP: prompt. Otherwise silent.
+    A relative target is read against both the agent's cwd and the checkout root; it is in scope
+    unless it is outside the checkout both ways (steps 1, 3 and 4 use every reading).
     A missing or non-string target falls back to the cwd-based behaviour (steps 2 and 5 to 7).
     The prompt is force_ask, which always asks. agy's plain ask honours its always-allow cache
     and its mode (accept-edits approved it unseen). HGP_HOOK_ASK picks it: unset, 1 or force ->
@@ -473,22 +475,26 @@ _TARGET_KEYS = {
 }
 
 
-def _target(name: str, args: dict[str, Any], root: Path) -> Path | None:
-    """The file a native tool writes: args.Path (write_file, edit_file) or args.TargetFile (the others).
+def _targets(name: str, args: dict[str, Any], root: Path, cwd: Path) -> list[Path]:
+    """The file(s) a native tool may write: args.Path (write_file, edit_file) or args.TargetFile (the others).
 
-    The other key is read as a fallback. None when no key holds a non-empty string. A relative
-    path resolves against ``root``, as the server resolves a relative file_path.
+    The other key is read as a fallback. Empty when no key holds a non-empty string. A leading
+    `~` is the home directory. An absolute path is one target. A relative path has two readings:
+    the tool writes it against the agent's ``cwd``, the server resolves it against ``root``; the
+    hook keeps both, so `../x` from <root>/sub (really <root>/x) is not mistaken for <root>/../x.
     """
     for key in _TARGET_KEYS[name]:
         raw = args.get(key)
         if isinstance(raw, str) and raw:
             path = Path(os.path.expanduser(raw))
-            return path if path.is_absolute() else root / path
-    return None
+            if path.is_absolute():
+                return [path]
+            return list(dict.fromkeys([cwd / path, root / path]))
+    return []
 
 
-def _in_artifact_dir(target: Path, event: dict[str, Any], root: Path) -> bool:
-    """Whether ``target`` is in agy's own artifact directory (artifactDirectoryPath).
+def _in_artifact_dir(targets: list[Path], event: dict[str, Any], root: Path) -> bool:
+    """Whether every reading of the target is in agy's own artifact directory (artifactDirectoryPath).
 
     An artifact directory that contains the checkout (a misconfigured `/` or `~`) exempts nothing.
     """
@@ -496,7 +502,13 @@ def _in_artifact_dir(target: Path, event: dict[str, Any], root: Path) -> bool:
     if not isinstance(raw, str) or not raw or not Path(raw).is_absolute():
         return False
     artifacts = Path(raw)
-    return _inside(target, artifacts) and not _inside(root, artifacts)
+    return all(_inside(t, artifacts) for t in targets) and not _inside(root, artifacts)
+
+
+def _event_dir(event: dict[str, Any], start: Path) -> Path:
+    """The agent's cwd, where its tools resolve a relative path; ``start`` when the event has none."""
+    cwd = event.get("cwd")
+    return Path(cwd) if isinstance(cwd, str) and cwd and Path(cwd).is_absolute() else start
 
 
 def _main() -> None:
@@ -516,12 +528,13 @@ def _main() -> None:
     args = cast(dict[str, Any], call).get("args")
     args = cast(dict[str, Any], args) if isinstance(args, dict) else {}
 
-    root = target = None
+    root = None
+    targets: list[Path] = []
     if isinstance(name, str) and name in HGP_TOOLS:
         root = _session_root(start)
-        target = _target(name, args, root)
+        targets = _targets(name, args, root, _event_dir(event, start))
         # A write into .hgp/ is denied whatever the policy, the mode or whether HGP is enabled.
-        if target is not None and _in_hgp_dir(target):
+        if any(_in_hgp_dir(t) for t in targets):
             _respond(
                 "deny",
                 f"[HGP] Blocked: `{name}` targets `.hgp/`, which is HGP-internal and user-controlled "
@@ -574,10 +587,11 @@ def _main() -> None:
         sys.exit(0)
     # HGP records only files under the session's checkout, and agy's own artifacts are not
     # project files; anywhere else the hook has no say (global mode has no checkout limit).
-    if root is not None and target is not None:
-        if _in_artifact_dir(target, event, root):
+    if root is not None and targets:
+        if _in_artifact_dir(targets, event, root):
             sys.exit(0)
-        if not os.environ.get("HGP_GLOBAL_MODE") and not _inside(target, root):
+        # In scope unless every reading of the target leaves the checkout.
+        if not os.environ.get("HGP_GLOBAL_MODE") and not any(_inside(t, root) for t in targets):
             sys.exit(0)
     if _paused(start):
         sys.exit(0)
