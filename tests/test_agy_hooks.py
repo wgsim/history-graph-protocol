@@ -447,6 +447,12 @@ CONTROL_FILE_WRITES = [
     # redirects are found wherever they occur, not only after the first `>`
     f"echo off 2> err.log > .hgp/{_M}", f"echo a >> x.log; echo off > .hgp/{_M}", f"cat x > y 2>&1 >.hgp/{_M}",
     f"echo off >&.hgp/{_M}", f"true > a > .hgp/{_M}",
+    # in-place editors: any sed or perl next to a control path is a write, whatever its options
+    f"sed -Ei 's/.*/off/' .hgp/{_M}", f"sed -i.bak s/a/b/ .hgp/{_M}", f"sed --in-place s/a/b/ .hgp/{_M}",
+    "sed --in-place=.bak s/a/b/ .hgp/hook-policy", f"sed -ni p .hgp/{_M}", f"sed -E -i s/a/b/ .hgp/{_M}",
+    f"sed --i s/a/b/ .hgp/{_M}", f"sed s/a/b/ .hgp/{_M} -i", f"perl -pi -e 's/on/off/' .hgp/{_M}",
+    "perl -i.bak -pe s/a/b/ .hgp/hook-policy", f"perl -0pi -e x .hgp/{_M}", f"perl -ne print .hgp/{_M}",
+    f"sed -n p .hgp/{_M}", f"sed s/a/b/ .hgp/{_M} > out.txt", "/usr/bin/perl -pi -e x .hgp/hook-policy",
 ]
 
 
@@ -474,7 +480,7 @@ def test_control_file_write_check_needs_an_enabled_repo(tmp_path: Path) -> None:
 # else that mentions a control path next to a writer word is denied (see CONTROL_FILE_WRITES).
 CONTROL_FILE_READS = [
     f"grep x .hgp/{_M} > out.txt", f"head -1 .hgp/{_M} 2>/dev/null", f"diff .hgp/{_M} other.txt",
-    f"echo hi > .hgp/{_M}.bak", f"cat .hgp/{_M} .hgp/hook-policy | wc -l", f"sed s/a/b/ .hgp/{_M} > out.txt",
+    f"echo hi > .hgp/{_M}.bak", f"cat .hgp/{_M} .hgp/hook-policy | wc -l",
     f"grep -c on .hgp/{_M}", f"cat .hgp/{_M} > /tmp/copy.txt", "grep x .hgp/hook-policy 2> err.log",
     "cat .hgp/hook-policy &> out.txt", f"echo $(cat .hgp/{_M}) > out.txt", f"cat .hgp/{_M} >> log.txt 2>&1",
     f"cat .hgp/{_M}", "ls -la .hgp/", f"git log --oneline -- .hgp/{_M}",
@@ -510,6 +516,14 @@ SELF_MUTATING_READONLY = [
     "git show --output=x HEAD", "ls -la; find . -delete",
     # options that run another command, with and without a mutating word in it
     "rg --pre chmod x .", "rg --pre ./clean.sh x .", "rg --pre=./clean.sh x .", "find . -name x -exec rm {} +",
+    # git options that run a program (also through git's unambiguous abbreviations)
+    "git fetch --upload-pack='sh -c x' origin", "git fetch --upload-pack=cmd origin",
+    "git ls-remote --upload-pack=cmd origin", "git ls-remote --uploadpack=cmd origin", "git ls-remote --up=cmd origin",
+    "git ls-remote --upl=cmd origin", "git ls-remote --exec=cmd origin", "git ls-remote --exe=cmd origin",
+    "git push --receive-pack=cmd origin", "git push --rec=cmd origin", "git push --rece=cmd origin",
+    "git diff --ext-diff", "git diff --ext x", "git diff --ext-d", "git log --ext-diff -p", "git show --ext-diff HEAD",
+    "git -c core.pager=less log", "git -c core.fsmonitor=cmd status", "git -ccore.pager=x log",
+    "git -c alias.x='!cmd' x", "git --config-env=core.pager=PAGER log", "git ls-remote --upload-pack x origin",
 ]
 
 
@@ -526,6 +540,70 @@ def test_self_mutating_option_behind_a_readonly_prefix_is_denied_under_block(tmp
     (repo / ".hgp" / "mode").write_text("off\n")  # paused: the policy file yields, the env var does not
     assert _silent(_run(repo, "run_command", args))
     assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+
+
+def test_git_fetch_and_remote_are_not_readonly_prefixes() -> None:
+    from hgp.hooks.agy import pre_tool_use_hgp as agy_hook
+
+    for command in (
+        "git fetch origin", "git fetch --upload-pack=cmd origin", "git remote -v", "git remote show origin",
+    ):
+        assert not agy_hook._is_readonly(command), command  # pyright: ignore[reportPrivateUsage]
+    for command in ("git log", "git show HEAD", "git diff", "git status", "git branch", "git ls-files", "ls -la"):
+        assert agy_hook._is_readonly(command), command  # pyright: ignore[reportPrivateUsage]
+
+
+# In-place editors outside the control files: sed with any -...i cluster or --in-place, perl with -...i.
+IN_PLACE_EDITORS = [
+    "sed -i s/a/b/ src/x.py", "sed -Ei s/a/b/ f", "sed -i.bak s/a/b/ f", "sed --in-place s/a/b/ f",
+    "sed --in-place=.bak s/a/b/ f", "sed s/a/b/ -i f", "sed -ni p f", "sed -E -i s/a/b/ f", "sed --i s/a/b/ f",
+    "sed 's/a;b/c/' -i f", "perl -pi -e s/a/b/ f", "perl -i.bak -pe s/a/b/ f", "perl -0pi -e x f",
+    "perl -pi -e 's/a/b/' f", "/usr/bin/perl -pi -e x f", "perl -Mstrict -pi -e x f",
+]
+
+
+@pytest.mark.parametrize("command", IN_PLACE_EDITORS)
+def test_in_place_editors_are_denied_under_block(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    args = {"CommandLine": command}
+    assert _silent(_run(repo, "run_command", args))  # advisory policy: never denied
+    _set_block(repo)
+    assert _decision(_run(repo, "run_command", args)) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    (repo / ".hgp" / "mode").write_text("off\n")  # paused: the policy file yields, the env var does not
+    assert _silent(_run(repo, "run_command", args))
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    "sed -n p f", "sed s/a/b/ f", "sed -e s/a/b/ f", "sed -E s/a/b/ f", "sed -s p f", "sed --expression=s/a/b/ f",
+    "cat f | sed s/a/b/ | grep -i x", "sed s/a/b/ f | sort -u", "perl -ne print f", "perl -Mstrict -e 1",
+    "perl -Ilib x.pl",
+    "perl -MData::Dumper -e 1", "perl -wle print", "perl -mwarnings -e 1", "perl -ne print f | grep -i x",
+    "perl -wle print | grep -in y", "perl -e 1 && ls -i", "sed -n p f | grep -i x", "sed -n p f && ls -i",
+    # read-only commands: sed and perl in their arguments are text
+    "grep -n 'sed -i' src", "grep -n 'sed -Ei' src", "rg 'perl -pi' src", "grep -rn in-place src", "git log --grep=sed",
+])
+def test_non_inplace_sed_and_perl_are_not_denied_under_block(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
+
+
+@pytest.mark.parametrize("command", [
+    "git log", "git show HEAD", "git diff", "git diff HEAD~1 -- src", "git status",
+    "git log --extended-regexp --grep=x",
+    "git log -E --grep=x", "git ls-files --exclude-standard", "git ls-files --recurse-submodules", "git log -c --stat",
+    "git diff -c", "git status --untracked-files=no", "git log --pretty=format:%h -5", "git fetch origin",
+    "git remote -v", "git remote show origin", "git ls-remote origin", "git diff --exit-code", "git log --exclude=x",
+    "git fetch --update-head-ok origin",
+])
+def test_plain_git_reads_are_not_denied_under_block(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
 
 
 # A read-only command only runs the option-based checks: a mutating word in its arguments is text.

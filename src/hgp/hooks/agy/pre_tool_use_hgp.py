@@ -58,8 +58,6 @@ _READONLY_PREFIXES = (
     "git show",
     "git branch",
     "git tag",
-    "git remote",
-    "git fetch",
     "git ls",
     "git stash list",
     "ls ",
@@ -117,9 +115,16 @@ _REDIRECT_PATTERNS = [
 ]
 
 _MEDIUM_PATTERNS = [
-    re.compile(r"\bsed\s+-i\b"),
+    # In-place editors: sed with any option cluster holding `i` (-i, -Ei, -i.bak) or --in-place
+    # (and its abbreviations); perl with such a cluster (-pi, -i.bak), but not -Mmodule or -Ilib.
+    # The scan stops at a pipe, `&` or newline, so `sed ... | grep -i x` is not a hit.
+    re.compile(r"\bsed\b[^|&\n]*\s(?:-[A-Za-z]*i|--i[a-z-]*)"),
+    re.compile(r"\bperl\b[^|&\n]*\s-(?![MmI])[A-Za-z0-9]*i"),
     re.compile(r"\bdd\b"),
 ]
+
+# Any sed or perl next to a control path counts as a write, whatever its options (fail closed).
+_IN_PLACE_EDITOR_WORDS = re.compile(r"\b(?:sed|perl)\b")
 
 # Options that make a read-only-looking command write files or run another command. These are
 # the only patterns a read-only command (_is_readonly) is checked against: `find . -delete`,
@@ -128,6 +133,13 @@ _SELF_MUTATING_PATTERNS = [
     re.compile(r"\bfind\b.*\s-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b", re.S),
     re.compile(r"\bgit\b.*\s--output(?![\w-])", re.S),
     re.compile(r"\brg\b.*\s--pre(?![\w-])", re.S),
+    # git options that run a program: --upload-pack, --receive-pack, --exec, --ext-diff and their
+    # unambiguous abbreviations (--up, --rec, --exe, --ext), -c key=value (core.pager, alias.x=!cmd,
+    # core.fsmonitor, ...) and --config-env. --update*, --recurse-submodules and --extended-regexp
+    # are other options and not matched.
+    re.compile(
+        r"\bgit\b.*\s(?:--(?:up(?!d)|rec(?!u)|exe|ext(?!ended)|config-env)[\w-]*|-c\s*[A-Za-z][\w.-]*=)", re.S,
+    ),
 ]
 
 # Mode and hook policy are user-only controls. These patterns run on a command with its quotes and
@@ -303,10 +315,11 @@ def _detect_mutating(command: str, readonly: bool = False) -> str | None:
     """Return the first matched pattern description, or None if command looks safe.
 
     A read-only command (see _is_readonly) is checked against the self-mutating options only
-    (`find -delete`, `git --output`, `rg --pre`): its other arguments are text, so
-    `grep -rn install src` is fine. Any other command gets every pattern. `sed -i` and `dd` are
-    left to the full set: a read-only prefix reaches them only as text or through `find -exec`
-    and `rg --pre`, which are caught.
+    (`find -delete`, `git --output`, `rg --pre`, git's program-running options): its other
+    arguments are text, so `grep -rn install src` is fine. Any other command gets every pattern.
+    The in-place editors and `dd` are left to the full set: a read-only prefix reaches them only
+    as text or through `find -exec` and `rg --pre`, which are caught. `git fetch` and `git remote`
+    are not read-only prefixes: `git fetch --upload-pack=cmd` runs a program.
     """
     if readonly:
         patterns = _SELF_MUTATING_PATTERNS
@@ -336,8 +349,9 @@ def _writes_hgp_control_file(text: str) -> bool:
     """Whether a normalised command may write .hgp/mode or .hgp/hook-policy. Fails closed.
 
     A command that names a control path is denied if a redirect anywhere in it targets one, or
-    if it contains any writer word anywhere (the mutating word patterns, `sed -i`, `dd`, the
-    self-mutating options). Operands are not resolved, so `cp .hgp/mode /tmp/x` and
+    if it contains any writer word anywhere (the mutating word patterns, `dd`, the in-place
+    editors, the self-mutating options; any `sed` or `perl` counts, whatever its options).
+    Operands are not resolved, so `cp .hgp/mode /tmp/x` and
     `cat .hgp/hook-policy | tee log.txt` are denied too. Only reading it, or redirecting some
     other file with no writer word, is allowed.
     """
@@ -345,7 +359,8 @@ def _writes_hgp_control_file(text: str) -> bool:
         return False
     if any(_CONTROL_PATH.search(target) for target in _REDIRECT_TARGET.findall(text.replace(">|", ">"))):
         return True
-    return any(pat.search(text) for pat in (*_HIGH_PATTERNS, *_SELF_MUTATING_PATTERNS, *_MEDIUM_PATTERNS))
+    writers = (*_HIGH_PATTERNS, *_SELF_MUTATING_PATTERNS, *_MEDIUM_PATTERNS, _IN_PLACE_EDITOR_WORDS)
+    return any(pat.search(text) for pat in writers)
 
 
 def _respond(decision: str, reason: str) -> None:
