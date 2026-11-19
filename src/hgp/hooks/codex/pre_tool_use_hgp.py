@@ -110,10 +110,23 @@ def _enabled(start: Path) -> bool:
     check = getattr(_hgp_paths(), "hgp_enabled", None)
     if check is not None:
         return bool(check(start))
+    if os.environ.get("HGP_GLOBAL_MODE"):
+        return True  # global mode records everywhere, as in the server
     for parent in [start, *start.parents]:  # no hgp_paths: walk up to the checkout root
         if (parent / ".git").exists():
             return (parent / ".hgp").is_dir()
     return (start / ".hgp").is_dir()  # outside git only this directory's store counts
+
+
+def _paused(start: Path) -> bool:
+    """Return whether HGP mode is advisory or off: HGP tools then do not write files.
+
+    HGP_HOOK_BLOCK=1 always wins: an agent can write .hgp/mode, not this environment.
+    """
+    if os.environ.get("HGP_HOOK_BLOCK") == "1":
+        return False
+    mode = getattr(_hgp_paths(), "hgp_mode", None)
+    return mode is not None and mode(start) in ("advisory", "off")
 
 
 def _event_cwd(event: object) -> Path:
@@ -210,6 +223,9 @@ def _main() -> None:
         }))
         sys.exit(0)
 
+    # Advising or blocking native tools is pointless while HGP tools do not write.
+    if _paused(start):
+        sys.exit(0)
     matched = _detect_mutating(command)
     if matched is None:
         sys.exit(0)

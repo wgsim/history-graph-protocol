@@ -165,17 +165,44 @@ def hgp_enabled(start: Path) -> bool:
 
     Enabled when its storage ``.hgp/`` exists, or when the checkout itself has a
     legacy ``.hgp/`` (a linked worktree's store from before storage was shared),
-    so upgrading never silently drops a worktree's policy. Outside git only
+    so upgrading never silently drops a worktree's policy. Always enabled in
+    global mode (``HGP_GLOBAL_MODE``), as in the server. Outside git only
     ``start/.hgp`` counts, matching the server's cwd-local store: an ancestor's
     ``.hgp`` (such as ``~/.hgp``) belongs to another directory. Like the
     server, ``HGP_PROJECT_ROOT`` (when it names a directory) replaces ``start``
     as the project root, with no walk up.
     """
+    if os.environ.get("HGP_GLOBAL_MODE"):
+        return True  # the server records to ~/.hgp in every directory
+    root = _checkout_root(start)
+    if root is None:
+        return (start / ".hgp").is_dir()
+    return shared_hgp_dir(root).is_dir() or (root / ".hgp").is_dir()
+
+
+def _checkout_root(start: Path) -> Path | None:
+    """HGP_PROJECT_ROOT when it names a directory, else the enclosing checkout root."""
     env = os.environ.get("HGP_PROJECT_ROOT")
     if env and Path(env).is_dir():
-        root = Path(env).resolve()
-        return shared_hgp_dir(root).is_dir() or (root / ".hgp").is_dir()
+        return Path(env).resolve()
     for parent in [start, *start.parents]:
         if (parent / ".git").exists():
-            return shared_hgp_dir(parent).is_dir() or (parent / ".hgp").is_dir()
-    return (start / ".hgp").is_dir()
+            return parent
+    return None
+
+
+def hgp_mode(start: Path) -> str:
+    """Return the server's HGP mode for ``start``: "on", "advisory" or "off".
+
+    Read from the storage ``.hgp/mode`` like the server; global mode is always "on".
+    In "advisory" and "off" HGP tools return without writing files.
+    """
+    if os.environ.get("HGP_GLOBAL_MODE"):
+        return "on"
+    root = _checkout_root(start)
+    mode_file = (shared_hgp_dir(root) if root is not None else start / ".hgp") / "mode"
+    try:
+        value = mode_file.read_text().strip()
+    except (OSError, UnicodeError):
+        return "on"
+    return value if value in ("on", "advisory", "off") else "on"

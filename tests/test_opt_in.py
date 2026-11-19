@@ -429,3 +429,78 @@ def test_post_bash_consumes_marker_when_cwd_leaves_enabled_repo(
     r = _run_hook(HOOKS / script, json.dumps({**event, "cwd": str(other)}), other)
     assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
     assert not bash_marker.exists()
+
+
+# ── Adversarial review of main ──────────────────────────────────────────────
+
+def test_hgp_enabled_in_global_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = git_init(tmp_path / "r")  # no .hgp: the server still records to ~/.hgp
+    monkeypatch.setenv("HGP_GLOBAL_MODE", "1")
+    assert hgp_paths.hgp_enabled(repo)
+    assert hgp_paths.hgp_enabled(tmp_path)
+
+
+@pytest.mark.parametrize("flags", [(), ("-S",)], ids=["with-helper", "fallback"])
+def test_hooks_enforce_in_global_mode(tmp_path: Path, flags: tuple[str, ...]) -> None:
+    repo = git_init(tmp_path / "r")
+    hook = HOOKS / "claude/pre_tool_use_hgp.py"
+    if flags:
+        hook = tmp_path / "pre_tool_use_hgp.py"
+        hook.write_bytes((HOOKS / "claude/pre_tool_use_hgp.py").read_bytes())
+    env = {**os.environ, "HGP_GLOBAL_MODE": "1", "HGP_HOOK_BLOCK": "1"}
+    r = subprocess.run(
+        [sys.executable, *flags, str(hook)], input=json.dumps({"tool_name": "Write", "cwd": str(repo)}),
+        cwd=repo, capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 2
+    assert "Native `Write` detected" in r.stderr
+
+
+PRE_TOOL_CASES = [
+    pytest.param("claude/pre_tool_use_hgp.py", {"tool_name": "Write"}, id="claude"),
+    pytest.param("gemini/pre_tool_use_hgp.py", {"tool_name": "write_file"}, id="gemini"),
+    pytest.param("codex/pre_tool_use_hgp.py", {"tool_name": "Bash", "tool_input": _CP}, id="codex"),
+]
+
+
+def _blocked(r: subprocess.CompletedProcess[str]) -> bool:
+    return r.returncode == 2 or '"deny"' in r.stdout
+
+
+@pytest.mark.parametrize("mode", ["on", "advisory", "off"])
+@pytest.mark.parametrize("script,event", PRE_TOOL_CASES)
+def test_block_policy_yields_when_hgp_tools_will_not_write(
+    tmp_path: Path, bash_marker: Path, script: str, event: dict[str, object], mode: str,
+) -> None:
+    repo = git_init(tmp_path / "r")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "hook-policy").write_text('{"block_mode": true}')
+    (repo / ".hgp" / "mode").write_text(mode + "\n")
+    r = _run_hook(HOOKS / script, json.dumps({**event, "cwd": str(repo)}), repo)
+    # In advisory/off mode HGP tools return without writing, so blocking native
+    # tools would leave the agent no way to change files.
+    assert _blocked(r) == (mode == "on")
+    if mode != "on":
+        assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
+
+
+def test_codex_still_blocks_mode_change_when_paused(tmp_path: Path) -> None:
+    repo = git_init(tmp_path / "r")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "mode").write_text("off\n")
+    event = {"tool_name": "Bash", "tool_input": {"command": "hgp " + "mode on"}, "cwd": str(repo)}
+    r = _run_hook(HOOKS / "codex/pre_tool_use_hgp.py", json.dumps(event), repo)
+    assert '"deny"' in r.stdout
+
+
+@pytest.mark.parametrize("script,event", PRE_TOOL_CASES)
+def test_env_block_is_not_relaxed_by_mode_file(tmp_path: Path, script: str, event: dict[str, object]) -> None:
+    # An agent can write .hgp/mode; it cannot change the hook's environment.
+    repo = git_init(tmp_path / "r")
+    (repo / ".hgp").mkdir()
+    (repo / ".hgp" / "mode").write_text("off\n")
+    r = subprocess.run(
+        [sys.executable, str(HOOKS / script)], input=json.dumps({**event, "cwd": str(repo)}),
+        cwd=repo, capture_output=True, text=True, env={**os.environ, "HGP_HOOK_BLOCK": "1"},
+    )
+    assert _blocked(r)

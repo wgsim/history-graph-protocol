@@ -1071,3 +1071,28 @@ def test_worktree_never_opened_by_hgp_does_not_block_orphan_retirement(shared_db
     report = ctx_for(repo).reconciler.reconcile()
     assert report.pending_orphaned == 1
     assert db.get_operation("op-wt")["status"] == "STALE_PENDING"
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores permissions")
+def test_worktree_without_id_refuses_mutations_until_fixed(linked_worktree, monkeypatch) -> None:
+    repo, wt = linked_worktree
+    admin = repo / ".git" / "worktrees" / wt.name
+    monkeypatch.setattr(server_module, "_ctx", None)
+    monkeypatch.chdir(wt)
+    mode = admin.stat().st_mode
+    admin.chmod(0o555)
+    try:
+        refused = hgp_write_file("new.txt", "x", "a")
+        assert refused["error"] == "WORKTREE_ID_UNAVAILABLE"
+        assert str(admin) in refused["message"]
+        assert not (wt / "new.txt").exists()
+        assert hgp_create_operation(op_type="hypothesis", agent_id="a")["error"] == "WORKTREE_ID_UNAVAILABLE"
+        assert "operations" in hgp_query_operations()  # reads keep working
+    finally:
+        admin.chmod(mode)
+    # Once the registration is writable again the same server assigns an ID.
+    written = hgp_write_file("new.txt", "x", "a")
+    assert written["status"] == "COMPLETED"
+    assert {o["op_id"] for o in hgp_query_operations(scope="checkout")["operations"]} == {written["op_id"]}
+    server_module._get_context().db.close()
+    server_module._ctx = None
