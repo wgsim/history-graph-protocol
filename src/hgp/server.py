@@ -1737,6 +1737,23 @@ def _install_hooks_files(pkg: str, dest_dir: Path) -> list[str]:
     return installed
 
 
+def _without_hgp_hooks(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return hook entries with HGP's own hooks removed.
+
+    Only the ``*_hgp.py`` hooks are dropped: a user hook grouped with one in the
+    same entry (same matcher) is kept, and an entry left empty is removed.
+    """
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        hooks = entry.get("hooks", [])
+        others = [h for h in hooks if "_hgp.py" not in h.get("command", "")]
+        if len(others) == len(hooks):
+            kept.append(entry)
+        elif others:
+            kept.append({**entry, "hooks": others})
+    return kept
+
+
 def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, scope: str) -> None:
     """Merge HGP hook entries into a client settings.json file.
 
@@ -1813,10 +1830,7 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
     if client == "claude":
         for deprecated, replacement in _deprecated_event_map.items():
             if deprecated in existing_hooks:
-                cleaned = [
-                    e for e in existing_hooks[deprecated]
-                    if not any("_hgp.py" in h.get("command", "") for h in e.get("hooks", []))
-                ]
+                cleaned = _without_hgp_hooks(existing_hooks[deprecated])
                 if cleaned:
                     existing_hooks[deprecated] = cleaned
                     custom_cmds = [
@@ -1841,10 +1855,7 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
         for invalid in ("BeforeShell", "AfterShell"):
             if invalid not in existing_hooks:
                 continue
-            cleaned = [
-                e for e in existing_hooks[invalid]
-                if not any("_hgp.py" in h.get("command", "") for h in e.get("hooks", []))
-            ]
+            cleaned = _without_hgp_hooks(existing_hooks[invalid])
             if cleaned:
                 existing_hooks[invalid] = cleaned
             else:
@@ -1852,10 +1863,7 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
 
     for event, hgp_entries in hook_specs.items():
         # Preserve non-HGP entries; replace HGP entries in place.
-        non_hgp = [
-            e for e in existing_hooks.get(event, [])
-            if not any("_hgp.py" in h.get("command", "") for h in e.get("hooks", []))
-        ]
+        non_hgp = _without_hgp_hooks(existing_hooks.get(event, []))
         existing_hooks[event] = non_hgp + hgp_entries
     existing["hooks"] = existing_hooks
     settings_path.write_text(json.dumps(existing, indent=2) + "\n")

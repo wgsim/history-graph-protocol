@@ -589,3 +589,37 @@ def test_install_hooks_deprecation_warning(capsys):
     captured = capsys.readouterr()
     assert "deprecated" in captured.err.lower()
     mock_ih.assert_called_once_with(["--claude"])
+
+
+@pytest.mark.parametrize("client,event,matcher", [
+    ("claude", "PreToolUse", "Bash"),
+    ("codex", "PreToolUse", ""),
+])
+def test_update_hooks_settings_keeps_custom_hooks_sharing_an_hgp_entry(tmp_path, client, event, matcher):
+    """A user hook grouped with an HGP hook in one entry must survive reinstalling."""
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    custom = {"type": "command", "command": "python3 /home/u/.claude/hooks/block_rm.py", "onFailure": "block"}
+    stale = {"type": "command", "command": f"python3 {hooks_dir}/old_location/pre_bash_hgp.py"}
+    settings.write_text(json.dumps({"hooks": {event: [{"matcher": matcher, "hooks": [custom, stale]}]}}))
+
+    for _ in range(2):  # idempotent
+        _update_hooks_settings(client, settings, hooks_dir, "global")
+    entries = json.loads(settings.read_text())["hooks"][event]
+    commands = [h["command"] for e in entries for h in e["hooks"]]
+    assert commands.count(custom["command"]) == 1
+    assert any(e["hooks"] == [custom] and e["matcher"] == matcher for e in entries)
+    assert stale["command"] not in commands  # the HGP hook itself is still replaced
+    assert len([c for c in commands if c.endswith("_hgp.py")]) == len(set(c for c in commands if c.endswith("_hgp.py")))
+
+
+def test_update_hooks_settings_deprecated_event_keeps_custom_hook_in_shared_entry(tmp_path):
+    settings = tmp_path / "settings.json"
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    custom = {"type": "command", "command": "python3 /home/u/mine.py"}
+    hgp = {"type": "command", "command": "python3 /x/pre_bash_hgp.py"}
+    settings.write_text(json.dumps({"hooks": {"PreBash": [{"matcher": "", "hooks": [custom, hgp]}]}}))
+    _update_hooks_settings("claude", settings, hooks_dir, "global")
+    assert json.loads(settings.read_text())["hooks"]["PreBash"] == [{"matcher": "", "hooks": [custom]}]
