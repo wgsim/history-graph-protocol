@@ -72,14 +72,17 @@ _ENV_KEYS = ("HGP_HOOK_BLOCK", "HGP_HOOK_ASK", "HGP_GLOBAL_MODE", "HGP_PROJECT_R
 
 def _event(
     repo: Path, name: str, args: dict[str, object] | None, transcript: Path | None = None,
+    artifact_dir: Path | None = None, event_cwd: Path | None = None,
 ) -> dict[str, object]:
     event: dict[str, object] = {
         "hookEventName": "PreToolUse", "conversationId": "c1", "stepIdx": 4,
         "toolCall": {"id": "call_1", "name": name, "args": args if args is not None else {}},
-        "cwd": str(repo), "workspacePaths": [str(repo)],
+        "cwd": str(event_cwd or repo), "workspacePaths": [str(repo)],
     }
     if transcript is not None:
         event["transcriptPath"] = str(transcript)
+    if artifact_dir is not None:
+        event["artifactDirectoryPath"] = str(artifact_dir)
     return event
 
 
@@ -95,12 +98,14 @@ def _run_raw(
 
 def _run(
     repo: Path, name: str, args: dict[str, object] | None = None, transcript: Path | None = None,
-    hook: Path = HOOK, flags: tuple[str, ...] = (), **env: str,
+    hook: Path = HOOK, flags: tuple[str, ...] = (), artifact_dir: Path | None = None,
+    event_cwd: Path | None = None, **env: str,
 ) -> subprocess.CompletedProcess[str]:
     # agy runs hook commands with the hooks.json directory as cwd, not the agent's cwd.
     hook_cwd = repo.parent / "hooks-json-dir"
     hook_cwd.mkdir(exist_ok=True)
-    return _run_raw(json.dumps(_event(repo, name, args, transcript)), hook_cwd, hook, flags, **env)
+    event = _event(repo, name, args, transcript, artifact_dir, event_cwd)
+    return _run_raw(json.dumps(event), hook_cwd, hook, flags, **env)
 
 
 def _decision(r: subprocess.CompletedProcess[str]) -> str | None:
@@ -113,6 +118,11 @@ def _silent(r: subprocess.CompletedProcess[str]) -> bool:
 
 def _set_block(repo: Path, text: str = '{"block_mode": true}') -> None:
     (repo / ".hgp" / "hook-policy").write_text(text)
+
+
+def _set_strict(repo: Path) -> None:
+    """Strict: files and shell (block alone stops native file tools only)."""
+    _set_block(repo, '{"block_mode": true, "block_shell": true}')
 
 
 def _lone_copy(tmp_path: Path) -> Path:
@@ -140,7 +150,7 @@ def test_silent_for_run_command_when_hgp_not_enabled(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     (repo / ".hgp").rmdir()
     assert _silent(_run(repo, "run_command", {"CommandLine": MODE_CMD}))
-    assert _silent(_run(repo, "run_command", {"CommandLine": "cp a b"}, HGP_HOOK_BLOCK="1"))
+    assert _silent(_run(repo, "run_command", {"CommandLine": "cp a b"}, HGP_HOOK_BLOCK="strict"))
 
 
 # ── Native file tools: ask once the session used HGP ─────────────────────────
@@ -408,23 +418,23 @@ def test_mode_change_command_denied_without_block_and_with_ask_disabled(tmp_path
 
 
 @pytest.mark.parametrize("command", ["cp a b", "rm -f a", "echo hi > out.txt", "git checkout -- a", "sed -i s/a/b/ f"])
-def test_mutating_command_is_denied_only_under_block(tmp_path: Path, command: str) -> None:
+def test_mutating_command_is_denied_only_under_strict(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
     args = {"CommandLine": command}
     transcript = _transcript(tmp_path, HGP_CALL)
     assert _silent(_run(repo, "run_command", args, transcript))  # advisory: no ask for shell, as in Claude
-    _set_block(repo)
+    _set_strict(repo)
     r = _run(repo, "run_command", args, transcript)
     assert (r.returncode, r.stderr) == (0, "")
     assert json.loads(r.stdout)["decision"] == "deny"
     assert "hgp_" in json.loads(r.stdout)["reason"]
-    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict")) == "deny"
 
 
 @pytest.mark.parametrize("command", ["ls -la", "git status", "git diff HEAD", "pwd", "grep -rn x .", "uname -a"])
 def test_readonly_and_other_commands_never_denied(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     assert _silent(_run(repo, "run_command", {"CommandLine": command}))
 
 
@@ -441,24 +451,24 @@ def test_compound_command_with_readonly_prefix_is_still_checked_for_mutation(tmp
     repo = _repo(tmp_path)
     args = {"CommandLine": command}
     assert _silent(_run(repo, "run_command", args))  # advisory policy: never denied
-    _set_block(repo)
+    _set_strict(repo)
     r = _run(repo, "run_command", args)
     assert (r.returncode, r.stderr) == (0, "")
     assert json.loads(r.stdout)["decision"] == "deny"
-    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict")) == "deny"
     (repo / ".hgp" / "mode").write_text("off\n")  # paused: the policy file yields, the env var does not
     assert _silent(_run(repo, "run_command", args))
-    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict")) == "deny"
 
 
 @pytest.mark.parametrize("command", [
     "ls -la", "git status", "git diff HEAD~1 -- src", "git log --oneline -5", "pwd", "grep -rn foo src",
     "find . -name x -type f", "head -5 a.txt", "  git diff HEAD  ", "wc -l a.txt",
 ])
-def test_plain_readonly_commands_stay_silent_under_block(tmp_path: Path, command: str) -> None:
+def test_plain_readonly_commands_stay_silent_under_strict(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
-    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
+    _set_strict(repo)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="strict"))
 
 
 @pytest.mark.parametrize("command", ['c"p" a b', "r\\m -f a", "'mv' a b", 't""ee out.txt', "echo hi | 't'ee out.txt"])
@@ -466,7 +476,7 @@ def test_quoting_does_not_hide_a_mutating_command(tmp_path: Path, command: str) 
     repo = _repo(tmp_path)
     args = {"CommandLine": command}
     assert _silent(_run(repo, "run_command", args))
-    _set_block(repo)
+    _set_strict(repo)
     assert _decision(_run(repo, "run_command", args)) == "deny"
 
 
@@ -515,7 +525,7 @@ def test_mode_and_policy_changes_are_denied_through_quoting_and_expansion(
 ])
 def test_commands_that_only_mention_hgp_or_mode_are_not_denied(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     assert _silent(_run(repo, "run_command", {"CommandLine": command}))
 
 
@@ -598,7 +608,7 @@ def test_reading_a_control_file_or_redirecting_elsewhere_is_not_a_control_write(
 
 def test_unrelated_redirect_is_an_ordinary_mutation_not_a_control_write(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     out = json.loads(_run(repo, "run_command", {"CommandLine": f"grep x .hgp/{_M} > out.txt"}).stdout)
     assert out["decision"] == "deny"
     assert "may mutate" in out["reason"]
@@ -627,18 +637,18 @@ SELF_MUTATING_READONLY = [
 
 
 @pytest.mark.parametrize("command", SELF_MUTATING_READONLY)
-def test_self_mutating_option_behind_a_readonly_prefix_is_denied_under_block(tmp_path: Path, command: str) -> None:
+def test_self_mutating_option_behind_a_readonly_prefix_is_denied_under_strict(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
     args = {"CommandLine": command}
     assert _silent(_run(repo, "run_command", args))  # advisory policy: never denied
-    _set_block(repo)
+    _set_strict(repo)
     r = _run(repo, "run_command", args)
     assert (r.returncode, r.stderr) == (0, "")
     assert json.loads(r.stdout)["decision"] == "deny"
-    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict")) == "deny"
     (repo / ".hgp" / "mode").write_text("off\n")  # paused: the policy file yields, the env var does not
     assert _silent(_run(repo, "run_command", args))
-    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict")) == "deny"
 
 
 def test_git_fetch_and_remote_are_not_readonly_prefixes() -> None:
@@ -662,16 +672,16 @@ IN_PLACE_EDITORS = [
 
 
 @pytest.mark.parametrize("command", IN_PLACE_EDITORS)
-def test_in_place_editors_are_denied_under_block(tmp_path: Path, command: str) -> None:
+def test_in_place_editors_are_denied_under_strict(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
     args = {"CommandLine": command}
     assert _silent(_run(repo, "run_command", args))  # advisory policy: never denied
-    _set_block(repo)
+    _set_strict(repo)
     assert _decision(_run(repo, "run_command", args)) == "deny"
-    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict")) == "deny"
     (repo / ".hgp" / "mode").write_text("off\n")  # paused: the policy file yields, the env var does not
     assert _silent(_run(repo, "run_command", args))
-    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict")) == "deny"
 
 
 @pytest.mark.parametrize("command", [
@@ -683,11 +693,11 @@ def test_in_place_editors_are_denied_under_block(tmp_path: Path, command: str) -
     # read-only commands: sed and perl in their arguments are text
     "grep -n 'sed -i' src", "grep -n 'sed -Ei' src", "rg 'perl -pi' src", "grep -rn in-place src", "git log --grep=sed",
 ])
-def test_non_inplace_sed_and_perl_are_not_denied_under_block(tmp_path: Path, command: str) -> None:
+def test_non_inplace_sed_and_perl_are_not_denied_under_strict(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     assert _silent(_run(repo, "run_command", {"CommandLine": command}))
-    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="strict"))
 
 
 @pytest.mark.parametrize("command", [
@@ -698,11 +708,11 @@ def test_non_inplace_sed_and_perl_are_not_denied_under_block(tmp_path: Path, com
     "git remote -v", "git remote show origin", "git ls-remote origin", "git diff --exit-code", "git log --exclude=x",
     "git fetch --update-head-ok origin",
 ])
-def test_plain_git_reads_are_not_denied_under_block(tmp_path: Path, command: str) -> None:
+def test_plain_git_reads_are_not_denied_under_strict(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     assert _silent(_run(repo, "run_command", {"CommandLine": command}))
-    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="strict"))
 
 
 # A read-only command only runs the option-based checks: a mutating word in its arguments is text.
@@ -715,12 +725,12 @@ READONLY_COMMANDS_MENTIONING_MUTATING_WORDS = [
 
 
 @pytest.mark.parametrize("command", READONLY_COMMANDS_MENTIONING_MUTATING_WORDS)
-def test_readonly_search_mentioning_a_mutating_word_is_not_denied_under_block(tmp_path: Path, command: str) -> None:
+def test_readonly_search_mentioning_a_mutating_word_is_not_denied_under_strict(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     args = {"CommandLine": command}
     assert _silent(_run(repo, "run_command", args))
-    assert _silent(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1"))
+    assert _silent(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict"))
 
 
 @pytest.mark.parametrize("command", [
@@ -729,7 +739,7 @@ def test_readonly_search_mentioning_a_mutating_word_is_not_denied_under_block(tm
 ])
 def test_commands_that_are_not_readonly_keep_the_full_pattern_set(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     assert _decision(_run(repo, "run_command", {"CommandLine": command})) == "deny"
 
 
@@ -738,11 +748,11 @@ def test_commands_that_are_not_readonly_keep_the_full_pattern_set(tmp_path: Path
     "find . -type f -name '*.py'", "find . -name delete.txt", "find . -name exec", "git diff HEAD --stat",
     "git diff --output-indicator-new=+", "git log --oneline -5", "head -5 a.txt", "pwd", "uname -a",
 ])
-def test_plain_readonly_commands_stay_silent_under_block_after_pattern_changes(tmp_path: Path, command: str) -> None:
+def test_plain_readonly_commands_stay_silent_under_strict_after_pattern_changes(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     assert _silent(_run(repo, "run_command", {"CommandLine": command}))
-    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="strict"))
 
 
 # ── Commit messages: no text is skipped, because a regex is not a shell parser ──
@@ -782,9 +792,9 @@ def test_commit_message_mentioning_both_words_is_denied_with_a_file_hint(tmp_pat
 ])
 def test_commit_message_from_a_file_or_without_both_words_is_not_denied(tmp_path: Path, command: str) -> None:
     repo = _repo(tmp_path)
-    _set_block(repo)
+    _set_strict(repo)
     assert _silent(_run(repo, "run_command", {"CommandLine": command}))
-    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="strict"))
 
 
 # Crafted heredocs and quote mixes: whatever hides a command in a message is still seen.
@@ -861,16 +871,16 @@ def test_transcript_scan_parses_only_lines_that_could_hold_an_hgp_mcp_call(
 def test_mutating_command_not_denied_while_paused_unless_env_block(tmp_path: Path, mode: str) -> None:
     repo = _repo(tmp_path)
     (repo / ".hgp" / "mode").write_text(mode + "\n")
-    _set_block(repo)
+    _set_strict(repo)
     args = {"CommandLine": "cp a b"}
     assert _silent(_run(repo, "run_command", args))
-    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1")) == "deny"
+    assert _decision(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict")) == "deny"
 
 
 @pytest.mark.parametrize("args", [None, {}, {"CommandLine": ""}, {"CommandLine": 7}, {"Command": "cp a b"}])
 def test_run_command_without_command_line_is_ignored(tmp_path: Path, args: dict[str, object] | None) -> None:
     repo = _repo(tmp_path)
-    assert _silent(_run(repo, "run_command", args, HGP_HOOK_BLOCK="1"))
+    assert _silent(_run(repo, "run_command", args, HGP_HOOK_BLOCK="strict"))
 
 
 # ── Tools the hook must leave alone ──────────────────────────────────────────
@@ -972,7 +982,8 @@ def test_never_emits_allow_across_scenarios(tmp_path: Path) -> None:
                            ("run_command", {"CommandLine": CONTROL_FILE_WRITES[0]})]:
             for transcript in transcripts.values():
                 for env in (
-                    {}, {"HGP_HOOK_BLOCK": "1"}, {"HGP_HOOK_ASK": "0"}, {"HGP_HOOK_ASK": "ask"},
+                    {}, {"HGP_HOOK_BLOCK": "1"}, {"HGP_HOOK_BLOCK": "strict"}, {"HGP_HOOK_ASK": "0"},
+                    {"HGP_HOOK_ASK": "ask"},
                     {"HGP_HOOK_ASK": "force"}, {"HGP_HOOK_ASK": "weird"}, {"HGP_GLOBAL_MODE": "1"},
                 ):
                     r = _run(repo, tool, args, transcript, **env)
@@ -980,3 +991,412 @@ def test_never_emits_allow_across_scenarios(tmp_path: Path) -> None:
                     assert '"allow"' not in r.stdout
                     seen.add(_decision(r))
     assert seen == {None, "force_ask", "ask", "deny"}
+
+
+# ── Target-path scoping, the .hgp deny and the levels ────────────────────────
+# The hook judges the file being written, not the session's cwd. agy's file tools carry an absolute
+# target: args.Path (write_file, edit_file) or args.TargetFile (write_to_file, replace_file_content,
+# multi_replace_file_content). Only a write HGP could have recorded (inside the session's checkout)
+# is asked about or blocked; agy's own artifacts and other checkouts are not; and a write into
+# .hgp/ is always denied.
+
+BLOCK_POLICY = '{"block_mode": true, "block_shell": false}'
+STRICT_POLICY = '{"block_mode": true, "block_shell": true}'
+TARGET_KEY = {
+    "write_file": "Path", "edit_file": "Path", "write_to_file": "TargetFile",
+    "replace_file_content": "TargetFile", "multi_replace_file_content": "TargetFile",
+}
+TOOL_NAMES = list(TARGET_KEY)
+
+
+def _target_args(name: str, target: object) -> dict[str, object]:
+    args = dict(FILE_TOOLS[name][0])
+    args[TARGET_KEY[name]] = str(target) if isinstance(target, Path) else target
+    return args
+
+
+def _write(
+    repo: Path, name: str, target: object, transcript: Path | None = None, **kw: object,
+) -> subprocess.CompletedProcess[str]:
+    return _run(repo, name, _target_args(name, target), transcript, **kw)
+
+
+def _commit(repo: Path) -> None:
+    for args in (["config", "user.email", "t@example.com"], ["config", "user.name", "T"]):
+        subprocess.run(["git", *args], cwd=repo, check=True)
+    (repo / "seed.txt").write_text("x")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True)
+
+
+@pytest.fixture
+def world(tmp_path: Path) -> dict[str, Path]:
+    """The session's repo plus places HGP cannot record a write to."""
+    repo = _repo(tmp_path)
+    _commit(repo)
+    brain = tmp_path / "brain" / "conv-1"  # ~/.gemini/antigravity-cli/brain/<id>
+    brain.mkdir(parents=True)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    sibling = tmp_path / "sibling-repo"
+    sibling.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=sibling, check=True)
+    (sibling / ".hgp").mkdir()  # enabled too, but another checkout
+    worktree = tmp_path / "sibling-worktree"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "wt", str(worktree)], cwd=repo, check=True)
+    return {"repo": repo, "artifact_dir": brain, "plain": plain, "sibling": sibling, "worktree": worktree}
+
+
+OUTSIDE_PLACES = ["artifact", "plain-dir", "sibling-repo", "sibling-worktree", "parent-of-repo"]
+
+
+def _outside_target(world: dict[str, Path], place: str) -> Path:
+    return {
+        "artifact": world["artifact_dir"] / "plan.md", "plain-dir": world["plain"] / "x.txt",
+        "sibling-repo": world["sibling"] / "x.txt", "sibling-worktree": world["worktree"] / "x.txt",
+        "parent-of-repo": world["repo"].parent / "x.txt",
+    }[place]
+
+
+@pytest.mark.parametrize("name", TOOL_NAMES)
+@pytest.mark.parametrize("place", OUTSIDE_PLACES)
+@pytest.mark.parametrize("setup", [
+    "block-policy", "strict-policy", "env-block", "env-strict", "hgp-session", "ask-ask",
+])
+def test_writes_outside_the_checkout_are_not_judged(
+    tmp_path: Path, world: dict[str, Path], name: str, place: str, setup: str,
+) -> None:
+    repo = world["repo"]
+    env: dict[str, str] = {"block-policy": {}, "strict-policy": {}, "env-block": {"HGP_HOOK_BLOCK": "1"},
+                           "env-strict": {"HGP_HOOK_BLOCK": "strict"}, "hgp-session": {},
+                           "ask-ask": {"HGP_HOOK_ASK": "ask"}}[setup]
+    if setup == "block-policy":
+        _set_block(repo, BLOCK_POLICY)
+    elif setup == "strict-policy":
+        _set_block(repo, STRICT_POLICY)
+    # the session used HGP in every case, so an in-scope write would be asked about
+    r = _write(repo, name, _outside_target(world, place), _transcript(tmp_path, HGP_CALL),
+               artifact_dir=world["artifact_dir"], **env)
+    assert _silent(r)
+
+
+def test_a_write_in_the_main_checkout_is_outside_a_worktree_session(
+    tmp_path: Path, world: dict[str, Path],
+) -> None:
+    repo, worktree = world["repo"], world["worktree"]
+    _set_block(repo, BLOCK_POLICY)  # the store is shared: the worktree session sees it
+    transcript = _transcript(tmp_path, HGP_CALL)
+    assert _silent(_write(worktree, "write_file", repo / "x.txt", transcript))
+    assert _decision(_write(worktree, "write_file", worktree / "x.txt", transcript)) == "deny"
+
+
+def test_an_artifact_directory_inside_the_checkout_is_exempt_but_the_rest_is_not(
+    tmp_path: Path, world: dict[str, Path],
+) -> None:
+    repo = world["repo"]
+    artifacts = repo / ".agents" / "artifacts"
+    artifacts.mkdir(parents=True)
+    _set_block(repo, BLOCK_POLICY)
+    transcript = _transcript(tmp_path, HGP_CALL)
+    assert _silent(_write(repo, "write_file", artifacts / "plan.md", transcript, artifact_dir=artifacts))
+    assert _decision(_write(repo, "write_file", repo / "src.py", transcript, artifact_dir=artifacts)) == "deny"
+    assert _silent(_write(repo, "write_file", artifacts / "sub" / "deep.md", artifact_dir=artifacts))
+
+
+def test_an_artifact_directory_that_contains_the_checkout_exempts_nothing(
+    tmp_path: Path, world: dict[str, Path],
+) -> None:
+    repo = world["repo"]
+    _set_block(repo, BLOCK_POLICY)
+    for huge in (tmp_path, repo.parent.parent, Path("/"), repo):
+        assert _decision(_write(repo, "write_file", repo / "x.py", artifact_dir=huge)) == "deny", huge
+
+
+@pytest.mark.parametrize("artifact", [None, "", 7, ["x"], "relative/dir"])
+def test_a_missing_or_odd_artifact_directory_is_ignored(
+    tmp_path: Path, world: dict[str, Path], artifact: object,
+) -> None:
+    repo = world["repo"]
+    _set_block(repo, BLOCK_POLICY)
+    event = _event(repo, "write_file", _target_args("write_file", repo / "x.py"))
+    if artifact is not None:
+        event["artifactDirectoryPath"] = artifact
+    assert _decision(_run_raw(json.dumps(event), tmp_path)) == "deny"
+
+
+@pytest.mark.parametrize("name", TOOL_NAMES)
+def test_a_write_inside_the_checkout_is_judged_as_before(tmp_path: Path, world: dict[str, Path], name: str) -> None:
+    repo = world["repo"]
+    target = repo / "src" / "x.py"
+    kw: dict[str, object] = {"artifact_dir": world["artifact_dir"]}
+    assert _silent(_write(repo, name, target, _transcript(tmp_path, OTHER_SERVER), **kw))
+    assert _decision(_write(repo, name, target, _transcript(tmp_path, HGP_CALL), **kw)) == "force_ask"
+    assert _decision(_write(repo, name, target, _transcript(tmp_path, HGP_CALL), HGP_HOOK_ASK="ask", **kw)) == "ask"
+    assert _silent(_write(repo, name, target, _transcript(tmp_path, HGP_CALL), HGP_HOOK_ASK="0", **kw))
+    _set_block(repo, BLOCK_POLICY)
+    assert _decision(_write(repo, name, target, **kw)) == "deny"
+    assert _decision(_write(repo, name, target, _transcript(tmp_path, HGP_CALL), **kw)) == "deny"
+
+
+@pytest.mark.parametrize("name", TOOL_NAMES)
+@pytest.mark.parametrize("how", [
+    "policy-block", "policy-strict", "policy-legacy-json", "policy-legacy-text", "env-1", "env-block", "env-strict",
+    "env-yes",
+])
+def test_block_and_strict_both_deny_native_file_writes(tmp_path: Path, name: str, how: str) -> None:
+    repo = _repo(tmp_path)
+    env: dict[str, str] = {}
+    if how.startswith("env-"):
+        env["HGP_HOOK_BLOCK"] = how.removeprefix("env-")
+    else:
+        _set_block(repo, {
+            "policy-block": BLOCK_POLICY, "policy-strict": STRICT_POLICY,
+            "policy-legacy-json": '{"block_mode": true}', "policy-legacy-text": "block\n",
+        }[how])
+    assert _decision(_write(repo, name, repo / "x.txt", **env)) == "deny"
+
+
+@pytest.mark.parametrize("policy", [BLOCK_POLICY, STRICT_POLICY, '{"block_mode": true}', "block"])
+def test_env_zero_is_advisory_whatever_the_file_says(tmp_path: Path, policy: str) -> None:
+    repo = _repo(tmp_path)
+    _set_block(repo, policy)
+    assert _silent(_write(repo, "write_file", repo / "x.txt", HGP_HOOK_BLOCK="0"))
+    assert _decision(_write(repo, "write_file", repo / "x.txt", _transcript(tmp_path, HGP_CALL),
+                            HGP_HOOK_BLOCK="0")) == "force_ask"
+
+
+# A write into .hgp/ is denied whatever the policy: the directory is HGP-internal and user-controlled
+# (the server rejects it too: HGP_INTERNAL_PATH).
+HGP_TARGETS = [
+    ".hgp/mode", ".hgp/hook-policy", "sub/.hgp/x", ".hgp/hgp.db", ".hgp/a/b/c", ".HGP/mode",
+    "./.hgp/mode", "sub/../.hgp/mode",
+]
+
+
+@pytest.mark.parametrize("name", TOOL_NAMES)
+@pytest.mark.parametrize("relative", HGP_TARGETS)
+@pytest.mark.parametrize("setup", [
+    "default", "paused-off", "paused-advisory", "env-zero", "ask-zero", "not-enabled", "global-mode", "hgp-session",
+])
+def test_writes_into_dot_hgp_are_always_denied(tmp_path: Path, name: str, relative: str, setup: str) -> None:
+    repo = _repo(tmp_path)
+    env: dict[str, str] = {}
+    transcript = _transcript(tmp_path, HGP_CALL) if setup == "hgp-session" else None
+    if setup in ("paused-off", "paused-advisory"):
+        (repo / ".hgp" / "mode").write_text(setup.removeprefix("paused-") + "\n")
+    elif setup == "env-zero":
+        env["HGP_HOOK_BLOCK"] = "0"
+    elif setup == "ask-zero":
+        env["HGP_HOOK_ASK"] = "0"
+    elif setup == "not-enabled":
+        (repo / ".hgp").rmdir()
+    elif setup == "global-mode":
+        env["HGP_GLOBAL_MODE"] = "1"
+    for target in (repo / relative, relative):  # absolute, then relative to the session root
+        r = _write(repo, name, target, transcript, artifact_dir=tmp_path / "brain", **env)
+        assert (r.returncode, r.stderr) == (0, "")
+        out = json.loads(r.stdout)
+        assert set(out) == {"decision", "reason"}
+        assert out["decision"] == "deny"
+        assert ".hgp" in out["reason"]
+        assert "HGP-internal" in out["reason"]
+        assert "user" in out["reason"]
+
+
+@pytest.mark.parametrize("target", ["{repo}/.hgp/mode", "{tmp}/elsewhere/.hgp/db", "{tmp}/brain/conv/.hgp/x"])
+def test_dot_hgp_is_denied_outside_the_checkout_and_inside_the_artifact_directory(
+    tmp_path: Path, target: str,
+) -> None:
+    repo = _repo(tmp_path)
+    path = Path(target.format(repo=repo, tmp=tmp_path))
+    assert _decision(_write(repo, "write_file", path, artifact_dir=tmp_path / "brain")) == "deny"
+    assert _decision(_write(repo, "write_file", path, HGP_GLOBAL_MODE="1")) == "deny"
+
+
+@pytest.mark.parametrize("relative", [".hgpx/mode", "hgp/mode", "x.hgp", "a.hgp/b", ".hgp.bak/x", "dot.hgp"])
+def test_only_an_exact_dot_hgp_segment_is_internal(tmp_path: Path, relative: str) -> None:
+    repo = _repo(tmp_path)
+    assert _silent(_write(repo, "write_file", repo / relative))  # in scope, no policy, no HGP session
+    _set_block(repo, BLOCK_POLICY)
+    assert _decision(_write(repo, "write_file", repo / relative)) == "deny"  # judged like any other file
+
+
+def test_dot_hgp_through_a_symlink_is_denied(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / "link").symlink_to(repo / ".hgp")
+    assert _decision(_write(repo, "write_file", repo / "link" / "mode")) == "deny"
+
+
+def test_relative_targets_resolve_against_the_session_root(tmp_path: Path, world: dict[str, Path]) -> None:
+    """The root is the checkout (as the server resolves a relative file_path), not the event's cwd."""
+    repo = world["repo"]
+    sub = repo / "sub"
+    sub.mkdir()
+    _set_block(repo, BLOCK_POLICY)
+    assert _decision(_write(repo, "write_file", "x.txt", event_cwd=sub)) == "deny"       # <root>/x.txt
+    assert _decision(_write(repo, "write_file", "sub/x.txt", event_cwd=sub)) == "deny"   # <root>/sub/x.txt
+    assert _silent(_write(repo, "write_file", "../x.txt", event_cwd=sub))                 # <root>/../x.txt: outside
+    assert _silent(_write(repo, "write_file", "../sibling-repo/x.txt", event_cwd=sub))
+    assert _decision(_write(repo, "write_file", "../.hgp/mode", event_cwd=sub)) == "deny"  # a .hgp segment, anywhere
+
+
+@pytest.mark.parametrize("target", [None, 7, "", ["a"], {"x": 1}, True])
+def test_a_malformed_target_keeps_the_cwd_behaviour(tmp_path: Path, target: object) -> None:
+    repo = _repo(tmp_path)
+    transcript = _transcript(tmp_path, HGP_CALL)
+    for name in TOOL_NAMES:
+        assert _decision(_write(repo, name, target, transcript)) == "force_ask"
+    _set_block(repo, BLOCK_POLICY)
+    for name in TOOL_NAMES:
+        assert _decision(_write(repo, name, target)) == "deny"
+
+
+@pytest.mark.parametrize("name", TOOL_NAMES)
+def test_a_missing_target_key_keeps_the_cwd_behaviour(tmp_path: Path, name: str) -> None:
+    repo = _repo(tmp_path)
+    transcript = _transcript(tmp_path, HGP_CALL)
+    assert _decision(_run(repo, name, {"Unrelated": "x"}, transcript)) == "force_ask"
+    assert _decision(_run(repo, name, {}, transcript)) == "force_ask"
+    assert _decision(_run(repo, name, None, transcript)) == "force_ask"
+    _set_block(repo, BLOCK_POLICY)
+    assert _decision(_run(repo, name, {})) == "deny"
+
+
+@pytest.mark.parametrize("name,other_key", [
+    ("write_file", "TargetFile"), ("edit_file", "TargetFile"), ("write_to_file", "Path"),
+    ("replace_file_content", "Path"), ("multi_replace_file_content", "Path"),
+])
+def test_either_target_key_is_read_for_every_file_tool(
+    world: dict[str, Path], name: str, other_key: str,
+) -> None:
+    repo = world["repo"]
+    _set_block(repo, BLOCK_POLICY)
+    outside = {other_key: str(world["plain"] / "x.txt")}
+    assert _silent(_run(repo, name, outside))
+    assert _decision(_run(repo, name, {other_key: str(repo / ".hgp" / "mode")})) == "deny"
+
+
+def test_global_mode_has_no_checkout_restriction(tmp_path: Path, world: dict[str, Path]) -> None:
+    repo = world["repo"]
+    outside = world["plain"] / "x.txt"
+    transcript = _transcript(tmp_path, HGP_CALL)
+    assert _decision(_write(repo, "write_file", outside, transcript, HGP_GLOBAL_MODE="1")) == "force_ask"
+    assert _decision(_write(repo, "write_file", outside, HGP_GLOBAL_MODE="1", HGP_HOOK_BLOCK="1")) == "deny"
+    (repo / ".hgp").rename(tmp_path / "gone")  # global mode needs no .hgp/ in the repo
+    assert _decision(_write(repo, "write_file", outside, HGP_GLOBAL_MODE="1", HGP_HOOK_BLOCK="strict")) == "deny"
+    assert _silent(_write(repo, "write_file", outside))  # not global, not enabled
+
+
+def test_hgp_project_root_is_the_session_root(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=other, check=True)
+    # the event's cwd is `other`, but the server's project root is `repo`
+    r = _run(other, "write_file", _target_args("write_file", repo / "x.txt"),
+             HGP_PROJECT_ROOT=str(repo), HGP_HOOK_BLOCK="1")
+    assert _decision(r) == "deny"
+    r = _run(other, "write_file", _target_args("write_file", other / "x.txt"),
+             HGP_PROJECT_ROOT=str(repo), HGP_HOOK_BLOCK="1")
+    assert _silent(r)
+
+
+@pytest.mark.parametrize("mode", ["advisory", "off"])
+def test_paused_stays_silent_for_files_in_the_checkout_unless_the_env_enforces(tmp_path: Path, mode: str) -> None:
+    repo = _repo(tmp_path)
+    (repo / ".hgp" / "mode").write_text(mode + "\n")
+    _set_strict(repo)
+    transcript = _transcript(tmp_path, HGP_CALL)
+    assert _silent(_write(repo, "write_file", repo / "x.txt", transcript))
+    assert _silent(_write(repo, "write_file", repo / "x.txt", transcript, HGP_HOOK_BLOCK="0"))
+    assert _decision(_write(repo, "write_file", repo / "x.txt", HGP_HOOK_BLOCK="strict")) == "deny"
+    assert _decision(_write(repo, "write_file", repo / "x.txt", HGP_HOOK_BLOCK="1")) == "deny"
+
+
+def test_not_enabled_stays_silent_for_ordinary_files(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / ".hgp").rmdir()
+    assert _silent(_write(repo, "write_file", repo / "x.txt", _transcript(tmp_path, HGP_CALL), HGP_HOOK_BLOCK="strict"))
+
+
+# ── run_command: only strict denies a mutating shell command ─────────────────
+
+MUTATING_SHELL = [
+    "cp a b", "rm -f a", "mkdir x", "echo hi > out.txt", "git checkout -- a", "pip install foo", "sed -i s/a/b/ f",
+]
+
+
+@pytest.mark.parametrize("command", MUTATING_SHELL)
+@pytest.mark.parametrize("how", [
+    "policy-block", "policy-legacy-json", "policy-legacy-text", "env-1", "env-block", "env-yes",
+])
+def test_block_leaves_the_shell_alone(tmp_path: Path, command: str, how: str) -> None:
+    repo = _repo(tmp_path)
+    env: dict[str, str] = {}
+    if how.startswith("env-"):
+        env["HGP_HOOK_BLOCK"] = how.removeprefix("env-")
+    else:
+        _set_block(repo, {"policy-block": BLOCK_POLICY, "policy-legacy-json": '{"block_mode": true}',
+                          "policy-legacy-text": "block\n"}[how])
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, **env))
+    # ... while the same level still stops a native file write
+    assert _decision(_write(repo, "write_file", repo / "x.txt", **env)) == "deny"
+
+
+@pytest.mark.parametrize("command", MUTATING_SHELL)
+@pytest.mark.parametrize("how", ["policy-strict", "env-strict"])
+def test_strict_denies_a_mutating_shell_command(tmp_path: Path, command: str, how: str) -> None:
+    repo = _repo(tmp_path)
+    env: dict[str, str] = {}
+    if how == "env-strict":
+        env["HGP_HOOK_BLOCK"] = "strict"
+    else:
+        _set_strict(repo)
+    out = json.loads(_run(repo, "run_command", {"CommandLine": command}, **env).stdout)
+    assert out["decision"] == "deny"
+    assert "may mutate" in out["reason"]
+    assert _decision(_write(repo, "write_file", repo / "x.txt", **env)) == "deny"  # strict includes the files
+
+
+@pytest.mark.parametrize("command", MUTATING_SHELL)
+def test_advisory_and_env_zero_leave_the_shell_alone(tmp_path: Path, command: str) -> None:
+    repo = _repo(tmp_path)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}))
+    _set_strict(repo)
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="0"))
+    assert _silent(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_BLOCK="1"))  # block: files only
+
+
+CONTROL_GUARDS = [
+    MODE_CMD, "hgp hook-policy block", f"echo off > .hgp/{_M}", "cp x .hgp/hook-policy", "python -m hgp.server " + _M,
+]
+
+
+@pytest.mark.parametrize("command", CONTROL_GUARDS)
+@pytest.mark.parametrize("level", ["advisory", "block", "strict", "env-zero", "env-1", "env-strict", "paused"])
+def test_the_control_guards_deny_under_every_level(tmp_path: Path, command: str, level: str) -> None:
+    repo = _repo(tmp_path)
+    env: dict[str, str] = {}
+    if level == "block":
+        _set_block(repo, BLOCK_POLICY)
+    elif level == "strict":
+        _set_strict(repo)
+    elif level == "paused":
+        (repo / ".hgp" / "mode").write_text("off\n")
+        _set_strict(repo)
+    elif level.startswith("env-"):
+        env["HGP_HOOK_BLOCK"] = level.removeprefix("env-")
+    out = json.loads(_run(repo, "run_command", {"CommandLine": command}, HGP_HOOK_ASK="0", **env).stdout)
+    assert out["decision"] == "deny"
+
+
+@pytest.mark.parametrize("name", TOOL_NAMES)
+def test_the_whole_checkout_is_in_scope_from_a_subdirectory_session(tmp_path: Path, name: str) -> None:
+    """The root is the checkout, not the cwd: a session in repo/sub still judges repo/other/x."""
+    repo = _repo(tmp_path)
+    (repo / "sub").mkdir()
+    (repo / "other").mkdir()
+    _set_block(repo, BLOCK_POLICY)
+    assert _decision(_write(repo, name, repo / "other" / "x.txt", event_cwd=repo / "sub")) == "deny"
+    assert _decision(_write(repo, name, repo / "sub" / "x.txt", event_cwd=repo / "sub")) == "deny"
+    assert _silent(_write(repo, name, tmp_path / "x.txt", event_cwd=repo / "sub"))
