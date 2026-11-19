@@ -9,6 +9,11 @@ Codex protocol (always exit 0):
 When a mutating pattern is detected, a marker file is written to /tmp so the
 PostToolUse hook can run 'git status' to report actual changes.
 
+Levels: block and strict both deny a mutating Bash command here. Codex's hooks see only the
+shell (file edits go through the shell or apply_patch), so the shell is the only lever it has;
+the files-only block of the other clients would leave Codex unguarded. HGP_HOOK_BLOCK works
+as elsewhere: 0 advisory, strict strict, any other value block, and it wins over the policy file.
+
 Note: Codex currently emits PreToolUse only for Bash commands. The apply_patch
 tool does not trigger this hook (Codex bug). Hook will work correctly for Bash
 once that is fixed upstream.
@@ -121,9 +126,10 @@ def _enabled(start: Path) -> bool:
 def _paused(start: Path) -> bool:
     """Return whether HGP mode is advisory or off: HGP tools then do not write files.
 
-    HGP_HOOK_BLOCK=1 always wins: an agent can write .hgp/mode, not this environment.
+    HGP_HOOK_BLOCK wins unless it is 0: an agent can write .hgp/mode, not this environment.
     """
-    if os.environ.get("HGP_HOOK_BLOCK") == "1":
+    env = os.environ.get("HGP_HOOK_BLOCK")
+    if env is not None and env != "0":
         return False
     mode = getattr(_hgp_paths(), "hgp_mode", None)
     return mode is not None and mode(start) in ("advisory", "off")
@@ -138,11 +144,46 @@ def _event_cwd(event: object) -> Path:
     return Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
 
 
-def _resolve_block_mode(start: Path) -> bool:
-    """Check HGP_HOOK_BLOCK env var, then fall back to .hgp/hook-policy file."""
+_LEVELS = ("advisory", "block", "strict")
+
+
+def _env_level() -> str | None:
+    """The level HGP_HOOK_BLOCK forces (trusted: it wins over the policy file), or None when unset.
+
+    0 -> advisory; "strict" -> strict; any other value (1, block, a typo, empty) -> block, so an
+    unexpected value fails toward enforcing.
+    """
     env = os.environ.get("HGP_HOOK_BLOCK")
-    if env is not None:
-        return env == "1"
+    if env is None:
+        return None
+    if env == "0":
+        return "advisory"
+    return "strict" if env == "strict" else "block"
+
+
+def _level_of(text: str) -> str:
+    """The level a .hgp/hook-policy text says: advisory, block or strict (unrecognised: advisory)."""
+    reader = getattr(_hgp_paths(), "hook_policy_level", None)
+    if reader is not None:
+        return reader(text) or "advisory"
+    stripped = text.strip()  # partial install without hgp_paths.py
+    if stripped.startswith("{"):
+        try:
+            data: object = json.loads(stripped)
+        except ValueError:
+            return "advisory"
+        fields = cast(dict[str, Any], data) if isinstance(data, dict) else {}
+        if fields.get("block_mode") is not True:
+            return "advisory"
+        return "strict" if fields.get("block_shell") is True else "block"
+    return "block" if stripped == "block" else "advisory"
+
+
+def _block_level(start: Path) -> str:
+    """advisory, block (native file tools) or strict (the shell too): HGP_HOOK_BLOCK, then the policy file."""
+    forced = _env_level()
+    if forced is not None:
+        return forced
     paths = _hgp_paths()
 
     def shared_hgp_dir(root: Path) -> Path:
@@ -150,27 +191,21 @@ def _resolve_block_mode(start: Path) -> bool:
             return Path(paths.shared_hgp_dir(root))
         return root / ".hgp"  # partial install without hgp_paths.py
 
-    def is_block(text: str) -> bool:
-        if paths is not None:
-            return paths.parse_hook_policy(text) is True
-        stripped = text.strip()  # partial install without hgp_paths.py
-        if stripped.startswith("{"):
-            try:
-                return json.loads(stripped).get("block_mode") is True
-            except (ValueError, AttributeError):
-                return False
-        return stripped == "block"
-
     for parent in [start, *start.parents]:
-        # Shared policy plus a checkout-local legacy one (written before storage
-        # was shared): block if either says so, so upgrading never drops enforcement.
+        # Shared policy plus a checkout-local legacy one (written before storage was shared):
+        # the stricter of the two counts, so upgrading never drops enforcement.
         candidates = dict.fromkeys([shared_hgp_dir(parent) / "hook-policy", parent / ".hgp" / "hook-policy"])
         found = [p for p in candidates if p.exists()]
         if found:
-            return any(is_block(p.read_text()) for p in found)
+            return max((_level_of(p.read_text()) for p in found), key=_LEVELS.index)
         if (parent / ".git").exists():
             break
-    return False
+    return "advisory"
+
+
+def _resolve_block_mode(start: Path) -> bool:
+    """Whether native file tools are blocked: the level is block or strict."""
+    return _block_level(start) != "advisory"
 
 
 def _is_readonly(command: str) -> bool:

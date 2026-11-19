@@ -138,6 +138,31 @@ def parse_hook_policy(text: str) -> bool | None:
     return None
 
 
+def hook_policy_level(text: str) -> str | None:
+    """Return the hook level from ``.hgp/hook-policy`` content, or None if unrecognised.
+
+    The level is "advisory", "block" (native file tools are blocked) or "strict" (the shell is
+    blocked as well). JSON ``{"block_mode": bool, "block_shell": bool}``: ``block_mode`` false is
+    advisory (``block_shell`` alone does nothing); true is strict when ``block_shell`` is true
+    and block otherwise, so a file written before the levels reads as block. Legacy plain text
+    ``block`` / ``advisory`` is still read. :func:`parse_hook_policy` keeps returning
+    ``block_mode`` for the hooks that do not know the levels.
+    """
+    import json
+
+    block = parse_hook_policy(text)
+    if block is None:
+        return None
+    if not block:
+        return "advisory"
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        data: object = json.loads(stripped)  # parse_hook_policy accepted it, so it is a JSON object
+        if isinstance(data, dict) and cast(dict[str, Any], data).get("block_shell") is True:
+            return "strict"
+    return "block"
+
+
 def shared_hgp_dir(root: Path) -> Path:
     """Return the ``.hgp`` directory HGP uses for a checkout rooted at ``root``."""
     return find_storage_root(root) / ".hgp"
@@ -174,14 +199,17 @@ def hgp_enabled(start: Path) -> bool:
     """
     if os.environ.get("HGP_GLOBAL_MODE"):
         return True  # the server records to ~/.hgp in every directory
-    root = _checkout_root(start)
+    root = checkout_root(start)
     if root is None:
         return (start / ".hgp").is_dir()
     return shared_hgp_dir(root).is_dir() or (root / ".hgp").is_dir()
 
 
-def _checkout_root(start: Path) -> Path | None:
-    """HGP_PROJECT_ROOT when it names a directory, else the enclosing checkout root."""
+def checkout_root(start: Path) -> Path | None:
+    """HGP_PROJECT_ROOT when it names a directory, else the enclosing checkout root (None outside git).
+
+    This is the root the server treats as the project: the files HGP can record live under it.
+    """
     env = os.environ.get("HGP_PROJECT_ROOT")
     if env and Path(env).is_dir():
         return Path(env).resolve()
@@ -199,7 +227,7 @@ def hgp_mode(start: Path) -> str:
     """
     if os.environ.get("HGP_GLOBAL_MODE"):
         return "on"
-    root = _checkout_root(start)
+    root = checkout_root(start)
     mode_file = (shared_hgp_dir(root) if root is not None else start / ".hgp") / "mode"
     try:
         value = mode_file.read_text().strip()

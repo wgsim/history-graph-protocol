@@ -26,7 +26,7 @@ from hgp.errors import (
     BlobWriteError,
     PayloadTooLargeError,
 )
-from hgp.hooks.hgp_paths import find_linked_worktree_gitdir
+from hgp.hooks.hgp_paths import find_linked_worktree_gitdir, hook_policy_level
 from hgp.lease import LeaseManager
 from hgp.models import EvidenceRef
 from hgp.project import (
@@ -38,7 +38,6 @@ from hgp.project import (
     ensure_worktree_id,
     find_project_root,
     find_storage_root,
-    parse_hook_policy,
 )
 from hgp.reconciler import Reconciler
 
@@ -2253,15 +2252,23 @@ def _install_hooks(args: list[str]) -> None:
         print("No hooks installed.", file=sys.stderr)
 
 
-_VALID_HOOK_POLICIES = {"advisory", "block"}
+_VALID_HOOK_POLICIES = {"advisory", "block", "strict"}
 
 _HOOK_POLICY_USAGE = (
-    "usage: hgp hook-policy [advisory|block]\n"
+    "usage: hgp hook-policy [advisory|block|strict]\n"
     "\n"
     "  (no args)   show current policy\n"
     "  advisory    warn only — native file tools allowed (default)\n"
-    "  block       block native file tools (Write/Edit/write_file/replace)\n"
+    "  block       block native file tools (Write/Edit/write_file/replace); shell work is left alone\n"
+    "  strict      block native file tools and mutating shell commands (Codex: block already does)\n"
 )
+
+# Stored in .hgp/hook-policy as {"block_mode": bool, "block_shell": bool}.
+_HOOK_POLICY_FLAGS = {
+    "advisory": (False, False),
+    "block": (True, False),
+    "strict": (True, True),
+}
 
 
 def _installed_policy_hooks(project_root: Path) -> list[Path]:
@@ -2287,6 +2294,11 @@ def _installed_policy_hooks(project_root: Path) -> list[Path]:
     ]
 
 
+def _reads_json_policy(hook_source: str) -> bool:
+    """Whether an installed hook reads the JSON hook-policy format (the level reader or the old parser)."""
+    return "hook_policy_level" in hook_source or "parse_hook_policy" in hook_source
+
+
 def _hook_policy(args: list[str]) -> None:
     """Read or set the persistent hook enforcement policy."""
     import sys
@@ -2310,12 +2322,12 @@ def _hook_policy(args: list[str]) -> None:
 
     existing = policy_file.read_text() if policy_file.exists() else ""
     if not args:
-        # read current policy (JSON or legacy plain text)
-        print("block" if parse_hook_policy(existing) is True else "advisory")
+        # read current policy (JSON or legacy plain text); unrecognised content is advisory
+        print(hook_policy_level(existing) or "advisory")
         return
 
     new_policy = args[0]
-    # JSON schema {"block_mode": bool}; keep any other keys already present.
+    # JSON schema {"block_mode": bool, "block_shell": bool}; keep any other keys already present.
     data: dict[str, Any] = {}
     if existing.strip().startswith("{"):
         try:
@@ -2324,17 +2336,18 @@ def _hook_policy(args: list[str]) -> None:
             loaded = None
         if isinstance(loaded, dict):
             data = dict(cast(dict[str, Any], loaded))
-    data["block_mode"] = new_policy == "block"
+    data["block_mode"], data["block_shell"] = _HOOK_POLICY_FLAGS[new_policy]
     policy_file.parent.mkdir(parents=True, exist_ok=True)
     # Installed hooks from before the JSON format compare the file to "block" and
     # would read JSON as advisory (fail-open). While any are installed, keep the
     # legacy plain-text format, which every hook version understands.
     json_unaware = [
         p for p in _installed_policy_hooks(project_root)
-        if p.is_file() and "parse_hook_policy" not in p.read_text(errors="replace")
+        if p.is_file() and not _reads_json_policy(p.read_text(errors="replace"))
     ]
     if json_unaware:
-        policy_file.write_text(new_policy + "\n")
+        # Those hooks know only the text `block`: strict can only be written to them as block.
+        policy_file.write_text(("block" if new_policy == "strict" else new_policy) + "\n")
         print(
             "Warning: these installed hook(s) do not read the JSON hook-policy format,\n"
             "so the policy was written in the legacy plain-text format instead:\n"
@@ -2342,6 +2355,12 @@ def _hook_policy(args: list[str]) -> None:
             + "Run `hgp install` (add --local for project hooks) to update them.",
             file=sys.stderr,
         )
+        if new_policy == "strict":
+            print(
+                "Warning: `strict` was stored as `block` for those hooks, which block native file\n"
+                "tools only. `strict` needs hooks reinstalled with `hgp install`.",
+                file=sys.stderr,
+            )
     else:
         policy_file.write_text(json.dumps(data) + "\n")
     print(f"Hook policy set to: {new_policy}")
@@ -3036,7 +3055,8 @@ def run() -> None:
         hgp install-hooks            # (deprecated) install hook files only
         hgp hook-policy              # show current hook enforcement policy
         hgp hook-policy advisory     # warn only (default)
-        hgp hook-policy block        # block native file tools
+        hgp hook-policy block        # block native file tools (shell work is left alone)
+        hgp hook-policy strict       # block native file tools and mutating shell commands
         hgp hook-backups [--prune]   # list / prune hook backups left by install
         hgp backup                   # back up .hgp/ to ~/.hgp/projects/<id>/
         hgp restore                  # restore .hgp/ from local backup
