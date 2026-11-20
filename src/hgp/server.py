@@ -1576,6 +1576,10 @@ hgp_set_context(root_op_id=root["op_id"], agent_id="claude-code",
 SubagentStart hooks will then inject the root op_id into every spawned
 subagent's context automatically. Subagents should use
 `parent_op_ids=[root_op_id]` for all `hgp_*` calls.
+
+Antigravity (agy) has no SubagentStart event: use the conversation id from the
+`[HGP] This conversation's id is ...` start-of-session message as `session_id`.
+A hook then puts the root op in front of every `invoke_subagent` prompt.
 <!-- hgp-instructions-end -->"""
 
 
@@ -1876,24 +1880,32 @@ def _update_hooks_settings(client: str, settings_path: Path, hooks_dir: Path, sc
     settings_path.write_text(json.dumps(existing, indent=2) + "\n")
 
 
-_AGY_HOOK_MATCHER = "write_to_file|replace_file_content|multi_replace_file_content|write_file|edit_file|run_command"
+_AGY_HOOK_MATCHER = (
+    "write_to_file|replace_file_content|multi_replace_file_content|write_file|edit_file|run_command|invoke_subagent"
+)
 
 
 def _update_agy_hooks_json(path: Path, hooks_dir: Path) -> str:
     """Set HGP's named hook in agy's ``hooks.json``, leaving every other named hook alone.
 
     agy's ``hooks.json`` maps hook names to event configs and merges them, so only the
-    top-level ``"hgp"`` key is written (replacing a stale one in place). Returns "written",
-    "updated" or "already_current". Raises ValueError, without touching the file, when it
-    exists but is not a JSON object.
+    top-level ``"hgp"`` key is written (replacing a stale one in place): PreToolUse (file tools,
+    the shell and invoke_subagent), PostToolUse (the shell), PostInvocation and SessionStart.
+    Returns "written", "updated" or "already_current". Raises ValueError, without touching the
+    file, when it exists but is not a JSON object.
     """
     import shlex
 
-    hook = hooks_dir / "pre_tool_use_hgp.py"
-    spec: dict[str, Any] = {"PreToolUse": [{
-        "matcher": _AGY_HOOK_MATCHER,
-        "hooks": [{"type": "command", "command": f"python3 {shlex.quote(str(hook))}", "timeout": 10}],
-    }]}
+    def command(script: str, timeout: int) -> dict[str, Any]:
+        return {"type": "command", "command": f"python3 {shlex.quote(str(hooks_dir / script))}", "timeout": timeout}
+
+    # PreToolUse and PostToolUse are grouped by matcher; PostInvocation and SessionStart are flat lists.
+    spec: dict[str, Any] = {
+        "PreToolUse": [{"matcher": _AGY_HOOK_MATCHER, "hooks": [command("pre_tool_use_hgp.py", 10)]}],
+        "PostToolUse": [{"matcher": "run_command", "hooks": [command("post_tool_use_hgp.py", 15)]}],
+        "PostInvocation": [command("post_invocation_hgp.py", 10)],
+        "SessionStart": [command("session_start_hgp.py", 10)],
+    }
     existing: dict[str, Any] = {}
     existed = path.exists()
     if existed:
