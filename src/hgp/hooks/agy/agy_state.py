@@ -278,17 +278,29 @@ def is_hgp_entry(line: str) -> bool:
     return any(segment.casefold() == ".hgp" for path in paths for segment in PurePosixPath(path).parts)
 
 
+def _git_env() -> dict[str, str]:
+    """The environment for the hook's git: no inherited GIT_* variables (a stray GIT_DIR, GIT_INDEX_FILE or
+    GIT_CONFIG_COUNT would point it at another repository or inject config), no system config. Only GIT_EXEC_PATH
+    is kept, since git may need it to find its own programs."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k == "GIT_EXEC_PATH"}
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    return env
+
+
 def git_status(root: Path) -> list[str] | None:
     """``git status --porcelain -uall`` lines for the checkout at ``root``, without .hgp entries.
 
-    None when git fails or times out (the hooks then track nothing). Optional locks and the
-    fsmonitor hook are off: a hook must not touch the index or run repository-configured programs.
+    None when git fails or times out (the hooks then track nothing). ``--no-optional-locks`` and
+    ``core.fsmonitor=false`` keep it from touching the index or running the fsmonitor hook, and the
+    environment is scrubbed (_git_env). Known limit: with a stale index git may still run the
+    repository's own clean/smudge filter drivers (`.gitattributes` plus config); the hook does not
+    try to switch them off one by one, because an agent that can edit `.git/config` or
+    `.gitattributes` can already run commands (under strict it can do neither).
     """
-    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     try:
         result = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "status", "--porcelain", "-uall"],
-            cwd=root, capture_output=True, text=True, timeout=GIT_TIMEOUT, check=False, env=env,
+            ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain", "-uall"],
+            cwd=root, capture_output=True, text=True, timeout=GIT_TIMEOUT, check=False, env=_git_env(),
         )
     except (OSError, subprocess.SubprocessError, UnicodeError):
         return None

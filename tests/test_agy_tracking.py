@@ -288,6 +288,58 @@ def test_stale_state_files_are_cleaned_up_a_few_at_a_time(tmp_path: Path) -> Non
     assert fresh.exists() and unrelated.exists()
 
 
+# ── git is run with a scrubbed environment and no optional locks ─────────────
+
+def _fake_git(tmp_path: Path) -> tuple[Path, Path]:
+    """A `git` on PATH that records how it was called and reports one untracked file."""
+    bin_dir, log = tmp_path / "bin", tmp_path / "fake-git.json"
+    bin_dir.mkdir()
+    script = bin_dir / "git"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "open(os.environ['FAKE_GIT_LOG'], 'w').write(json.dumps(\n"
+        "    {'argv': sys.argv[1:], 'env': dict(os.environ), 'cwd': os.getcwd()}))\n"
+        "print('?? x')\n"
+    )
+    script.chmod(0o755)
+    return bin_dir, log
+
+
+def test_git_runs_with_no_optional_locks_and_a_scrubbed_environment(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    bin_dir, log = _fake_git(tmp_path)
+    hostile = {
+        "GIT_DIR": str(tmp_path / "elsewhere"), "GIT_WORK_TREE": str(tmp_path), "GIT_INDEX_FILE": "/nonexistent",
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": "/bin/evil",
+        "GIT_CONFIG_GLOBAL": "/nonexistent", "GIT_EXTERNAL_DIFF": "/bin/evil", "GIT_EXEC_PATH": "/opt/git-exec",
+    }
+    r = _run(PRE, _pre(repo, "cp a b"), tmp_path, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+             FAKE_GIT_LOG=str(log), **hostile)
+    assert _silent(r)
+    seen = json.loads(log.read_text())
+    assert seen["argv"][:1] == ["--no-optional-locks"]  # a global option, before the subcommand
+    assert seen["argv"][-3:] == ["status", "--porcelain", "-uall"]
+    assert "core.fsmonitor=false" in seen["argv"]
+    assert Path(seen["cwd"]).resolve() == repo
+    assert {k for k in seen["env"] if k.startswith("GIT_")} == {"GIT_EXEC_PATH", "GIT_CONFIG_NOSYSTEM"}
+    assert seen["env"]["GIT_CONFIG_NOSYSTEM"] == "1" and seen["env"]["GIT_EXEC_PATH"] == "/opt/git-exec"
+    assert json.loads(_marker(tmp_path).read_text())["baseline"] == {str(repo): ["?? x"]}  # and the output is used
+
+
+def test_post_runs_git_the_same_way(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _track(tmp_path, repo)
+    bin_dir, log = _fake_git(tmp_path)
+    r = _run(POST, _post(repo), tmp_path, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+             FAKE_GIT_LOG=str(log), GIT_DIR=str(tmp_path / "elsewhere"), GIT_CONFIG_COUNT="1")
+    assert _json(r) == {}
+    seen = json.loads(log.read_text())
+    assert seen["argv"][0] == "--no-optional-locks"
+    assert {k for k in seen["env"] if k.startswith("GIT_")} == {"GIT_CONFIG_NOSYSTEM"}
+    assert json.loads(_post_state(tmp_path).read_text())["changed"] == ["?? x"]
+
+
 # ── Post: only the new entries ───────────────────────────────────────────────
 
 def _track(tmp_path: Path, repo: Path, command: str = "cp a b", conv: str = "conv-1", step: int = 4) -> None:
