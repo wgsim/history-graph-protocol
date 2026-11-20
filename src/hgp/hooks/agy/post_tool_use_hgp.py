@@ -11,7 +11,6 @@ decides anything, and any error means "nothing tracked".
 """
 import json
 import sys
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -45,19 +44,7 @@ def _track() -> None:
     data = agy_state.read_json(marker)
     agy_state.remove(marker)  # consumed, valid or not
     fields = cast(dict[str, Any], data) if isinstance(data, dict) else {}
-    baseline = fields.get("baseline")
-    if not isinstance(baseline, dict):
-        return
-
-    new: list[str] = []
-    for root, before in cast(dict[object, object], baseline).items():
-        seen = agy_state.str_list(before)
-        if not isinstance(root, str) or not Path(root).is_absolute() or seen is None:
-            continue
-        now = agy_state.git_status(Path(root))
-        if now is not None:
-            before_set = set(seen)
-            new.extend(line for line in now if line not in before_set)
+    new = agy_state.new_entries(fields)
     if not new:
         return
     pattern = fields.get("pattern")

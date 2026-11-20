@@ -511,17 +511,18 @@ V4 uses a multi-layer strategy to encourage agents to use `hgp_*` tools instead 
 | 1 | Instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) | All CLI agents | No — advisory only |
 | 2a | Claude Code `PreToolUse` hook — Write/Edit/MultiEdit (`.claude/hooks/pre_tool_use_hgp.py`) | Claude Code only | No by default; yes with `HGP_HOOK_BLOCK=1` |
 | 2b | Gemini CLI `BeforeTool` hook — write_file/replace (`.gemini/hooks/pre_tool_use_hgp.py`) | Gemini CLI only | No by default; yes with `HGP_HOOK_BLOCK=1` |
-| 2c | Claude Code `PreToolUse` Bash hook — warns before mutating shell commands (`.claude/hooks/pre_bash_hgp.py`) | Claude Code only | No — warning only |
-| 2d | Claude Code `PostToolUse` Bash hook — reports actual file changes after Bash (`.claude/hooks/post_bash_hgp.py`) | Claude Code only | No — informational |
+| 2c | Claude Code `PreToolUse` Bash hook — always denies HGP mode/policy changes and writes to `.hgp/mode` and `.hgp/hook-policy`; denies mutating shell commands under `strict`, otherwise warns and records a `git status` baseline (`.claude/hooks/pre_bash_hgp.py`) | Claude Code only | Yes for the guards, and for mutating commands under `strict` |
+| 2d | Claude Code `PostToolUse` Bash hook — reports only the files the command changed since the baseline, through `additionalContext` (`.claude/hooks/post_bash_hgp.py`) | Claude Code only | No — informational |
 | 2e | Gemini CLI `BeforeTool` shell hook — warns before mutating shell commands (`.gemini/hooks/pre_bash_hgp.py`) | Gemini CLI only | No — warning only |
 | 2f | Gemini CLI `AfterTool` shell hook — reports actual file changes after shell (`.gemini/hooks/post_bash_hgp.py`) | Gemini CLI only | No — informational |
 | 3 | Agent discipline | All agents | N/A |
 
-Layers 2c/2e use a marker-file gate: the Pre hook writes `/tmp/.hgp_bash_mutating_<ppid>` when a mutating pattern is detected, and the Post hook only runs `git status` when that marker exists. This keeps read-only Bash calls (e.g. `git log`, `ls`) free of overhead.
+Layer 2e uses a marker-file gate: the Pre hook writes `/tmp/.hgp_bash_mutating_<ppid>` when a mutating pattern is detected, and the Post hook only runs `git status` when that marker exists. Layers 2c/2d (and the Codex and agy shell hooks) use the same gate with a baseline instead: the Pre hook records `git status` in a per-user directory (`<tmp>/hgp-<client>-<uid>/bash-<tool_use_id>.json`) for a mutating command it lets through, and the Post hook reports only the entries that are new since then. Both keep read-only Bash calls (e.g. `git log`, `ls`) free of overhead. The shell analysis and the tracking helpers are shared in `hgp_paths.py` (`shell_*`, `track_*`).
 
 **Known limitations:**
 - Native tool bypass — agents using Write/Edit/Bash directly bypass V4 recording (layers 2a–2f warn but do not prevent)
-- Marker file gate depends on `ppid` linkage; in rare cases where the harness forks differently this may not fire correctly
+- The Gemini marker gate depends on `ppid` linkage; in rare cases where the harness forks differently this may not fire correctly. Claude and Codex key their marker by the payload's `tool_use_id`, and use the ppid only when it is missing
+- Shell tracking compares `git status` lines, so it cannot see a re-edit of a file that was already modified before the command
 - `.gitignore`'d files are not reported by the Post-Bash git-status scan
 - External process changes triggered outside the agent's shell (background daemons, CI scripts) are not tracked
 - Codex CLI enforcement — Codex `PreToolUse`/`PostToolUse` hooks are supported (enabled via `features.codex_hooks = true` in `config.toml`) and installed to `.codex/hooks/`. As of April 2026, Codex fires these hooks for Bash commands only; `apply_patch` (file edits) does not trigger them ([upstream issue](https://github.com/openai/codex/issues/16732))
