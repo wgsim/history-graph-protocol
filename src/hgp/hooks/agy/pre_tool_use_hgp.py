@@ -3,8 +3,8 @@
 agy protocol (always exit 0; hooks.json command, run with the hooks.json directory as cwd):
   Input:  stdin JSON, camelCase: {"toolCall": {"id", "name", "args"}, "cwd", "workspacePaths",
           "transcriptPath", "hookEventName", ...}
-  Output: stdout JSON {"decision": "force_ask" | "ask" | "deny", "reason": "..."}, or nothing
-          ("no opinion").
+  Output: stdout JSON {"decision": "force_ask" | "ask" | "deny", "reason": "...", "overwrite": {...}},
+          or nothing ("no opinion"). ``overwrite`` is optional and merged into the tool's args.
 
 This hook only ever answers force_ask, ask or deny. It never answers allow: that would
 auto-approve a tool call that agy would otherwise have gated behind its own permission check.
@@ -41,7 +41,17 @@ auto-approve a tool call that agy would otherwise have gated behind its own perm
     file tools and leaves shell work alone); otherwise stay silent. A command is read-only only
     with a read-only prefix and no chaining, substitution or redirection, and then only the
     self-mutating options (`find -delete/-exec/...`, `git --output`, `rg --pre`) are checked:
-    its other arguments are text.
+    its other arguments are text. A mutating command that is let through (not denied) in an
+    enabled, unpaused git checkout also records a `git status` baseline for the PostToolUse hook
+    (agy_state.py); this hook stays silent about it.
+  * invoke_subagent: put the parent session's root op id in front of the subagent's Prompt, so
+    its HGP operations link to this session's history. The id comes from
+    ``.hgp/context-<conversationId>.json`` (hgp_set_context, with the conversation id as
+    session_id). Live capture (agy 1.5.13): ``overwrite`` only takes effect with ask or
+    force_ask (a bare overwrite is denied) and invoke_subagent is not permission-gated, so
+    the answer is ``ask`` plus ``overwrite`` (no prompt appeared in the capture). Skipped for the research,
+    browser and image-generator types, the branch and share workspaces, a prompt that already
+    carries the prefix, or when no valid context exists.
 
 Levels (.hgp/hook-policy ``{"block_mode": bool, "block_shell": bool}``, or HGP_HOOK_BLOCK):
 advisory, block (native file tools) and strict (the shell too). HGP_HOOK_BLOCK wins over the
@@ -188,6 +198,21 @@ def _hgp_paths() -> Any:
         except ImportError:
             return None
     return hgp_paths
+
+
+def _agy_state() -> Any:
+    """Return agy_state (shell tracking and subagent helpers): beside this hook, else the package, else None.
+
+    Without it those two features are off; the hook's guarding does not depend on it.
+    """
+    try:
+        import agy_state  # pyright: ignore[reportMissingImports]
+    except ImportError:
+        try:
+            from hgp.hooks.agy import agy_state
+        except ImportError:
+            return None
+    return agy_state
 
 
 def _enabled(start: Path) -> bool:
@@ -419,10 +444,17 @@ def _ask_decision() -> str | None:
     return "ask" if value == "ask" else "force_ask"
 
 
-def _respond(decision: str, reason: str) -> None:
-    """Print agy's PreToolUse answer. Only force_ask, ask and deny exist here: never auto-approve."""
+def _respond(decision: str, reason: str, overwrite: dict[str, str] | None = None) -> None:
+    """Print agy's PreToolUse answer. Only force_ask, ask and deny exist here: never auto-approve.
+
+    ``overwrite`` (tool args to replace) rides along with ask or force_ask: agy ignores it when
+    there is no decision and denies a bare one.
+    """
     if decision in ("force_ask", "ask", "deny"):
-        print(json.dumps({"decision": decision, "reason": reason}))
+        answer: dict[str, Any] = {"decision": decision, "reason": reason}
+        if overwrite is not None:
+            answer["overwrite"] = overwrite
+        print(json.dumps(answer))
 
 
 def _session_root(start: Path) -> Path:
@@ -581,6 +613,23 @@ def _main() -> None:
                 "If this writes or deletes tracked files, use hgp_* tools so the "
                 "operation is recorded in HGP history.",
             )
+        elif matched is not None:
+            # Let it through, and note the git status so PostToolUse can tell what it changed.
+            state = _agy_state()
+            if state is not None:
+                state.write_baseline(event.get("conversationId"), event.get("stepIdx"), _session_root(start), matched)
+        sys.exit(0)
+
+    if name == "invoke_subagent":
+        state = _agy_state()
+        if state is not None and not _paused(start):
+            prompt = state.subagent_prompt(args, event.get("conversationId"), state.hgp_dirs(_session_root(start)))
+            if prompt is not None:
+                _respond(
+                    "ask",
+                    "[HGP] Passing this session's root op to the subagent so its HGP operations link to this history.",
+                    {"Prompt": prompt},
+                )
         sys.exit(0)
 
     if not isinstance(name, str) or name not in HGP_TOOLS:

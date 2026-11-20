@@ -635,7 +635,14 @@ def test_update_hooks_settings_deprecated_event_keeps_custom_hook_in_shared_entr
 
 # ── agy (Antigravity CLI) ─────────────────────────────────────
 
-AGY_MATCHER = "write_to_file|replace_file_content|multi_replace_file_content|write_file|edit_file|run_command"
+AGY_MATCHER = (
+    "write_to_file|replace_file_content|multi_replace_file_content|write_file|edit_file|run_command|invoke_subagent"
+)
+AGY_EVENTS = ["PreToolUse", "PostToolUse", "PostInvocation", "SessionStart"]
+AGY_HOOK_FILES = {
+    "pre_tool_use_hgp.py", "post_tool_use_hgp.py", "post_invocation_hgp.py", "session_start_hgp.py",
+    "agy_state.py", "hgp_paths.py",
+}
 
 
 def _agy_paths(home: Path) -> tuple[Path, Path]:
@@ -648,11 +655,23 @@ def test_update_agy_hooks_json_creates_file(tmp_path):
     assert _update_agy_hooks_json(hooks_json, hooks_dir) == "written"
     data = json.loads(hooks_json.read_text())
     assert list(data) == ["hgp"]
-    assert list(data["hgp"]) == ["PreToolUse"]  # no PostToolUse/PreInvocation, and not disabled
+    assert list(data["hgp"]) == AGY_EVENTS  # not disabled, and no PreInvocation
     (group,) = data["hgp"]["PreToolUse"]
     assert group["matcher"] == AGY_MATCHER
     (hook,) = group["hooks"]
     assert hook == {"type": "command", "command": f"python3 {hooks_dir / 'pre_tool_use_hgp.py'}", "timeout": 10}
+    # shell change tracking: a grouped PostToolUse on run_command, then flat PostInvocation / SessionStart
+    (post,) = data["hgp"]["PostToolUse"]
+    assert post["matcher"] == "run_command"
+    assert post["hooks"] == [
+        {"type": "command", "command": f"python3 {hooks_dir / 'post_tool_use_hgp.py'}", "timeout": 15},
+    ]
+    assert data["hgp"]["PostInvocation"] == [
+        {"type": "command", "command": f"python3 {hooks_dir / 'post_invocation_hgp.py'}", "timeout": 10},
+    ]
+    assert data["hgp"]["SessionStart"] == [
+        {"type": "command", "command": f"python3 {hooks_dir / 'session_start_hgp.py'}", "timeout": 10},
+    ]
 
 
 def test_agy_hooks_json_matcher_covers_exactly_the_hook_tools(tmp_path):
@@ -663,8 +682,8 @@ def test_agy_hooks_json_matcher_covers_exactly_the_hook_tools(tmp_path):
     hooks_json, hooks_dir = _agy_paths(tmp_path)
     _update_agy_hooks_json(hooks_json, hooks_dir)
     matcher = json.loads(hooks_json.read_text())["hgp"]["PreToolUse"][0]["matcher"]
-    assert set(matcher.split("|")) == {*agy_hook.HGP_TOOLS, "run_command"}
-    for name in (*agy_hook.HGP_TOOLS, "run_command"):
+    assert set(matcher.split("|")) == {*agy_hook.HGP_TOOLS, "run_command", "invoke_subagent"}
+    for name in (*agy_hook.HGP_TOOLS, "run_command", "invoke_subagent"):
         assert re.fullmatch(matcher, name)
     for name in ("call_mcp_tool", "read_file", "view_file", "write_file_x", ""):
         assert not re.fullmatch(matcher, name)  # HGP's own writes go through call_mcp_tool
@@ -702,7 +721,7 @@ def test_update_agy_hooks_json_replaces_stale_hgp_entry_in_place(tmp_path):
     _update_agy_hooks_json(hooks_json, hooks_dir)
     data = json.loads(hooks_json.read_text())
     assert list(data) == ["a", "hgp", "z"]  # replaced where it was, neighbours untouched
-    assert list(data["hgp"]) == ["PreToolUse"]
+    assert list(data["hgp"]) == AGY_EVENTS
     assert data["hgp"]["PreToolUse"][0]["matcher"] == AGY_MATCHER
     assert "/old/" not in hooks_json.read_text()
     assert data["a"] == {"Stop": [{"command": "a.sh"}]}
@@ -780,9 +799,10 @@ def test_install_agy_installs_hook_files_hooks_json_and_instructions(tmp_path, c
 
     assert [call[0][0] for call in mock_mcp.call_args_list] == ["agy"]
     hooks_json, hooks_dir = _agy_paths(home)
-    assert {p.name for p in hooks_dir.iterdir()} == {"pre_tool_use_hgp.py", "hgp_paths.py"}
+    assert {p.name for p in hooks_dir.iterdir()} == AGY_HOOK_FILES
     data = json.loads(hooks_json.read_text())
     assert data["hgp"]["PreToolUse"][0]["hooks"][0]["command"] == f"python3 {hooks_dir / 'pre_tool_use_hgp.py'}"
+    assert list(data["hgp"]) == AGY_EVENTS
     assert "<!-- hgp-instructions-start -->" in (home / ".gemini" / "GEMINI.md").read_text()
     out = capsys.readouterr().out
     assert "agy" in out
@@ -792,6 +812,45 @@ def test_install_agy_installs_hook_files_hooks_json_and_instructions(tmp_path, c
     assert not (home / ".gemini" / "settings.json").exists()
     assert not (home / ".claude").exists()
     assert not (home / ".codex").exists()
+
+
+def test_every_installed_agy_hook_command_points_at_a_file_that_was_installed(tmp_path):
+    import shlex
+
+    home = tmp_path / "home"
+    home.mkdir()
+    with patch("pathlib.Path.home", return_value=home), \
+         patch("hgp.server._install_mcp", return_value=(True, "registered")):
+        _install(["--agy"])
+    hooks_json, hooks_dir = _agy_paths(home)
+    data = json.loads(hooks_json.read_text())["hgp"]
+    commands = []
+    for event in AGY_EVENTS:
+        for entry in data[event]:
+            commands += [h["command"] for h in entry.get("hooks", [entry])]
+    assert len(commands) == 4
+    for command in commands:
+        interpreter, script = shlex.split(command)
+        assert interpreter == "python3"
+        assert Path(script).is_file()
+        assert Path(script).parent == hooks_dir
+    # the helpers every tracking hook imports sit beside them
+    assert (hooks_dir / "agy_state.py").is_file() and (hooks_dir / "hgp_paths.py").is_file()
+
+
+def test_a_pre_tracking_agy_entry_gains_the_new_events_and_keeps_other_hooks(tmp_path):
+    hooks_json, hooks_dir = _agy_paths(tmp_path)
+    hooks_json.parent.mkdir(parents=True)
+    older = {"PreToolUse": [{"matcher": "write_file|run_command", "hooks": [
+        {"type": "command", "command": f"python3 {hooks_dir / 'pre_tool_use_hgp.py'}", "timeout": 10},
+    ]}]}
+    mine = {"PostInvocation": [{"type": "command", "command": "./mine.sh"}]}
+    hooks_json.write_text(json.dumps({"hgp": older, "mine": mine}))
+    assert _update_agy_hooks_json(hooks_json, hooks_dir) == "updated"
+    data = json.loads(hooks_json.read_text())
+    assert list(data["hgp"]) == AGY_EVENTS
+    assert data["mine"] == mine  # another named hook's events are never merged into ours
+    assert _update_agy_hooks_json(hooks_json, hooks_dir) == "already_current"
 
 
 def test_installed_agy_hook_is_self_contained(tmp_path):
@@ -920,3 +979,12 @@ def test_inject_instructions_appends_when_start_has_no_end(tmp_path):
     assert text.startswith("# Rules\n<!-- hgp-instructions-start -->\ntruncated\n")
     assert text.count("<!-- hgp-instructions-end -->") == 1
     assert _inject_instructions(md) == "already_current"
+
+
+def test_instructions_say_where_agy_gets_its_session_id(tmp_path):
+    md = tmp_path / "GEMINI.md"
+    _inject_instructions(md)
+    text = md.read_text()
+    assert "Antigravity" in text
+    assert "conversation id" in text
+    assert "invoke_subagent" in text
