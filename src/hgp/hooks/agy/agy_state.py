@@ -1,18 +1,18 @@
-"""Shared helpers for the agy shell-change tracking and subagent hooks. Stdlib only.
+"""agy-specific helpers for the shell-change tracking and subagent hooks. Stdlib only.
 
 ``hgp install --agy`` copies this file next to the hook scripts, which import it by name (and fall
-back to the hgp package). The three tracking hooks pass state to each other through small JSON
-files in a per-user directory, ``<tmp>/hgp-agy-<uid>`` (mode 0700), never a bare /tmp, so other
-users can neither read nor plant them:
+back to the hgp package). It builds on ``hgp_paths`` (installed beside it), where the parts shared
+with the Claude and Codex hooks live: the per-user state directory, the ``git status`` baseline and
+diff, the scrubbed git environment and the message. The three agy tracking hooks pass state to each
+other through files in ``<tmp>/hgp-agy-<uid>`` (mode 0700):
 
   bash-<conversation>__<step>.json   a ``git status`` baseline, written by PreToolUse before a
                                      mutating shell command and consumed by PostToolUse
   post-<conversation>__<step>.json   the new status entries PostToolUse found, collected (and
                                      deleted) by PostInvocation into one message
 
-Conversation ids and steps are sanitised into the file name (``[A-Za-z0-9.-]``, at most 80
-characters). Tracking is status-level only: it cannot see a re-edit of a file that was already
-modified before the command.
+Tracking is status-level only: it cannot see a re-edit of a file that was already modified before
+the command.
 
 Subagent propagation reads ``.hgp/context-<conversationId>.json`` (written by ``hgp_set_context``).
 The agent can write that file, so the conversation id is validated before it names a file, the
@@ -21,45 +21,42 @@ put into a prompt.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
-import stat
-import subprocess
-import tempfile
-import time
 from collections.abc import Iterable
-from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
-MAX_CHANGED = 200  # status entries kept per command
-STALE_SECONDS = 6 * 3600  # state older than this belongs to a command that never finished
-MAX_CLEANUP = 20  # stale files removed per run
-GIT_TIMEOUT = 6.0  # seconds; the hooks themselves time out at 10 to 15
+if TYPE_CHECKING:
+    from hgp.hooks import hgp_paths
+else:
+    try:
+        import hgp_paths
+    except ImportError:  # run from the hgp package, not from an installed copy
+        from hgp.hooks import hgp_paths
 
+MAX_CHANGED = hgp_paths.TRACK_MAX_CHANGED  # status entries kept per command
 ROOT_PREFIX = "[HGP] Session root op:"
 SKIP_TYPES = frozenset({"research", "browser", "image-generator"})  # subagents that never use HGP
 SKIP_WORKSPACES = frozenset({"branch", "share"})  # they work in another checkout
 
-_UNSAFE = re.compile(r"[^A-Za-z0-9.-]")
-_STATE_FILE = re.compile(r"(?:bash|post)-[A-Za-z0-9.-]+__[A-Za-z0-9.-]+\.json(?:\.\d+\.tmp)?")
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 _OP_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}")
 
+# The shared helpers, under the names the agy hooks use.
+safe_id = hgp_paths.safe_id
+str_list = hgp_paths.str_list
+read_json = hgp_paths.track_read_json
+write_json = hgp_paths.track_write_json
+remove = hgp_paths.track_remove
+cleanup_stale = hgp_paths.track_cleanup
+is_hgp_entry = hgp_paths.is_hgp_entry
+git_status = hgp_paths.git_status
+track_message = hgp_paths.track_message
+new_entries = hgp_paths.track_new_entries
 
-# ── HGP storage and mode (the hooks are standalone, so these mirror pre_tool_use_hgp.py) ──
 
-def load_hgp_paths() -> Any:
-    """Return hgp_paths: installed beside the hooks, else from the hgp package, else None."""
-    try:
-        import hgp_paths  # pyright: ignore[reportMissingImports]
-    except ImportError:
-        try:
-            from hgp.hooks import hgp_paths
-        except ImportError:
-            return None
-    return hgp_paths
-
+# ── HGP storage and mode ──
 
 def event_cwd(event: dict[str, Any]) -> Path:
     """HGP_PROJECT_ROOT when it names a directory (as in the server), else the event's cwd."""
@@ -79,30 +76,13 @@ def event_cwd(event: dict[str, Any]) -> Path:
 
 def session_root(start: Path) -> Path:
     """The checkout root the server treats as the project, else ``start`` itself (outside git)."""
-    reader = getattr(load_hgp_paths(), "checkout_root", None)
-    if reader is not None:
-        root = reader(start)
-        return Path(root) if root is not None else start
-    env = os.environ.get("HGP_PROJECT_ROOT")  # partial install without hgp_paths.py
-    if env and Path(env).is_dir():
-        return Path(env).resolve()
-    for parent in [start, *start.parents]:
-        if (parent / ".git").exists():
-            return parent
-    return start
+    root = hgp_paths.checkout_root(start)
+    return Path(root) if root is not None else start
 
 
 def enabled(start: Path) -> bool:
     """Whether HGP is enabled for ``start`` (its storage .hgp/ exists, or global mode)."""
-    check = getattr(load_hgp_paths(), "hgp_enabled", None)
-    if check is not None:
-        return bool(check(start))
-    if os.environ.get("HGP_GLOBAL_MODE"):
-        return True
-    for parent in [start, *start.parents]:  # no hgp_paths: walk up to the checkout root
-        if (parent / ".git").exists():
-            return (parent / ".hgp").is_dir()
-    return (start / ".hgp").is_dir()
+    return hgp_paths.hgp_enabled(start)
 
 
 def paused(start: Path) -> bool:
@@ -110,39 +90,19 @@ def paused(start: Path) -> bool:
 
     HGP_HOOK_BLOCK wins unless it is 0: an agent can write .hgp/mode, not the hook's environment.
     """
-    env = os.environ.get("HGP_HOOK_BLOCK")
-    if env is not None and env != "0":
-        return False
-    mode = getattr(load_hgp_paths(), "hgp_mode", None)
-    return mode is not None and mode(start) in ("advisory", "off")
+    return hgp_paths.hook_paused(start)
 
 
 def hgp_dirs(root: Path) -> list[Path]:
     """The .hgp directories that may hold a session context: the checkout's shared store, then
     ``~/.hgp`` in global mode (the server records there when HGP_GLOBAL_MODE is set)."""
-    shared = getattr(load_hgp_paths(), "shared_hgp_dir", None)
-    dirs = [Path(shared(root)) if shared is not None else root / ".hgp"]
+    dirs = [Path(hgp_paths.shared_hgp_dir(root))]
     if os.environ.get("HGP_GLOBAL_MODE"):
         dirs.append(Path.home() / ".hgp")
     return dirs
 
 
 # ── Ids and the per-user state directory ──
-
-def safe_id(value: object) -> str | None:
-    """A conversation id or step as a file-name part: ``[A-Za-z0-9.-]``, at most 80 characters.
-
-    Anything else becomes ``-``, so an id can never name another directory. None for a value that
-    is not a non-empty string or an integer.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        value = str(value)
-    if not isinstance(value, str) or not value:
-        return None
-    return _UNSAFE.sub("-", value)[:80]
-
 
 def conversation_id(value: object) -> str | None:
     """A conversation id that is safe to echo and to use in a file name as it is, else None.
@@ -156,35 +116,23 @@ def conversation_id(value: object) -> str | None:
 
 
 def state_dir() -> Path | None:
-    """The per-user state directory, created 0700; None when it cannot be made safely.
+    """The per-user state directory ``<tmp>/hgp-agy-<uid>``, created 0700; None when it cannot be used."""
+    return hgp_paths.track_dir("agy")
 
-    Refused when the path is a symlink, is not ours, or cannot be tightened to 0700.
-    """
-    uid = os.getuid() if hasattr(os, "getuid") else None
-    path = Path(tempfile.gettempdir()) / f"hgp-agy-{uid if uid is not None else 'user'}"
-    try:
-        path.mkdir(mode=0o700, exist_ok=True)
-        info = path.lstat()
-    except OSError:
-        return None
-    if not stat.S_ISDIR(info.st_mode) or (uid is not None and info.st_uid != uid):
-        return None
-    if info.st_mode & 0o077:
-        try:
-            path.chmod(0o700)
-        except OSError:
-            return None
-    return path
+
+def _name(conversation: object, step: object) -> str | None:
+    conv, number = safe_id(conversation), safe_id(step)
+    return None if conv is None or number is None else f"{conv}__{number}"
 
 
 def marker_path(directory: Path, conversation: object, step: object) -> Path | None:
-    conv, number = safe_id(conversation), safe_id(step)
-    return None if conv is None or number is None else directory / f"bash-{conv}__{number}.json"
+    name = _name(conversation, step)
+    return None if name is None else directory / f"bash-{name}.json"
 
 
 def post_path(directory: Path, conversation: object, step: object) -> Path | None:
-    conv, number = safe_id(conversation), safe_id(step)
-    return None if conv is None or number is None else directory / f"post-{conv}__{number}.json"
+    name = _name(conversation, step)
+    return None if name is None else directory / f"post-{name}.json"
 
 
 def post_files(directory: Path, conversation: object) -> list[Path]:
@@ -207,126 +155,15 @@ def post_files(directory: Path, conversation: object) -> list[Path]:
     return [path for _, _, path in sorted(found)]
 
 
-def write_json(path: Path, data: object) -> bool:
-    """Write ``data`` as JSON, mode 0600, atomically; never through a symlink."""
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle)
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        return False
-    return True
-
-
-def read_json(path: Path) -> object:
-    """The JSON in ``path``, or None when it is missing, not a regular file, too large or not JSON."""
-    try:
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_size > 4_000_000:
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeError):
-        return None
-
-
-def remove(path: Path) -> None:
-    """Delete a state file (a symlink is removed, never followed); a missing file is fine."""
-    try:
-        path.unlink()
-    except OSError:
-        pass
-
-
-def cleanup_stale(directory: Path) -> None:
-    """Delete state files older than STALE_SECONDS, at most MAX_CLEANUP per run."""
-    limit = time.time() - STALE_SECONDS
-    removed = 0
-    try:
-        names = list(directory.iterdir())
-    except OSError:
-        return
-    for path in names:
-        if removed >= MAX_CLEANUP:
-            return
-        try:
-            if _STATE_FILE.fullmatch(path.name) and path.lstat().st_mtime < limit:
-                path.unlink()
-                removed += 1
-        except OSError:
-            continue
-
-
-def str_list(value: object) -> list[str] | None:
-    """``value`` when it is a list of strings, else None (state files are untrusted input)."""
-    if not isinstance(value, list):
-        return None
-    items = cast(list[Any], value)
-    return cast(list[str], items) if all(isinstance(item, str) for item in items) else None
-
-
-# ── git status ──
-
-def is_hgp_entry(line: str) -> bool:
-    """Whether a ``git status --porcelain`` line is about .hgp/ (HGP's own storage)."""
-    paths = [part.strip().strip('"') for part in line[3:].split(" -> ")]
-    return any(segment.casefold() == ".hgp" for path in paths for segment in PurePosixPath(path).parts)
-
-
-def _git_env() -> dict[str, str]:
-    """The environment for the hook's git: no inherited GIT_* variables (a stray GIT_DIR, GIT_INDEX_FILE or
-    GIT_CONFIG_COUNT would point it at another repository or inject config), no system config. Only GIT_EXEC_PATH
-    is kept, since git may need it to find its own programs."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k == "GIT_EXEC_PATH"}
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
-    return env
-
-
-def git_status(root: Path) -> list[str] | None:
-    """``git status --porcelain -uall`` lines for the checkout at ``root``, without .hgp entries.
-
-    None when git fails or times out (the hooks then track nothing). ``--no-optional-locks`` and
-    ``core.fsmonitor=false`` keep it from touching the index or running the fsmonitor hook, and the
-    environment is scrubbed (_git_env). Known limit: with a stale index git may still run the
-    repository's own clean/smudge filter drivers (`.gitattributes` plus config); the hook does not
-    try to switch them off one by one, because an agent that can edit `.git/config` or
-    `.gitattributes` can already run commands (under strict it can do neither).
-    """
-    try:
-        result = subprocess.run(
-            ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain", "-uall"],
-            cwd=root, capture_output=True, text=True, timeout=GIT_TIMEOUT, check=False, env=_git_env(),
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return None
-    if result.returncode != 0:
-        return None
-    return [line for line in result.stdout.splitlines() if line and not is_hgp_entry(line)]
-
-
 def write_baseline(conversation: object, step: object, root: Path, pattern: str) -> None:
     """Record ``root``'s git status as the baseline for the shell command at this step.
 
     Does nothing without a usable conversation id and step, outside a git checkout, or when the
     per-user state directory is unavailable.
     """
-    if safe_id(conversation) is None or safe_id(step) is None:
-        return
-    baseline = git_status(root)
-    if baseline is None:
-        return
-    directory = state_dir()
-    if directory is None:
-        return
-    cleanup_stale(directory)
-    path = marker_path(directory, conversation, step)
-    if path is not None:
-        write_json(path, {"pattern": pattern, "baseline": {str(root): baseline}})
+    name = _name(conversation, step)
+    if name is not None:
+        hgp_paths.track_record("agy", name, root, pattern)
 
 
 # ── Subagents ──

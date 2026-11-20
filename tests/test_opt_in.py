@@ -237,6 +237,28 @@ def bash_marker() -> Iterator[Path]:
     marker.unlink(missing_ok=True)
 
 
+def _write_bash_marker(script: str, bash_marker: Path, tmp_path: Path, root: Path) -> Path:
+    """A marker for the Post hook of ``script``, where that hook looks for it.
+
+    Gemini keeps the old /tmp marker. Claude and Codex read a baseline from a per-user directory under
+    TMPDIR, keyed by the parent pid when the event has no tool_use_id (the test process is the parent).
+    """
+    if script.split("/")[0] not in ("claude", "codex"):
+        bash_marker.write_text("cp")
+        return bash_marker
+    state = tmp_path / "tmp" / f"hgp-{script.split('/')[0]}-{os.getuid()}"
+    state.mkdir(parents=True, mode=0o700)
+    marker = state / f"bash-ppid-{os.getpid()}.json"
+    marker.write_text(json.dumps({"pattern": "cp", "baseline": {str(root): []}}))
+    return marker
+
+
+def _hook_env(tmp_path: Path) -> dict[str, str]:
+    """The hook environment with TMPDIR inside tmp_path, so a marker never touches the real temp directory."""
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    return {k: v for k, v in os.environ.items() if k != "HGP_HOOK_BLOCK"} | {"TMPDIR": str(tmp_path / "tmp")}
+
+
 @pytest.mark.parametrize("script,event,needs_marker", HOOK_CASES)
 def test_hooks_silent_without_hgp(
     tmp_path: Path, bash_marker: Path, script: str, event: dict[str, object], needs_marker: bool,
@@ -244,8 +266,11 @@ def test_hooks_silent_without_hgp(
     repo = git_init(tmp_path / "r")
     (repo / "a").write_text("x")
     if needs_marker:
-        bash_marker.write_text("cp")
-    r = _run_hook(HOOKS / script, json.dumps({**event, "cwd": str(repo)}), repo)
+        _write_bash_marker(script, bash_marker, tmp_path, repo)
+    r = subprocess.run(
+        [sys.executable, str(HOOKS / script)], input=json.dumps({**event, "cwd": str(repo)}), cwd=repo,
+        capture_output=True, text=True, env=_hook_env(tmp_path),
+    )
     assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
     assert not (repo / ".hgp").exists()
 
@@ -427,10 +452,13 @@ def test_post_bash_consumes_marker_when_cwd_leaves_enabled_repo(
     tmp_path: Path, bash_marker: Path, script: str, event: dict[str, object], needs_marker: bool,
 ) -> None:
     other = git_init(tmp_path / "other")  # `cd other && ...` moved out of an enabled repo
-    bash_marker.write_text("cp")
-    r = _run_hook(HOOKS / script, json.dumps({**event, "cwd": str(other)}), other)
+    marker = _write_bash_marker(script, bash_marker, tmp_path, other)
+    r = subprocess.run(
+        [sys.executable, str(HOOKS / script)], input=json.dumps({**event, "cwd": str(other)}), cwd=other,
+        capture_output=True, text=True, env=_hook_env(tmp_path),
+    )
     assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
-    assert not bash_marker.exists()
+    assert not marker.exists()
 
 
 # ── Adversarial review of main ──────────────────────────────────────────────

@@ -51,6 +51,31 @@ def _bash_event(command: str) -> dict:
     return {"tool_name": "Bash", "tool_input": {"command": command}}
 
 
+def _real_repo(path: Path) -> Path:
+    """An HGP-enabled git repository with one tracked file, committed."""
+    path.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@t.com"], ["config", "user.name", "T"]):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+    (path / ".hgp").mkdir()
+    (path / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, capture_output=True)
+    return path.resolve()
+
+
+def _run_isolated(hook: str, payload: dict, tmp_path: Path, cwd: Path) -> subprocess.CompletedProcess:
+    """Run a hook with TMPDIR inside tmp_path, so the per-user marker directory is the test's own."""
+    (tmp_path / "tmp").mkdir(exist_ok=True)
+    return subprocess.run(
+        [sys.executable, hook], input=json.dumps(payload), capture_output=True, text=True, cwd=cwd,
+        env={**os.environ, "TMPDIR": str(tmp_path / "tmp")},
+    )
+
+
+def _state_dir(tmp_path: Path, client: str) -> Path:
+    return tmp_path / "tmp" / f"hgp-{client}-{os.getuid()}"
+
+
 # ── Pre-Bash hook (Claude) ────────────────────────────────────────────────────
 
 def test_pre_bash_detects_cp():
@@ -115,19 +140,21 @@ def test_pre_bash_invalid_json():
     assert proc.returncode == 0
 
 
-def test_pre_bash_writes_marker_on_mutating_command():
-    """Pre hook writes /tmp marker when a mutating command is detected."""
-    result = _run_hook(_PRE_HOOK, _bash_event("rm old_file.txt"))
+def test_pre_bash_writes_marker_on_mutating_command(tmp_path):
+    """Pre hook records a git status baseline when a mutating command is detected.
+
+    The marker now lives in a per-user directory under TMPDIR (hgp-claude-<uid>), keyed by the
+    payload's tool_use_id, and holds the baseline: the old empty /tmp/.hgp_bash_mutating_<ppid> file
+    could not tell what the command changed.
+    """
+    repo = _real_repo(tmp_path / "repo")
+    event = {**_bash_event("rm old_file.txt"), "tool_use_id": "toolu_01", "cwd": str(repo)}
+    result = _run_isolated(_PRE_HOOK, event, tmp_path, repo)
     assert result.returncode == 0
     assert "[HGP]" in result.stderr
-    # Marker file: /tmp/.hgp_bash_mutating_<ppid-of-hook-process>
-    # The hook uses os.getppid() which will be our test process pid
-    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
-    # Task 5.6: assert the marker was actually written before cleaning it up
-    assert marker.exists(), (
-        f"Pre hook must write marker file {marker} for mutating commands"
-    )
-    marker.unlink(missing_ok=True)
+    marker = _state_dir(tmp_path, "claude") / "bash-toolu-01.json"
+    assert marker.exists(), f"Pre hook must write marker file {marker} for mutating commands"
+    assert json.loads(marker.read_text())["baseline"] == {str(repo): []}
 
 
 # ── Post-Bash hook (Claude) ───────────────────────────────────────────────────
@@ -143,17 +170,18 @@ def test_post_bash_no_marker_silent():
     assert result.stderr == ""
 
 
-def test_post_bash_no_git_repo():
-    """Running post hook outside a git repo does not crash (exit 0)."""
+def test_post_bash_no_git_repo(tmp_path):
+    """Running post hook outside a git repo does not crash (exit 0), and consumes the marker."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Write marker so hook proceeds to git status
-        marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
-        marker.write_text("")
-        try:
-            result = _run_hook(_POST_HOOK, _bash_event("touch foo"), cwd=tmpdir)
-            assert result.returncode == 0
-        finally:
-            marker.unlink(missing_ok=True)
+        # A marker whose baseline root is not a git repository: the hook proceeds to git status
+        state = _state_dir(tmp_path, "claude")
+        state.mkdir(parents=True, mode=0o700)
+        marker = state / f"bash-ppid-{os.getpid()}.json"
+        marker.write_text(json.dumps({"pattern": "touch", "baseline": {tmpdir: []}}))
+        result = _run_isolated(_POST_HOOK, _bash_event("touch foo"), tmp_path, Path(tmpdir))
+        assert result.returncode == 0
+        assert result.stdout == "" and result.stderr == ""
+        assert not marker.exists()
 
 
 # ── Gemini Pre-Bash hook ──────────────────────────────────────────────────────
@@ -395,19 +423,14 @@ def test_codex_pre_tool_use_block_mode_denies_mutating(tmp_path):
 def test_codex_pre_tool_use_block_mode_does_not_write_marker(tmp_path):
     """Codex PreToolUse must NOT write a marker file when denying — denied commands
     don't execute, so a marker would cause a false PostToolUse advisory on the
-    next Bash call."""
-    (tmp_path / ".git").mkdir()
-    policy_dir = tmp_path / ".hgp"
-    policy_dir.mkdir()
-    (policy_dir / "hook-policy").write_text("block")
+    next Bash call. (The marker moved to a per-user directory under TMPDIR.)"""
+    repo = _real_repo(tmp_path / "repo")
+    (repo / ".hgp" / "hook-policy").write_text("block")
 
-    # Clean up any stale marker left by earlier advisory-mode tests in this process
-    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
-    marker.unlink(missing_ok=True)
+    result = _run_isolated(_CODEX_PRE_HOOK, {**_bash_event("cp foo bar"), "cwd": str(repo)}, tmp_path, repo)
 
-    _run_hook(_CODEX_PRE_HOOK, _bash_event("cp foo bar"), cwd=str(tmp_path))
-
-    assert not marker.exists(), "marker must not be written when command is denied"
+    assert '"deny"' in result.stdout
+    assert not _state_dir(tmp_path, "codex").exists(), "marker must not be written when command is denied"
 
 
 def test_codex_pre_tool_use_advisory_mode_warns_mutating(tmp_path):
@@ -437,28 +460,21 @@ def test_codex_post_tool_use_no_marker_passthrough():
 
 
 def test_codex_post_tool_use_reports_changed_files(tmp_path):
-    """PostToolUse hook reports changed files via hookSpecificOutput.additionalContext."""
-    import os
-    # Create a tracked file change in a git repo
-    subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
-    (tmp_path / ".hgp").mkdir()  # HGP is opt-in: hooks only speak in enabled repos
-    tracked = tmp_path / "tracked.txt"
-    tracked.write_text("original")
-    subprocess.run(["git", "add", str(tracked)], capture_output=True, cwd=str(tmp_path))
-    subprocess.run(["git", "commit", "-m", "init", "--allow-empty-message"], capture_output=True, cwd=str(tmp_path))
-    tracked.write_text("modified")
+    """PostToolUse hook reports changed files via hookSpecificOutput.additionalContext.
 
-    # Write marker as PreToolUse hook would
-    marker = Path(f"/tmp/.hgp_bash_mutating_{os.getpid()}")
-    marker.write_text(r"\bcp\b")
-    try:
-        result = _run_hook(_CODEX_POST_HOOK, _bash_event("echo done"), cwd=str(tmp_path))
-        assert result.returncode == 0
-        assert result.stdout.strip(), "Expected JSON output"
-        data = json.loads(result.stdout.strip())
-        output = data.get("hookSpecificOutput", {})
-        assert output.get("hookEventName") == "PostToolUse"
-        assert "[HGP]" in output.get("additionalContext", "")
-        assert "tracked.txt" in output.get("additionalContext", "")
-    finally:
-        marker.unlink(missing_ok=True)
+    Only what changed since the PreToolUse baseline is reported (it used to be the whole git status),
+    so the PreToolUse hook runs first and the file is modified after it.
+    """
+    repo = _real_repo(tmp_path / "repo")
+    pre = _run_isolated(_CODEX_PRE_HOOK, {**_bash_event("cp foo bar"), "cwd": str(repo)}, tmp_path, repo)
+    assert pre.returncode == 0 and "systemMessage" in pre.stdout
+    (repo / "tracked.txt").write_text("modified")
+
+    result = _run_isolated(_CODEX_POST_HOOK, {**_bash_event("echo done"), "cwd": str(repo)}, tmp_path, repo)
+    assert result.returncode == 0
+    assert result.stdout.strip(), "Expected JSON output"
+    data = json.loads(result.stdout.strip())
+    output = data.get("hookSpecificOutput", {})
+    assert output.get("hookEventName") == "PostToolUse"
+    assert "[HGP]" in output.get("additionalContext", "")
+    assert "tracked.txt" in output.get("additionalContext", "")

@@ -1,13 +1,23 @@
-"""PreToolUse hook for Bash: warn when shell commands may mutate files outside HGP.
+"""PreToolUse hook for Bash: keep shell commands from changing HGP's controls, and track what they change.
 
-This hook is non-blocking (always exit 0). It prints a warning to stderr when
-it detects shell patterns that typically write or delete files, reminding the
-agent to use hgp_* tools for tracked file operations.
+Decision order, first match wins (the analysis is hgp_paths.shell_*, shared with the agy and Codex hooks):
+  1. HGP is not enabled for the repository: silent.
+  2. The command runs HGP's mode or hook-policy command, or may write .hgp/mode or .hgp/hook-policy:
+     deny (exit 2), always (even paused, in advisory, with HGP_HOOK_BLOCK=0). Those controls are
+     user-only, and a read-only prefix or a quoting trick does not hide them.
+  3. HGP mode is advisory or off (and HGP_HOOK_BLOCK does not enforce): silent.
+  4. The command does not look file-mutating: silent.
+  5. The level is strict (policy file `block_shell`, or HGP_HOOK_BLOCK=strict): deny (exit 2).
+     block only stops native file tools and leaves shell work alone.
+  6. Otherwise warn on stderr, and record a ``git status`` baseline so the PostToolUse hook can
+     tell the agent what the command changed (post_bash_hgp.py reports only the new entries).
 
-When a mutating pattern is detected, a marker file is written to /tmp so the
-Post-Bash hook can run 'git status' to report actual changes.
+Baseline: <tmp>/hgp-claude-<uid>/bash-<tool_use_id>.json (the parent pid when the payload has no
+tool_use_id), written 0600 in a per-user 0700 directory. Without hgp_paths.py beside the hook (a
+broken install) the guards still work through a coarse built-in check, and neither the policy file
+nor tracking is available.
 
-Marker file: /tmp/.hgp_bash_mutating_<ppid>
+Fails open: an unexpected error never blocks the agent's tool call.
 """
 from __future__ import annotations
 
@@ -18,95 +28,50 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
-# ── Read-only command prefixes — skip pattern matching for these ──────────────
-_READONLY_PREFIXES = (
-    "git log",
-    "git status",
-    "git diff",
-    "git show",
-    "git branch",
-    "git tag",
-    "git remote",
-    "git fetch",
-    "git ls",
-    "git stash list",
-    "ls ",
-    "ls\t",
-    "head ",
-    "tail ",
-    "grep ",
-    "rg ",
-    "find ",
-    "wc ",
-    "diff ",
-    "less ",
-    "more ",
-    "file ",
-    "stat ",
-    "pwd",
-    "date",
-    "which ",
-    "type ",
-    "uname",
+# --- hgp-shell-fallback begin: keep this block identical in the agy, Claude and Codex hooks (a test checks) ---
+# The shell analysis lives in hgp_paths (shell_*), installed beside every hook. This block is what a hook
+# still has when hgp_paths.py is missing (a broken install): the always-deny guards and a coarse mutating
+# check. It may deny more than hgp_paths does, never less than the guards. The messages are shared.
+_MODE_DENY = (
+    "[HGP] Blocked: `hgp mode` and `hgp hook-policy` must be run by the user directly, not by the agent. "
+    "Use `!hgp mode <value>` or `!hgp hook-policy <value>` in your terminal. "
+    "If this is only text, such as a commit message, write it to a file and run `git commit -F <file>`."
+)
+_CONTROL_DENY = (
+    "[HGP] Blocked: `.hgp/mode` and `.hgp/hook-policy` are user-controlled settings; the agent "
+    "must not write them from the shell. Ask the user to run `!hgp mode <value>` or "
+    "`!hgp hook-policy <value>` instead."
+)
+_FB_QUOTES = str.maketrans("", "", "'\"\\")
+_FB_MODE = re.compile(r"\bhgp(?:\.server)?\s+(?:mode|hook-policy)\b")
+_FB_HGP_WORD = re.compile(r"(?:(?<![\w./-])|(?<=/bin/))hgp(?:\.server)?(?![\w./-])")
+_FB_CONTROL_WORD = re.compile(r"(?<![\w./-])(?:mode|hook-policy)(?![\w./-])")
+_FB_CONTROL_PATH = re.compile(r"\.hgp/(?:mode|hook-policy)(?![\w.-])")
+_FB_WRITER = re.compile(
+    r"\b(?:cp|mv|rm|tee|touch|install|mkdir|rmdir|chmod|chown|ln|truncate|patch|dd|sed|perl|git|find|rg|awk)\b|>"
+)
+_FB_MUTATING = re.compile(
+    r"\b(?:cp|mv|rm|tee|touch|install|mkdir|rmdir|chmod|chown|ln|truncate|patch|dd|sed|perl)\b"
+    r"|\bgit\s+(?:checkout|restore|switch|apply|revert|merge|rebase|reset)\b|>"
 )
 
-# ── Mutating patterns (regex) ─────────────────────────────────────────────────
-_HIGH_PATTERNS = [
-    re.compile(r"\bcp\b"),
-    re.compile(r"\bmv\b"),
-    re.compile(r"\brm\b"),
-    re.compile(r"\btee\b"),
-    re.compile(r"\btouch\b"),
-    re.compile(r"\binstall\b"),
-    re.compile(r"\bmkdir\b"),
-    re.compile(r"\brmdir\b"),
-    re.compile(r"\bchmod\b"),
-    re.compile(r"\bchown\b"),
-    re.compile(r"\bln\b"),
-    re.compile(r"\btruncate\b"),
-    # git commands that rewrite working-tree files
-    re.compile(r"\bgit\s+checkout\b"),
-    re.compile(r"\bgit\s+restore\b"),
-    re.compile(r"\bgit\s+switch\b"),
-    re.compile(r"\bgit\s+apply\b"),
-    re.compile(r"\bgit\s+revert\b"),
-    re.compile(r"\bgit\s+merge\b"),
-    re.compile(r"\bgit\s+rebase\b"),
-    re.compile(r"\bgit\s+reset\b"),
-    # patch tools
-    re.compile(r"\bpatch\b"),
-]
 
-_MEDIUM_PATTERNS = [
-    re.compile(r"(?<![|&])\s*>(?!>)"),  # stdout redirect (not >>)
-    re.compile(r">>"),                   # append redirect
-    re.compile(r"\bsed\s+-i\b"),
-    re.compile(r"\bdd\b"),
-    re.compile(r"\bawk\b.*>"),           # awk with redirect
-]
-
-# Detect agent attempts to change HGP mode via Bash
-_HGP_MODE_PATTERN = re.compile(r"\bhgp\s+mode\b")
+def _fb_control_violation(command: str) -> str | None:
+    text = command.translate(_FB_QUOTES)
+    if _FB_MODE.search(text):
+        return "mode"
+    if ("$" in text or "`" in text) and _FB_HGP_WORD.search(text) and _FB_CONTROL_WORD.search(text):
+        return "mode"
+    # A control path next to any writer word or redirect: fail closed (operands are not resolved).
+    return "control-file" if _FB_CONTROL_PATH.search(text) and _FB_WRITER.search(text) else None
 
 
-def _is_readonly(command: str) -> bool:
-    stripped = command.lstrip()
-    return any(stripped.startswith(p) for p in _READONLY_PREFIXES)
+def _fb_mutating(command: str) -> str | None:
+    found = _FB_MUTATING.search(command.translate(_FB_QUOTES))
+    return found.group(0) if found else None
 
 
-def _detect_mutating(command: str) -> str | None:
-    """Return the first matched pattern description, or None if command looks safe."""
-    for pat in _HIGH_PATTERNS:
-        if pat.search(command):
-            return pat.pattern
-    for pat in _MEDIUM_PATTERNS:
-        if pat.search(command):
-            return pat.pattern
-    return None
-
-
-def _marker_path() -> str:
-    return f"/tmp/.hgp_bash_mutating_{os.getppid()}"
+# --- hgp-shell-fallback end ---
 
 
 def _hgp_paths() -> Any:
@@ -143,46 +108,92 @@ def _event_cwd(event: object) -> Path:
     return Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
 
 
+def _paused(start: Path) -> bool:
+    """Whether HGP mode is advisory or off: HGP tools then do not write files.
+
+    HGP_HOOK_BLOCK wins unless it is 0: an agent can write .hgp/mode, not this environment.
+    Without hgp_paths the mode file is not read, so nothing is paused.
+    """
+    check = getattr(_hgp_paths(), "hook_paused", None)
+    return bool(check(start)) if check is not None else False
+
+
+def _block_level(start: Path) -> str:
+    """advisory, block or strict: HGP_HOOK_BLOCK, then the policy file. Without hgp_paths only the
+    environment is read (the trusted channel)."""
+    check = getattr(_hgp_paths(), "block_level", None)
+    if check is not None:
+        return str(check(start))
+    env = os.environ.get("HGP_HOOK_BLOCK")
+    if env is None or env == "0":
+        return "advisory"
+    return "strict" if env == "strict" else "block"
+
+
+def _control_violation(command: str) -> str | None:
+    """"mode" for a command that changes HGP's mode or hook policy, "control-file" for a shell write to
+    .hgp/mode or .hgp/hook-policy, else None. Both are user-only (hgp_paths.shell_control_violation)."""
+    check = getattr(_hgp_paths(), "shell_control_violation", None)
+    return check(command) if check is not None else _fb_control_violation(command)
+
+
+def _mutating_pattern(command: str) -> str | None:
+    """The pattern that makes the command look file-mutating, or None (hgp_paths.shell_mutating_pattern)."""
+    check = getattr(_hgp_paths(), "shell_mutating_pattern", None)
+    return check(command) if check is not None else _fb_mutating(command)
+
+
+def _record_baseline(event: dict[str, Any], start: Path, pattern: str) -> None:
+    """Note ``git status`` before the command so PostToolUse can tell what it changed (needs hgp_paths)."""
+    paths = _hgp_paths()
+    record = getattr(paths, "track_record", None)
+    if record is None:
+        return
+    root = paths.checkout_root(start)
+    record("claude", paths.track_key(event), Path(root) if root is not None else start, pattern)
+
+
 def _main() -> None:
     try:
-        event = json.loads(sys.stdin.read())
-    except (json.JSONDecodeError, ValueError):
+        raw: object = json.loads(sys.stdin.read())
+    except ValueError:
         sys.exit(0)
-    if not _enabled(_event_cwd(event)):
+    if not isinstance(raw, dict):
         sys.exit(0)
-
-    if not isinstance(event, dict):
+    event = cast(dict[str, Any], raw)
+    start = _event_cwd(event)
+    if not _enabled(start):
         sys.exit(0)
-    event_typed = cast(dict[str, object], event)
-    if event_typed.get("tool_name") != "Bash":
-        sys.exit(0)
-
-    tool_input_raw = event_typed.get("tool_input")
-    tool_input = cast(dict[str, object], tool_input_raw) if isinstance(tool_input_raw, dict) else {}
-    cmd_raw = tool_input.get("command", "")
-    command: str = cmd_raw if isinstance(cmd_raw, str) else ""
-    if not command or _is_readonly(command):
+    if event.get("tool_name") != "Bash":
         sys.exit(0)
 
-    # Block agent attempts to change HGP mode via Bash (mode control is user-only)
-    if _HGP_MODE_PATTERN.search(command):
+    tool_input = event.get("tool_input")
+    command = cast(dict[str, Any], tool_input).get("command", "") if isinstance(tool_input, dict) else ""
+    if not isinstance(command, str) or not command:
+        sys.exit(0)
+
+    # Mode and policy control is user-only, so this runs before the paused and read-only exits:
+    # a leading read-only command must not smuggle a change through, and neither may pausing HGP.
+    violation = _control_violation(command)
+    if violation is not None:
+        print(_MODE_DENY if violation == "mode" else _CONTROL_DENY, file=sys.stderr)
+        sys.exit(2)
+    # Advising or blocking is pointless while HGP tools do not write.
+    if _paused(start):
+        sys.exit(0)
+    matched = _mutating_pattern(command)
+    if matched is None:
+        sys.exit(0)
+    # Only strict blocks the shell: block stops native file tools and leaves shell work alone.
+    if _block_level(start) == "strict":
         print(
-            "[HGP] Blocked: `hgp mode` must be run by the user directly, not by the agent. "
-            "Use `!hgp mode <value>` in your terminal to change HGP mode.",
+            f"[HGP] Blocked: Bash command may mutate files (matched: {matched!r}) and the hook level is strict. "
+            "Use hgp_* tools so the operation is recorded in HGP history.",
             file=sys.stderr,
         )
         sys.exit(2)
 
-    matched = _detect_mutating(command)
-    if matched is None:
-        sys.exit(0)
-
-    # Write marker so Post-Bash hook knows to run git status
-    try:
-        open(_marker_path(), "w").close()
-    except OSError:
-        pass  # /tmp not writable — skip gating, hook still warns
-
+    _record_baseline(event, start, matched)
     print(
         f"[HGP] Bash command may mutate files (matched: {matched!r}). "
         "If this writes or deletes tracked files, prefer hgp_* tools so the "
